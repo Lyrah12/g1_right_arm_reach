@@ -1,0 +1,40 @@
+# G1 Right Arm Reach Controller Parameters
+# =========================================
+
+reach_node:
+  ros__parameters:
+
+    # --- Robot Model ---
+    robot_model:
+      urdf_path: ""  # Set via launch argument
+      # Right arm joints to keep active (all others are locked)
+      active_joints:
+        - "right_shoulder_pitch_joint"
+        - "right_shoulder_roll_joint"
+        - "right_shoulder_yaw_joint"
+        - "right_elbow_joint"
+        - "right_wrist_roll_joint"
+      # End-effector frame name
+      ee_frame_hint: "right_rubber_hand"
+
+    # --- PID Controller ---
+    pid:
+      kp: 2.5                    # proportional gain (up from 1.5)
+      ki: 3.0                    # integral gain — eliminates steady-state error
+      kd: 0.05                   # derivative gain
+      damping: 1.0e-4            # base damping, adaptive increases near singularity
+      tolerance: 0.003           # 3mm convergence threshold (was 5mm)
+      max_iters: 5000
+
+    # --- Controller Manager ---
+    manager:
+      control_rate: 20.0
+
+    # --- Reach Node ---
+    reach_node:
+      target_topic: "/target_point"
+      joint_state_topic: "/joint_states"
+      joint_command_topic: "/joint_commands"
+      debug_error_topic: "/debug/position_error"
+      debug_status_topic: "/debug/controller_status"
+      default_target: [0.30, -0.40, 0.20]
