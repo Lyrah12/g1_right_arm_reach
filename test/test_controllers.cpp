@@ -52,8 +52,7 @@ protected:
             1.0,    // ki
             0.1,    // kd
             1e-4,   // damping
-            0.01,   // tolerance (1cm)
-            1000    // max_iters
+            0.01    // tolerance (1cm)
         );
     }
 
@@ -133,16 +132,26 @@ TEST_F(ControllerTest, PIDRespectsJointLimits) {
 
 TEST_F(ControllerTest, PIDResetClearsState) {
     Eigen::Vector3d target(0.30, -0.40, 0.20);
-    robot_->setNeutralConfig();
 
-    // Run a few steps to accumulate state
-    for (int i = 0; i < 50; ++i) {
+    // Record the result from a freshly-reset controller.
+    robot_->setNeutralConfig();
+    pid_->reset();
+    auto result_fresh = pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+
+    // Run many steps to accumulate integral error and derivative history.
+    for (int i = 0; i < 100; ++i) {
         pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
     }
 
-    // Reset and verify name
+    // Reset, re-initialize the robot, and verify the controller behaves
+    // identically to a fresh one (integral = 0, first_call = true).
+    robot_->setNeutralConfig();
     pid_->reset();
-    EXPECT_EQ(pid_->name(), "PID");
+    auto result_after_reset = pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+
+    // The first command after reset must match the first command from fresh.
+    EXPECT_TRUE(result_fresh.command.isApprox(result_after_reset.command, 1e-6));
+    EXPECT_DOUBLE_EQ(result_fresh.position_error, result_after_reset.position_error);
 }
 
 // ============================================================================

@@ -92,7 +92,6 @@ public:
      * @param kd        Derivative gain (default 0.05).
      * @param damping   Jacobian damping factor λ (default 1e-4).
      * @param tolerance Convergence threshold in meters (default 0.003 = 3 mm).
-     * @param max_iters Max internal iterations per control cycle (default 5000).
      */
     PIDController(RobotModel& robot,
                   Kinematics& kin,
@@ -100,8 +99,7 @@ public:
                   double ki = 3.0,
                   double kd = 0.05,
                   double damping = 1e-4,
-                  double tolerance = 0.003,
-                  int max_iters = 5000);
+                  double tolerance = 0.003);
 
     // ------------------------------------------------------------------
     // Public interface
@@ -135,6 +133,11 @@ public:
 
     /// Set all three PID gains at once.
     void setGains(double kp, double ki, double kd) { kp_ = kp; ki_ = ki; kd_ = kd; }
+
+    /// Set individual PID gains (useful for parameter callbacks).
+    void setKp(double kp) { kp_ = kp; }
+    void setKi(double ki) { ki_ = ki; }
+    void setKd(double kd) { kd_ = kd; }
 
     /// Set the Jacobian damping factor λ.
     void setDamping(double d) { damping_ = d; }
@@ -173,7 +176,6 @@ private:
     double kd_;              ///< Derivative gain
     double damping_;         ///< Jacobian damping factor λ
     double tolerance_;       ///< Convergence threshold (meters)
-    int max_iters_;          ///< Max internal iterations per control cycle
 
     // State
     Eigen::Vector3d prev_error_;       ///< Previous position error (for derivative term)

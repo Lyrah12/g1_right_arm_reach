@@ -30,8 +30,7 @@ PIDController::PIDController(
     double ki,
     double kd,
     double damping,
-    double tolerance,
-    int max_iters)
+    double tolerance)
     : robot_(robot)
     , kin_(kin)
     , kp_(kp)
@@ -39,7 +38,6 @@ PIDController::PIDController(
     , kd_(kd)
     , damping_(damping)
     , tolerance_(tolerance)
-    , max_iters_(max_iters)
     , prev_error_(Eigen::Vector3d::Zero())
     , error_integral_(Eigen::Vector3d::Zero())
     , first_call_(true)
@@ -130,7 +128,6 @@ ControlResult PIDController::compute(
     Eigen::Matrix3d JJt = J_pos * J_pos.transpose();
     double jjt_det = JJt.determinant();
     double adaptive_damp = std::max(damping_, 2e-3 / (1.0 + jjt_det * 1e5));
-    JJt.diagonal().array() += adaptive_damp;
 
     // --- Task-space velocity: P + I + D ---
     Eigen::Vector3d task_vel = eff_kp * error;           // proportional
@@ -145,9 +142,10 @@ ControlResult PIDController::compute(
     Eigen::VectorXd dq = J_pinv * task_vel;
 
     // --- Null-space joint-limit avoidance ---
+    // Compute null-space projector N = I - J^+ * J directly from the
+    // already-computed pseudoinverse J_pinv to avoid a second SVD/LDLT.
     Eigen::VectorXd dq_null = jointLimitAvoidance(0.1);
-    Eigen::MatrixXd N(nv, nv);
-    kin_.nullSpaceProjector(J_pos, adaptive_damp, N);
+    Eigen::MatrixXd N = Eigen::MatrixXd::Identity(nv, nv) - J_pinv * J_pos;
     dq += N * dq_null;
 
     // --- Velocity scaling ---

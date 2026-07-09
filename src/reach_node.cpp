@@ -54,16 +54,16 @@ public:
         this->declare_parameter("pid.kd", 0.05);
         this->declare_parameter("pid.damping", 1.0e-4);
         this->declare_parameter("pid.tolerance", 0.003);
-        this->declare_parameter("pid.max_iters", 5000);
 
         this->declare_parameter("manager.control_rate", 20.0);
+        this->declare_parameter("reach_node.base_frame", "pelvis");
 
         this->declare_parameter("reach_node.target_topic", "/target_point");
         this->declare_parameter("reach_node.joint_state_topic", "/joint_states");
         this->declare_parameter("reach_node.debug_error_topic", "/debug/position_error");
         this->declare_parameter("reach_node.debug_status_topic", "/debug/controller_status");
         this->declare_parameter("reach_node.default_target",
-            std::vector<double>{0.30, -0.40, 0.20});
+            std::vector<double>{0.10, -0.15, 0.10});
 
         // --------------------------------------------------------------------
         // SECTION: Read default target from parameters
@@ -106,8 +106,7 @@ public:
             this->get_parameter("pid.ki").as_double(),
             this->get_parameter("pid.kd").as_double(),
             this->get_parameter("pid.damping").as_double(),
-            this->get_parameter("pid.tolerance").as_double(),
-            this->get_parameter("pid.max_iters").as_int()
+            this->get_parameter("pid.tolerance").as_double()
         );
 
         // --------------------------------------------------------------------
@@ -142,10 +141,51 @@ public:
         // SECTION: Control loop timer — fires at the configured control rate
         // --------------------------------------------------------------------
         double control_rate = this->get_parameter("manager.control_rate").as_double();
+        dt_ = 1.0 / control_rate;
         int period_ms = static_cast<int>(1000.0 / control_rate);
         control_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(period_ms),
             std::bind(&ReachNode::controlLoop, this));
+
+        base_frame_ = this->get_parameter("reach_node.base_frame").as_string();
+
+        // --------------------------------------------------------------------
+        // SECTION: Dynamic parameter callback — runtime tuning of PID gains
+        // --------------------------------------------------------------------
+        [[maybe_unused]] auto _param_cb = this->add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& params) {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                for (const auto& p : params) {
+                    if (p.get_name() == "pid.kp") {
+                        pid_->setKp(p.as_double());
+                        RCLCPP_INFO(this->get_logger(), "PID kp = %.2f", p.as_double());
+                    } else if (p.get_name() == "pid.ki") {
+                        pid_->setKi(p.as_double());
+                        RCLCPP_INFO(this->get_logger(), "PID ki = %.2f", p.as_double());
+                    } else if (p.get_name() == "pid.kd") {
+                        pid_->setKd(p.as_double());
+                        RCLCPP_INFO(this->get_logger(), "PID kd = %.3f", p.as_double());
+                    } else if (p.get_name() == "pid.damping") {
+                        if (p.as_double() <= 0.0) {
+                            result.successful = false;
+                            result.reason = "pid.damping must be > 0";
+                        } else {
+                            pid_->setDamping(p.as_double());
+                            RCLCPP_INFO(this->get_logger(), "PID damping = %.1e", p.as_double());
+                        }
+                    } else if (p.get_name() == "pid.tolerance") {
+                        if (p.as_double() <= 0.0) {
+                            result.successful = false;
+                            result.reason = "pid.tolerance must be > 0";
+                        } else {
+                            pid_->setTolerance(p.as_double());
+                            RCLCPP_INFO(this->get_logger(), "PID tolerance = %.3f", p.as_double());
+                        }
+                    }
+                }
+                return result;
+            });
 
         // Publish an initial joint-state message so RViz shows the arm right away.
         publishJointStates();
@@ -186,7 +226,6 @@ private:
                     }
                 }
             }
-            has_joint_feedback_ = true;
         }
     }
 
@@ -211,7 +250,7 @@ private:
             return;
         }
 
-        double dt = 0.05;  // 50 ms control step
+        double dt = dt_;
 
         // Snapshot the robot's internal joint state (may be updated by feedback).
         Eigen::VectorXd q = robot_->q_;
@@ -301,7 +340,7 @@ private:
         if (!has_target_) return;
 
         auto marker = visualization_msgs::msg::Marker();
-        marker.header.frame_id = "pelvis";
+        marker.header.frame_id = base_frame_;
         marker.header.stamp = this->now();
         marker.ns = "target";
         marker.id = 0;
@@ -352,10 +391,12 @@ private:
     rclcpp::TimerBase::SharedPtr control_timer_;
 
     // Current Cartesian target (default: a test point in front of the robot).
-    Eigen::Vector3d target_{0.30, -0.40, 0.20};
+    Eigen::Vector3d target_{0.10, -0.15, 0.10};
     bool has_target_{false};
-    bool has_joint_feedback_{false};
     int total_cycles_{0};  ///< Cycle counter for diagnostics
+
+    double dt_{0.05};       ///< Control timestep derived from control_rate
+    std::string base_frame_{"pelvis"};  ///< TF base frame for markers
 };
 
 }  // namespace g1_right_arm_reach

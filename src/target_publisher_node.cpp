@@ -24,7 +24,7 @@ public:
         : Node("target_publisher_node")
     {
         // Declare ROS2 parameters with defaults.
-        this->declare_parameter("target", "0.30,-0.40,0.20");
+        this->declare_parameter("target", "0.10,-0.15,0.10");
         this->declare_parameter("rate", 10.0);  // publishing frequency in Hz
 
         std::string target_str = this->get_parameter("target").as_string();
@@ -49,6 +49,22 @@ public:
         // Show how to change the target at runtime.
         RCLCPP_INFO(this->get_logger(),
             "Change target: ros2 param set /target_publisher_node target \"x,y,z\"");
+
+        // Register a parameter callback so target changes take effect immediately.
+        [[maybe_unused]] auto _param_cb = this->add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& params) {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                for (const auto& p : params) {
+                    if (p.get_name() == "target") {
+                        parseTarget(p.as_string());
+                        RCLCPP_INFO(this->get_logger(),
+                            "Target updated: [%.3f, %.3f, %.3f]",
+                            target_.x, target_.y, target_.z);
+                    }
+                }
+                return result;
+            });
     }
 
 private:

@@ -23,8 +23,7 @@ reach_node:
       ki: 3.0                    # integral gain — eliminates steady-state error
       kd: 0.05                   # derivative gain
       damping: 1.0e-4            # base damping, adaptive increases near singularity
-      tolerance: 0.003           # 3mm convergence threshold (was 5mm)
-      max_iters: 5000
+      tolerance: 0.003           # 3mm convergence threshold
 
     # --- Controller Manager ---
     manager:
@@ -37,4 +36,4 @@ reach_node:
       joint_command_topic: "/joint_commands"
       debug_error_topic: "/debug/position_error"
       debug_status_topic: "/debug/controller_status"
-      default_target: [0.30, -0.40, 0.20]
+      default_target: [0.10, -0.15, 0.10]
