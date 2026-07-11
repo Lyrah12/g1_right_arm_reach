@@ -1,0 +1,159 @@
+<!--
+  g1_grasp_scene.xml — MuJoCo 仿真场景
+  =======================================
+  用于 G1 右臂抓取任务（Phase 1.5 物理仿真）。
+
+  场景元素：
+    - G1 人形机器人（从 unitree_mujoco include）
+    - 地面 + 桌面
+    - 待抓取物体（杯子、方块）
+    - 虚拟头部相机（RGB-D）
+    - 位置执行器（覆盖 MJCF 自带的力矩电机，实现位置伺服）
+
+  路径说明：
+    - <include> 和 meshdir 使用绝对路径，需与 WSL2 用户目录一致
+    - 默认用户：YOUR_USERNAME，如有不同请 sed 替换
+-->
+<mujoco model="g1_grasp_scene">
+
+  <!-- ===================================================================== -->
+  <!-- 编译选项                                                               -->
+  <!--   不设置 meshdir — 由 MJCF 自带的 <compiler meshdir="meshes"/> 处理，  -->
+  <!--   相对路径会正确解析到 MJCF 所在目录下的 meshes/ 子目录。              -->
+  <!-- ===================================================================== -->
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- ===================================================================== -->
+  <!-- 可视化选项                                                             -->
+  <!-- ===================================================================== -->
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <!-- ===================================================================== -->
+  <!-- G1 机器人模型（完整 MJCF，含 worldbody + motor 执行器 + 传感器）       -->
+  <!-- ===================================================================== -->
+  <include file="/home/YOUR_USERNAME/deps/unitree_mujoco/unitree_robots/g1/g1_23dof.xml"/>
+
+  <!-- ===================================================================== -->
+  <!-- 场景几何体（追加到 MJCF 的 worldbody 后面）                            -->
+  <!-- ===================================================================== -->
+  <worldbody>
+
+    <!-- ---- 地面（恢复碰撞：weld 固定骨盆 + 双脚站稳）---------------- -->
+    <geom name="floor" type="plane" size="0 0 0.05" rgba="0.8 0.8 0.8 1"/>
+
+    <!-- ---- 光照 --------------------------------------------------------- -->
+    <light name="sun" directional="true" pos="2 2 3" dir="-0.5 -0.5 -1"
+           diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+
+    <!-- ---- 桌面 --------------------------------------------------------- -->
+    <body name="table" pos="0.45 -0.15 0.75">
+      <geom name="table_top" type="box" size="0.40 0.30 0.02"
+            rgba="0.6 0.4 0.2 1"/>
+      <geom name="leg_fl" type="cylinder" size="0.02 0.35"
+            pos="-0.35 -0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
+      <geom name="leg_fr" type="cylinder" size="0.02 0.35"
+            pos="-0.35  0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
+      <geom name="leg_bl" type="cylinder" size="0.02 0.35"
+            pos=" 0.35 -0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
+      <geom name="leg_br" type="cylinder" size="0.02 0.35"
+            pos=" 0.35  0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
+    </body>
+
+    <!-- ---- 待抓取物体 1：杯子 -------------------------------------------- -->
+    <body name="cup" pos="0.35 -0.25 1.14">
+      <freejoint name="cup_joint"/>
+      <geom name="cup_body" type="cylinder" size="0.03 0.08"
+            rgba="0.2 0.5 0.8 1" mass="0.15"/>
+      <geom name="cup_bottom" type="cylinder" size="0.028 0.005"
+            pos="0 0 -0.08" rgba="0.15 0.4 0.7 1" mass="0.01"/>
+      <geom name="cup_handle" type="cylinder" size="0.008 0.04"
+            pos="0.035 0 0.03" euler="0 0 0.8" rgba="0.2 0.5 0.8 1" mass="0.02"/>
+    </body>
+
+    <!-- ---- 待抓取物体 2：小方块 ------------------------------------------ -->
+    <body name="block" pos="0.45 -0.05 1.09">
+      <freejoint name="block_joint"/>
+      <geom name="block_geom" type="box" size="0.025 0.025 0.025"
+            rgba="0.9 0.3 0.3 1" mass="0.05"/>
+    </body>
+
+    <!-- ---- 虚拟相机（模拟 G1 头部 RGB-D 相机）--------------------------- -->
+    <camera name="head_cam"
+            pos="0.02 0 0.65"
+            xyaxes="1 0 0 0 0.7 0.7"
+            fovy="60"
+            resolution="640 480"/>
+
+  </worldbody>
+
+  <!-- ===================================================================== -->
+  <!-- 位置执行器（覆盖 MJCF 自带的 <motor> 力矩电机）                        -->
+  <!--                                                                       -->
+  <!-- 原理：MJCF include 自带 28 个 <motor>（力矩控制），本段追加 28 个      -->
+  <!--       <position>（位置伺服）。MuJoCo 允许多个执行器作用于同一关节。     -->
+  <!--       桥接节点会将 ctrl 初始化 = qpos0，仅右臂 5 关节从 ROS2 更新。    -->
+  <!--                                                                       -->
+  <!-- 增益说明：                                                             -->
+  <!--   - 主动关节（右臂 5）：kp=300, kv=50 → 高刚度，快速跟踪               -->
+  <!--   - 锁定关节（腿）：kp=500, kv=100 → 高刚度站稳，重力下几乎无形变      -->
+  <!--   - 锁定关节（其他）：kp=100~300, kv=20~50 → 维持姿态                   -->
+  <!-- ===================================================================== -->
+  <actuator>
+    <!-- ========== 右臂 5 关节（主动控制）— 高刚度抗重力 + 强阻尼 ==========
+         motor 已禁用（ctrl=0，零力矩），仅 position servo 承力。
+         重力 ≈ 30-50 N·m（肩/肘）→ kp=600 时稳态误差 ≈ 0.05-0.08 rad (3-5°)。
+         再高对 200 Hz 仿真无益（Nyquist 限制）。手腕惯量小，kp=200 足矣。
+         kv=80: 临界阻尼以上（ζ > 5），配合 bridge EMA 平滑（τ=25ms）。 -->
+    <position name="act_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="600" kv="80"/>
+    <position name="act_shoulder_roll"  joint="right_shoulder_roll_joint"  kp="600" kv="80"/>
+    <position name="act_shoulder_yaw"   joint="right_shoulder_yaw_joint"   kp="600" kv="80"/>
+    <position name="act_elbow"          joint="right_elbow_joint"          kp="600" kv="80"/>
+    <position name="act_wrist_roll"     joint="right_wrist_roll_joint"     kp="200" kv="80"/>
+
+    <!-- ========== 左臂 5 关节（锁定）========== -->
+    <position name="act_left_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="300" kv="50"/>
+    <position name="act_left_shoulder_roll"  joint="left_shoulder_roll_joint"  kp="300" kv="50"/>
+    <position name="act_left_shoulder_yaw"   joint="left_shoulder_yaw_joint"   kp="300" kv="50"/>
+    <position name="act_left_elbow"          joint="left_elbow_joint"          kp="300" kv="50"/>
+    <position name="act_left_wrist_roll"     joint="left_wrist_roll_joint"     kp="300" kv="50"/>
+
+    <!-- ========== 左腿 6 关节（锁定）— 高刚度站稳 ========== -->
+    <position name="act_left_hip_pitch"   joint="left_hip_pitch_joint"   kp="500" kv="100"/>
+    <position name="act_left_hip_roll"    joint="left_hip_roll_joint"    kp="500" kv="100"/>
+    <position name="act_left_hip_yaw"     joint="left_hip_yaw_joint"     kp="500" kv="100"/>
+    <position name="act_left_knee"        joint="left_knee_joint"        kp="500" kv="100"/>
+    <position name="act_left_ankle_pitch" joint="left_ankle_pitch_joint" kp="500" kv="100"/>
+    <position name="act_left_ankle_roll"  joint="left_ankle_roll_joint"  kp="500" kv="100"/>
+
+    <!-- ========== 右腿 6 关节（锁定）— 高刚度站稳 ========== -->
+    <position name="act_right_hip_pitch"   joint="right_hip_pitch_joint"   kp="500" kv="100"/>
+    <position name="act_right_hip_roll"    joint="right_hip_roll_joint"    kp="500" kv="100"/>
+    <position name="act_right_hip_yaw"     joint="right_hip_yaw_joint"     kp="500" kv="100"/>
+    <position name="act_right_knee"        joint="right_knee_joint"        kp="500" kv="100"/>
+    <position name="act_right_ankle_pitch" joint="right_ankle_pitch_joint" kp="500" kv="100"/>
+    <position name="act_right_ankle_roll"  joint="right_ankle_roll_joint"  kp="500" kv="100"/>
+
+    <!-- ========== 腰部 3 关节（锁定）========== -->
+    <position name="act_waist_yaw"   joint="waist_yaw_joint"   kp="300" kv="50"/>
+    <position name="act_waist_roll"  joint="waist_roll_joint"  kp="300" kv="50"/>
+    <position name="act_waist_pitch" joint="waist_pitch_joint" kp="300" kv="50"/>
+
+    <!-- ========== 左腕 dummy 关节（锁定）========== -->
+    <position name="act_left_wrist_pitch" joint="left_wrist_pitch_joint" kp="100" kv="20"/>
+    <position name="act_left_wrist_yaw"   joint="left_wrist_yaw_joint"   kp="100" kv="20"/>
+
+    <!-- ========== 右腕 dummy 关节（锁定）========== -->
+    <position name="act_right_wrist_pitch" joint="right_wrist_pitch_joint" kp="100" kv="20"/>
+    <position name="act_right_wrist_yaw"   joint="right_wrist_yaw_joint"   kp="100" kv="20"/>
+  </actuator>
+
+  <!--
+  ============================================================================
+  传感器 — MJCF include 已自带所有关节 pos/vel/torque 传感器，此处不重复定义
+  ============================================================================
+  -->
+
+</mujoco>

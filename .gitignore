@@ -1,20 +1,21 @@
-# Claude AI 本地配置
-.claude/
-
-# 编译产物
+# Build
 build/
-devel/
-*.o
-*.so
+install/
+log/
 
 # IDE
 .vscode/
 .idea/
-
-# 项目文档（不上传）
-日志.md
-要求.txt
+*.swp
+*~
 
 # Python
 __pycache__/
 *.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

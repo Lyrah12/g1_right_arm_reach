@@ -34,6 +34,28 @@ find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(action_msgs REQUIRED)
+
+# MODULE: Custom Messages and Actions
+# ============================================================================
+
+# Generate ROS2 interfaces for vision-grasp communication.
+# These are used by reach_node (C++) and mujoco_bridge_node (Python).
+rosidl_generate_interfaces(${PROJECT_NAME}
+    # --- Messages ---
+    "msg/DetectedObject.msg"
+    "msg/DetectedObjectArray.msg"
+    "msg/ArmStatus.msg"
+    "msg/GraspResult.msg"
+    # --- Actions ---
+    "action/GraspObject.action"
+    DEPENDENCIES
+        std_msgs
+        geometry_msgs
+        action_msgs
+    ADD_LINTER_TESTS
+)
 
 # MODULE: Core Library — robot model + kinematics (Pinocchio wrapper)
 # ============================================================================
@@ -82,6 +104,7 @@ target_link_libraries(g1_controllers
 add_executable(reach_node src/reach_node.cpp)
 target_link_libraries(reach_node g1_right_arm_core g1_controllers)
 ament_target_dependencies(reach_node rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs)
+rosidl_target_interfaces(reach_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 # target_publisher_node: testing utility that publishes a marker pose so the
 # reach_node has a target to track without needing external input.
@@ -99,6 +122,12 @@ install(TARGETS g1_right_arm_core g1_controllers reach_node target_publisher_nod
 
 install(DIRECTORY include/
     DESTINATION include
+)
+
+# Install Python scripts (MuJoCo bridge, utilities)
+install(PROGRAMS
+    scripts/mujoco_bridge_node.py
+    DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch config

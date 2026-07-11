@@ -1,0 +1,20 @@
+# GraspObject.action — 抓取物体动作
+#
+# 视觉模块作为 Action Client 发送抓取请求，
+# reach_node 作为 Action Server 执行并反馈进度。
+
+# Request（视觉 → 抓取）
+string    object_id
+geometry_msgs/PoseStamped  grasp_pose
+string    grasp_type
+float64   approach_distance  0.05
+---
+# Result（抓取 → 视觉）
+bool      success
+float64   final_error
+string    error_msg
+---
+# Feedback（抓取 → 视觉，执行过程中持续发送）
+string    current_phase
+float64   position_error
+float64   progress_percent
