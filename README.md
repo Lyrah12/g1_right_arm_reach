@@ -1,27 +1,46 @@
-# G1 右臂抓取控制器
+<p align="center">
+  <h1 align="center">G1 右臂抓取控制器</h1>
+  <p align="center">ROS 2 + Pinocchio + MuJoCo · 任务空间 PID IK · 收敛 ≤1cm</p>
+</p>
 
-基于 ROS2 Jazzy + Pinocchio + MuJoCo，控制宇树 G1 右臂到达目标点并实现灵巧手抓取。收敛误差 ≤ 1cm，调节时间 ~1.8s。
+---
 
-## 阶段
+## 运行效果
 
-| 阶段 | 状态 | 内容 |
-|------|:----:|------|
-| Phase 1 | ✅ | RViz 运动学演示 — PID IK |
-| Phase 2 | ✅ | MuJoCo 物理仿真 — 重力/接触/相机 |
-| Phase 3 | 🔧 | 灵巧手操作 — 指尖→掌心映射 + 抓取动作库 |
-| Phase 4 | 📋 | 视觉模块对接 |
-| Phase 5 | 🔮 | 真机部署 |
+20Hz PID 控制器驱动 G1 右臂 5 自由度到达三维目标点，MuJoCo 200Hz 物理仿真闭环。
+
+```
+收敛时间 ~1.7s  |  稳态误差 ≤ 1cm  |  支持运行时动态调参
+```
+
+## 坐标系
+
+**世界坐标系**（MuJoCo global），原点 = 骨盆正下方地面：
+
+| 轴 | 方向 |
+|----|------|
+| +X | 机器人前方 |
+| +Y | 机器人**左侧**（右臂在 -Y） |
+| +Z | 垂直向上（重力 -Z） |
+
+| 关键位置 | 世界坐标 |
+|----------|----------|
+| 骨盆 | (0, 0, 0.823) |
+| 桌面 | (0.50, -0.15, 0.77) |
+| 杯子 | (0.20, 0.00, 0.85) |
+| 方块 | (0.30, -0.10, 0.795) |
+
+> `/target_point` 锁定 **腕关节**（`right_wrist_roll_rubber_hand`），手掌 mesh 向前延伸 ~10cm。抓取时请偏移。
 
 ## 快速开始
 
-### 环境
+### 依赖
 
 ```bash
-# ROS2 Jazzy + 依赖
-sudo apt install -y ros-jazzy-desktop ros-jazzy-pinocchio ros-jazzy-rviz2 \
-    ros-jazzy-robot-state-publisher ros-jazzy-cv-bridge libeigen3-dev
+# ROS 2 Jazzy
+sudo apt install ros-jazzy-desktop ros-jazzy-pinocchio ros-jazzy-robot-state-publisher
 
-# MuJoCo
+# Python
 pip install --break-system-packages mujoco opencv-python "numpy<2"
 
 # G1 模型
@@ -30,7 +49,7 @@ git clone https://github.com/unitreerobotics/unitree_ros.git
 git clone https://github.com/unitreerobotics/unitree_mujoco.git
 ```
 
-### 构建
+### 编译
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -39,89 +58,94 @@ colcon build --packages-select g1_right_arm_reach --cmake-args -DCMAKE_BUILD_TYP
 source install/setup.bash
 ```
 
-### 运行
+### 启动
 
 ```bash
-# Phase 1: 运动学演示
-ros2 launch g1_right_arm_reach rviz_demo.launch.py \
-    urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_23dof_rev_1_0.urdf
-
-# Phase 2: MuJoCo 物理仿真
-sed -i 's|g1_23dof.xml|'${HOME}'/deps/unitree_mujoco/unitree_robots/g1/g1_23dof.xml|' \
-    ~/g1_ws/src/g1_right_arm_reach/config/g1_grasp_scene.xml
 ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
     urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_23dof_rev_1_0.urdf \
-    scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_grasp_scene.xml
-
-# 发送目标（世界坐标，pelvis 高 0.793m）
-ros2 topic pub /target_point geometry_msgs/msg/Point "{x: 0.15, y: -0.15, z: 0.90}" -1
+    scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_grasp_scene.xml \
+    viewer:=true
 ```
 
-### 调参
+### 发送目标
 
 ```bash
-ros2 param set /reach_node pid.kp 2.0   # 运行时动态调整
-ros2 topic echo /debug/position_error    # 监控误差
+# 杯子附近
+ros2 topic pub /target_point geometry_msgs/msg/Point "{x: 0.20, y: 0.00, z: 0.90}" -1
+
+# 方块附近
+ros2 topic pub /target_point geometry_msgs/msg/Point "{x: 0.20, y: -0.10, z: 0.85}" -1
 ```
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `pid.kp` | 1.5 | 比例增益 |
-| `pid.ki` | 0.5 | 积分增益 |
-| `pid.tolerance` | 0.01 | 收敛容差 (m) |
+### 监控 & 调参
+
+```bash
+ros2 topic echo /debug/position_error              # 位置误差
+ros2 param set /reach_node pid.kp 2.5               # 增大增益
+ros2 param set /reach_node pid.ki 0.8               # 增大积分
+ros2 param set /reach_node pid.posture_gain 0.3     # 调整姿态吸引
+```
 
 ## 架构
 
 ```
-Phase 2:  /target_point → reach_node (PID IK) ←→ mujoco_bridge (200Hz 物理)
-                             ↓                        ↓
-                       /joint_commands           /joint_states
-                                                  /actual_ee_pose (世界系)
-                                                  /camera/rgb /camera/depth
-
-Phase 3:  抓取动作库 (YAML) → 掌心 IK + 指尖 FK → /joint_commands (臂+手指)
+  /target_point                /actual_ee_pose
+  (世界坐标)                   /mujoco_jacobian
+       │                       /joint_states
+       ▼                            ▲
+┌─────────────────┐    /joint_commands    ┌──────────────────────────┐
+│   reach_node    │ ────────────────────► │   mujoco_bridge_node     │
+│   PID IK 20Hz   │                       │   物理仿真 200Hz          │
+│                 │                       │                          │
+│ · 阻尼伪逆       │                       │ · EMA 平滑 (α=0.2)       │
+│ · 零空间姿态吸引  │                       │ · Position servo         │
+│ · 抗积分饱和      │                       │   (kp=300, kv=5)         │
+│ · 发散检测       │                       │ · 骨盆+关节 hard clamp    │
+└─────────────────┘                       │ · 数值 Jacobian           │
+                                          └────────────┬─────────────┘
+                                                       │
+                                                       ▼
+                                                MuJoCo 物理引擎
+                                               (2ms 步长, 重力 -9.81)
 ```
 
-核心原则：`reach_node` 只与 Topic 交互，不感知底层是仿真还是真机。
+`reach_node` 只通过 Topic 通信，不区分仿真还是真机。
 
-## Phase 3规划: 灵巧手操作
+## 参数
 
-核心思路：**不同物体的抓取 = 手指末端相对掌心的位置配置不同** → 建立可复用的抓取动作库。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `pid.kp` | 2.0 | 比例增益 |
+| `pid.ki` | 0.4 | 积分增益 |
+| `pid.kd` | 0.05 | 微分增益 |
+| `pid.damping` | 2e-4 | 阻尼伪逆 λ |
+| `pid.tolerance` | 0.01 | 收敛容差 (m) |
+| `pid.posture_gain` | 0.2 | 零空间姿态吸引 |
+| `reach_node.base_offset` | `[0, 0, 0.793]` | 骨盆世界位置 |
 
-### 子任务
+完整参数列表见 [`config/params.yaml`](config/params.yaml)。
 
-| # | 任务 | 说明 |
-|---|------|------|
-| 3.1 | 手指运动学模型 | 扩展 `active_joints` 加入手指关节，建立指尖 FK（相对掌心） |
-| 3.2 | 掌心 IK | 掌心世界位姿 + 指尖配置 → 全臂+手关节角度 |
-| 3.3 | 抓取动作库 | YAML 定义标准抓取姿态（捏取/包络/钩取/球形） |
-| 3.4 | MuJoCo 仿真验证 | 接触力分布、抓取稳定性测试 |
-| 3.5 | 力控/柔顺 | 力矩控制防抓碎（鸡蛋、纸杯） |
+## 项目阶段
 
-### 抓取类型
+| 阶段 | 状态 | 内容 |
+|------|:----:|------|
+| 运动学仿真 | ✅ | RViz + Pinocchio FK/IK |
+| 物理仿真 | ✅ | MuJoCo 重力/接触/相机/Jacobian |
+| 灵巧手 | 🔧 | 手指运动学 + 抓取动作库 |
+| 视觉对接 | 📋 | 检测→目标→抓取闭环 |
+| 真机部署 | 🔮 | G1 实机 |
 
-| 类型 | 适用物体 | 指尖特征 |
-|------|----------|----------|
-| 捏取 (precision) | 鸡蛋、瓶盖 | 拇指对向食/中指 |
-| 包络 (power) | 电缆、工具柄 | 五指屈曲合拢 |
-| 侧捏 (lateral) | 卡片、钥匙 | 拇指侧压食指 |
-| 球形 (spherical) | 苹果、网球 | 五指张开环抱 |
-
-## Phase 4规划: 视觉模块接口 
-
-| Topic | 类型 | 方向 |
-|-------|------|:----:|
-| `/grasp_target` | `PoseStamped` | 视觉 → 抓取 |
-| `/arm_status` | `ArmStatus` | 抓取 → 视觉 |
-| `/grasp_result` | `GraspResult` | 抓取 → 视觉 |
-
-## 测试
+## 开发
 
 ```bash
+# 编译（Release）
+colcon build --packages-select g1_right_arm_reach --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# 测试
 export G1_TEST_URDF_PATH=${HOME}/deps/unitree_ros/robots/g1_description/g1_23dof_rev_1_0.urdf
 colcon test --packages-select g1_right_arm_reach
 ```
 
-## 许可证
+## 许可
 
 BSD-3-Clause

@@ -57,6 +57,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState, Image
 from geometry_msgs.msg import WrenchStamped, PointStamped
+from std_msgs.msg import Float64MultiArray
 from cv_bridge import CvBridge
 
 
@@ -114,7 +115,13 @@ class MuJoCoBridgeNode(Node):
             'right_elbow_joint',
             'right_wrist_roll_joint',
         ])  # 主动控制关节（由 /joint_commands 更新）
-        self.declare_parameter('clamp_arm_joints', True)  # 手臂关节硬夹持，防止重力下垂/抖动
+        self.declare_parameter('clamp_arm_joints', False)  # 手臂关节硬夹持（默认关闭，靠位置伺服）
+        self.declare_parameter('hard_clamp_pelvis', True)   # 硬夹持骨盆（固定机器人位置）
+        self.declare_parameter('hard_clamp_joints', True)   # 硬夹持非右臂关节（除右臂外全部锁死）
+
+        # 实际读取硬夹持参数值（在 MuJoCo 加载后赋值）
+        self.hard_clamp_pelvis = False
+        self.hard_clamp_joints = False
 
         # -----------------------------------------------------------------
         # SECTION: 加载 MuJoCo 场景
@@ -280,8 +287,11 @@ class MuJoCoBridgeNode(Node):
         # ─────────────────────────────────────────────────────────────
         self.init_pelvis_pos = np.array(self.data.qpos[0:3].copy(), dtype=np.float64)
         self.init_pelvis_quat = np.array(self.data.qpos[3:7].copy(), dtype=np.float64)
+        # 骨盆抬高 3cm（z += 0.03），减少脚底穿透地面的深度，避免接触力反弹振荡
+        self.init_pelvis_pos[2] += 0.03
+        self.data.qpos[0:3] = self.init_pelvis_pos
         self.get_logger().info(
-            f"骨盆初始位置 (MJCF qpos0): [{self.init_pelvis_pos[0]:.3f}, "
+            f"骨盆初始位置 (MJCF qpos0 + 抬高): [{self.init_pelvis_pos[0]:.3f}, "
             f"{self.init_pelvis_pos[1]:.3f}, {self.init_pelvis_pos[2]:.3f}]"
         )
 
@@ -338,6 +348,14 @@ class MuJoCoBridgeNode(Node):
             f"{total_pos_ctrl} 个 position servo → ctrl=qpos0"
         )
 
+        # 读取硬夹持参数（必须在 MuJoCo 加载后）
+        self.hard_clamp_pelvis = self.get_parameter('hard_clamp_pelvis').get_parameter_value().bool_value
+        self.hard_clamp_joints = self.get_parameter('hard_clamp_joints').get_parameter_value().bool_value
+        self.get_logger().info(
+            f"硬夹持配置: pelvis={'ON' if self.hard_clamp_pelvis else 'OFF'}, "
+            f"joints={'ON' if self.hard_clamp_joints else 'OFF'}"
+        )
+
         # ─────────────────────────────────────────────────────────────
         # 设置右臂 "预备跑" 姿态（微屈肘，手在前方 ≈ 跑步预备姿势）
         # 在 MJCF 默认站立姿态基础上覆盖右臂 5 关节
@@ -361,10 +379,10 @@ class MuJoCoBridgeNode(Node):
         self.get_logger().info(f"右臂 MJCF 默认 qpos: {', '.join(default_arm_q)}")
 
         arm_ready_pose = {
-            'right_shoulder_pitch_joint':  0.0,   # 上臂竖直（贴躯干）
+            'right_shoulder_pitch_joint': -0.2,   # 上臂微前倾（离开Z-min奇异点）
             'right_shoulder_roll_joint':   0.0,   # 不外展
             'right_shoulder_yaw_joint':    0.0,   # 旋转中立
-            'right_elbow_joint':           0.0,   # 肘伸直 → 全臂竖直向下（静止就绪姿态）
+            'right_elbow_joint':           0.3,   # 肘微屈（离开伸直极限，留双向运动空间）
             'right_wrist_roll_joint':      0.0,   # 腕中立
         }
         for joint_name, angle in arm_ready_pose.items():
@@ -392,11 +410,11 @@ class MuJoCoBridgeNode(Node):
                     f"  关节 '{joint_name}' 未在执行器映射中找到，跳过"
                 )
 
-        # 诊断模式：clamp_arm_joints=true → 手臂关节也硬夹持（在就绪姿态）
+        # 手臂关节硬夹持（由参数 clamp_arm_joints 控制）
         clamp_arm = self.get_parameter('clamp_arm_joints').get_parameter_value().bool_value
         if clamp_arm:
-            self.get_logger().warn(
-                "诊断模式：手臂关节硬夹持启用 (--ros-args -p clamp_arm_joints:=false 可关闭)"
+            self.get_logger().info(
+                "手臂关节硬夹持已启用 (--ros-args -p clamp_arm_joints:=true)"
             )
             for joint_name in self.active_joint_names:
                 if joint_name in self.actuator_map:
@@ -515,6 +533,32 @@ class MuJoCoBridgeNode(Node):
             self.ee_pub = None
             self.get_logger().warn("未找到 right_wrist_roll_rubber_hand body，末端位置不发布")
 
+        # --- MuJoCo 数值 Jacobian 发布（供 PID 使用，消除 URDF/MJCF Jacobian 差异）---
+        arm_joint_order = [
+            'right_shoulder_pitch_joint',
+            'right_shoulder_roll_joint',
+            'right_shoulder_yaw_joint',
+            'right_elbow_joint',
+            'right_wrist_roll_joint',
+        ]
+        self.arm_joint_qpos_addrs = []  # [qpos_addr, ...] 按 arm_joint_order 顺序
+        for joint_name in arm_joint_order:
+            if joint_name in self.actuator_map_primary:
+                act_id = self.actuator_map_primary[joint_name]
+                act_joint_id = self.model.actuator_trnid[act_id][0]
+                qpos_addr = self.model.jnt_qposadr[act_joint_id]
+                self.arm_joint_qpos_addrs.append(qpos_addr)
+            else:
+                self.get_logger().warn(f"Jacobian: 关节 '{joint_name}' 不在 actuator_map 中")
+        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) == 5:
+            self.jac_pub = self.create_publisher(Float64MultiArray, '/mujoco_jacobian', 10)
+            self.get_logger().info(
+                f"MuJoCo 数值 Jacobian 发布已启用 (5 关节, qpos_addrs={self.arm_joint_qpos_addrs})"
+            )
+        else:
+            self.jac_pub = None
+            self.get_logger().warn("Jacobian 发布禁用（EE body 或 arm joint qpos 地址缺失）")
+
         # -----------------------------------------------------------------
         # SECTION: 仿真定时器
         # -----------------------------------------------------------------
@@ -619,48 +663,69 @@ class MuJoCoBridgeNode(Node):
                     # （已在 __init__ 中设好），不需要平滑（目标值不变）
                     pass
 
-        # 1.5 夹持 floating_base + 锁定关节（双重锁死：硬覆写 + 位置伺服）
-        #     pelvis 是自由关节，无 position 执行器，必须硬夹持。
-        #     锁定关节：硬夹持消除累积漂移，position 伺服在步内提供连续力矩。
-        self.data.qpos[0:3] = self.init_pelvis_pos
-        self.data.qpos[3:7] = self.init_pelvis_quat
-        self.data.qvel[0:6] = 0.0
-        self.data.qfrc_applied[0:6] = 0.0
+        # 1.5 根据参数决定是否硬夹持（默认关闭，完全依赖位置伺服 + 足地接触）
+        if self.hard_clamp_pelvis:
+            self.data.qpos[0:3] = self.init_pelvis_pos
+            self.data.qpos[3:7] = self.init_pelvis_quat
+            self.data.qvel[0:6] = 0.0
+            self.data.qfrc_applied[0:6] = 0.0
 
-        for clamp_entry in self.locked_joint_clamps:
-            qpos_addr = clamp_entry[0]
-            target_val = clamp_entry[1]
-            dof_addr = clamp_entry[2]
-            self.data.qpos[qpos_addr] = target_val
-            if dof_addr >= 0:
-                self.data.qvel[dof_addr] = 0.0
+        if self.hard_clamp_joints:
+            for clamp_entry in self.locked_joint_clamps:
+                qpos_addr = clamp_entry[0]
+                target_val = clamp_entry[1]
+                dof_addr = clamp_entry[2]
+                self.data.qpos[qpos_addr] = target_val
+                if dof_addr >= 0:
+                    self.data.qvel[dof_addr] = 0.0
 
         # 2. 步进物理
         mujoco.mj_step(self.model, self.data)
 
-        # 每 10 秒检查基座/锁定关节漂移（条件触发，常态静默）
+        # 每 10 秒检查基座漂移（仅在硬夹持骨盆时检查，否则漂移是正常的）
         if self.step_counter % 2000 == 0:
-            drift = float(np.linalg.norm(self.data.qpos[0:3] - self.init_pelvis_pos))
-            if drift > 5e-3:  # 5mm 以上才告警（之前 0.1mm 过于敏感）
-                self.get_logger().warn(
-                    f"基座漂移: |drift|={drift:.4f} m "
-                    f"(pelvis={self.data.qpos[0]:.4f},{self.data.qpos[1]:.4f},{self.data.qpos[2]:.4f})"
-                )
-            # 锁定关节漂移诊断（仅检查非手臂关节）
-            max_lock_drift = 0.0
-            max_lock_name = ""
-            for joint_name, qpos_addr, init_q in self.locked_joint_info:
-                if joint_name in self.active_joint_names:
-                    continue  # 跳过主动关节——它们本就应该运动
-                d = abs(float(self.data.qpos[qpos_addr]) - init_q)
-                if d > max_lock_drift:
-                    max_lock_drift = d
-                    max_lock_name = joint_name
-            if max_lock_drift > 0.05:  # 2.9° 以上才告警（之前 0.01 rad ≈ 0.6° 过于敏感）
-                self.get_logger().warn(
-                    f"锁定关节最大漂移: {max_lock_name} = {max_lock_drift:.4f} rad "
-                    f"({max_lock_drift*57.3:.1f}°) — 检查执行器 kp/kv 是否足够"
-                )
+            if self.hard_clamp_pelvis:
+                drift = float(np.linalg.norm(self.data.qpos[0:3] - self.init_pelvis_pos))
+                if drift > 5e-3:
+                    self.get_logger().warn(
+                        f"基座漂移: |drift|={drift:.4f} m "
+                        f"(pelvis={self.data.qpos[0]:.4f},{self.data.qpos[1]:.4f},{self.data.qpos[2]:.4f})"
+                    )
+            # 锁定关节漂移诊断（仅在硬夹持时检查，无硬夹持时漂移是正常现象）
+            if self.hard_clamp_joints:
+                max_lock_drift = 0.0
+                max_lock_name = ""
+                for joint_name, qpos_addr, init_q in self.locked_joint_info:
+                    if joint_name in self.active_joint_names:
+                        continue
+                    d = abs(float(self.data.qpos[qpos_addr]) - init_q)
+                    if d > max_lock_drift:
+                        max_lock_drift = d
+                        max_lock_name = joint_name
+                if max_lock_drift > 0.05:
+                    self.get_logger().warn(
+                        f"锁定关节最大漂移: {max_lock_name} = {max_lock_drift:.4f} rad "
+                        f"({max_lock_drift*57.3:.1f}°) — 检查执行器 kp/kv 是否足够"
+                    )
+
+        # 每 2 秒输出精简状态摘要（400 步 / 200 Hz）
+        if self.step_counter % 400 == 0 and self.ee_body_id >= 0:
+            ee_pos = self.data.xpos[self.ee_body_id]
+            # 快速关节状态摘要
+            arm_summary = []
+            for joint_name in self.active_joint_names:
+                if joint_name in self.actuator_map_primary:
+                    act_id = self.actuator_map_primary[joint_name]
+                    act_joint_id = self.model.actuator_trnid[act_id][0]
+                    qpos_addr = self.model.jnt_qposadr[act_joint_id]
+                    short = joint_name.replace('right_', '').replace('_joint', '')
+                    arm_summary.append(
+                        f"{short}={float(self.data.qpos[qpos_addr]):+.2f}"
+                    )
+            self.get_logger().info(
+                f"EE=[{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}] | "
+                f"arm: {' '.join(arm_summary)}"
+            )
 
         # 每 30 秒输出右臂状态摘要（6000 步 / 200 Hz）
         if self.step_counter % 6000 == 0:
@@ -691,7 +756,10 @@ class MuJoCoBridgeNode(Node):
                         f"τ_m={motor_f:.0f} τ_p={pos_f:.0f} τ_tot={total_f:.0f}"
                     )
             self.get_logger().info(
-                f"右臂 [cmd/act/err(rad)/vel(rad/s)/τ_m/τ_p/τ_tot(N·m)]:\n  " +
+                f"右臂诊断 [cmd/act/err(rad)/vel(rad/s)/τ_m/τ_p/τ_tot(N·m)]: "
+                f"EE=({float(self.data.xpos[self.ee_body_id][0]):.3f}, "
+                f"{float(self.data.xpos[self.ee_body_id][1]):.3f}, "
+                f"{float(self.data.xpos[self.ee_body_id][2]):.3f})\n  " +
                 "\n  ".join(arm_diag_parts)
             )
 
@@ -701,6 +769,8 @@ class MuJoCoBridgeNode(Node):
         # 3.5 发布 MuJoCo 真实末端位置（20Hz，与 PID 同频）
         if self.ee_pub is not None and self.step_counter % 10 == 0:
             self._publish_ee_pose()
+            if self.jac_pub is not None:
+                self._publish_jacobian()
 
         # 4. 按降频渲染相机
         self.step_counter += 1
@@ -731,6 +801,42 @@ class MuJoCoBridgeNode(Node):
         msg.point.y = float(pos[1])
         msg.point.z = float(pos[2])
         self.ee_pub.publish(msg)
+
+    def _publish_jacobian(self):
+        """发布 /mujoco_jacobian — MuJoCo 3×5 中心差分数值 Jacobian。
+
+        对 5 个主动关节分别 ±ε 扰动，用 mj_forward() 计算 EE 位移。
+        扰动后恢复原始 qpos，不改变仿真状态。
+        """
+        eps = 0.001  # rad
+        J = np.zeros((3, 5), dtype=np.float64)
+
+        # 保存并扰动各关节
+        for i, qpos_addr in enumerate(self.arm_joint_qpos_addrs):
+            orig = float(self.data.qpos[qpos_addr])
+
+            # +ε
+            self.data.qpos[qpos_addr] = orig + eps
+            mujoco.mj_forward(self.model, self.data)
+            pos_plus = self.data.xpos[self.ee_body_id].copy()
+
+            # −ε
+            self.data.qpos[qpos_addr] = orig - eps
+            mujoco.mj_forward(self.model, self.data)
+            pos_minus = self.data.xpos[self.ee_body_id].copy()
+
+            # 中心差分
+            J[:, i] = (pos_plus - pos_minus) / (2.0 * eps)
+
+            # 恢复
+            self.data.qpos[qpos_addr] = orig
+
+        # 恢复完整运动学状态
+        mujoco.mj_forward(self.model, self.data)
+
+        msg = Float64MultiArray()
+        msg.data = J.flatten().tolist()  # row-major: [J00..J04, J10..J14, J20..J24]
+        self.jac_pub.publish(msg)
 
     def _publish_joint_states(self):
         """发布 /joint_states（所有主动关节的位置 + 速度）。"""

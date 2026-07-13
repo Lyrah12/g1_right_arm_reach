@@ -4,7 +4,10 @@
  *
  *  Usage:
  *    ros2 run g1_right_arm_reach target_publisher_node
- *    ros2 run g1_right_arm_reach target_publisher_node --ros-args -p target:="[0.30,-0.45,0.25]"
+ *    ros2 run g1_right_arm_reach target_publisher_node --ros-args -p target:="[0.30,-0.10,0.88]"
+ *
+ *  TARGET FRAME: world coordinates (x=fwd, y=left, z=up), targets the right
+ *  rubber hand WRIST JOINT origin.
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -24,7 +27,7 @@ public:
         : Node("target_publisher_node")
     {
         // Declare ROS2 parameters with defaults.
-        this->declare_parameter("target", "0.10,-0.15,0.10");
+        this->declare_parameter("target", "0.20,-0.05,0.88");
         this->declare_parameter("rate", 10.0);  // publishing frequency in Hz
 
         std::string target_str = this->get_parameter("target").as_string();

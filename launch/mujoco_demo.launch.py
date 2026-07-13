@@ -79,5 +79,11 @@ def generate_launch_description():
         DeclareLaunchArgument('use_test_target', default_value='false'),
         DeclareLaunchArgument('viewer', default_value='false',
             description='Open MuJoCo interactive viewer'),
+        DeclareLaunchArgument('hard_clamp_pelvis', default_value='false',
+            description='Hard-clamp pelvis free joint'),
+        DeclareLaunchArgument('hard_clamp_joints', default_value='false',
+            description='Hard-clamp locked joint qpos'),
+        DeclareLaunchArgument('clamp_arm_joints', default_value='false',
+            description='Hard-clamp arm joints'),
         OpaqueFunction(function=launch_setup),
     ])

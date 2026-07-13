@@ -12,7 +12,6 @@
 
 #include <iostream>
 #include <algorithm>
-#include <map>
 #include <unordered_set>
 
 namespace g1_right_arm_reach {
@@ -55,7 +54,6 @@ RobotModel::RobotModel(
     extractJointLimits();
     q_ = pinocchio::neutral(reduced_model_);
     dq_ = Eigen::VectorXd::Zero(reduced_model_.nv);
-    q_full_actual_ = q_ref_full_;
     updateKinematics();
 
     std::cout << "[RobotModel] Full: " << full_model_.nq << " DOF → Reduced: "
@@ -122,54 +120,9 @@ void RobotModel::updateKinematics()
     pinocchio::updateFramePlacements(reduced_model_, reduced_data_);
 }
 
-void RobotModel::updateKinematicsFullActual()
-{
-    pinocchio::forwardKinematics(full_model_, full_data_, q_full_actual_);
-    pinocchio::updateFramePlacements(full_model_, full_data_);
-}
-
 Eigen::Vector3d RobotModel::getEndEffectorPosition() const
 {
     return reduced_data_.oMf[ee_frame_id_].translation();
-}
-
-Eigen::Vector3d RobotModel::getEndEffectorPositionFull() const
-{
-    return full_data_.oMf[ee_frame_id_full_].translation();
-}
-
-// ============================================================================
-// Joint state → full model sync
-// ============================================================================
-
-void RobotModel::updateFullJointState(
-    const std::vector<std::string>& names,
-    const std::vector<double>& positions)
-{
-    static std::map<std::string, int> name_to_qidx;
-    static bool init = false;
-    if (!init) {
-        for (pinocchio::JointIndex jid = 1; jid < full_model_.joints.size(); ++jid) {
-            int q_idx = full_model_.joints[jid].idx_q();
-            if (q_idx >= 0 && q_idx < full_model_.nq)
-                name_to_qidx[full_model_.names[jid]] = q_idx;
-        }
-        init = true;
-    }
-    for (size_t i = 0; i < names.size() && i < positions.size(); ++i) {
-        auto it = name_to_qidx.find(names[i]);
-        if (it != name_to_qidx.end()) q_full_actual_(it->second) = positions[i];
-    }
-    q_full_initialized_ = true;
-}
-
-void RobotModel::syncActiveToFull()
-{
-    for (size_t i = 0; i < active_joint_ids_full_.size() && i < static_cast<size_t>(q_.size()); ++i) {
-        int q_idx = full_model_.joints[active_joint_ids_full_[i]].idx_q();
-        if (q_idx >= 0 && q_idx < q_full_actual_.size())
-            q_full_actual_(q_idx) = q_(static_cast<int>(i));
-    }
 }
 
 // ============================================================================

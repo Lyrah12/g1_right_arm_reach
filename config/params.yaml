@@ -13,17 +13,19 @@ reach_node:
         - "right_wrist_roll_joint"
 
     pid:
-      kp: 1.5
-      ki: 0.5
+      kp: 2.0
+      ki: 0.4
       kd: 0.05
-      damping: 5.0e-4
+      damping: 2.0e-4
       tolerance: 0.01           # 1 cm
+      posture_gain: 0.2         # null-space pull toward preferred pose
+      posture_target: [-0.2, 0.0, 0.0, 0.3, 0.0]  # preferred joint posture (must match MuJoCo ready pose)
 
     manager:
       control_rate: 20.0
 
     reach_node:
-      base_offset: [0.0, 0.0, 0.793]   # pelvis world position (MuJoCo qpos0)
+      base_offset: [0.0, 0.0, 0.793]   # pelvis world pos = MJCF qpos0 Z (bridge elevates +0.03 → actual z=0.823)
       target_topic: "/target_point"
       joint_state_topic: "/joint_states"
       default_target: [0.20, -0.25, 0.893]  # world frame

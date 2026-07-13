@@ -45,12 +45,6 @@ void Kinematics::computePositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic
 
     robot_.q_ = q_save;
     robot_.updateKinematics();
-
-    static bool once = false;
-    if (!once) {
-        once = true;
-        std::cout << "[Kinematics] Numerical Jacobian, |J|=" << J_pos.norm() << "\n";
-    }
 }
 
 // ============================================================================

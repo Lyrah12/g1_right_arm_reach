@@ -73,18 +73,6 @@ public:
     /// Print model summary to stdout.
     void printSummary() const;
 
-    /// Update FK on the FULL model using q_full_actual_ (correct locked joint positions).
-    void updateKinematicsFullActual();
-
-    /// Get end-effector position from the FULL model FK data.
-    Eigen::Vector3d getEndEffectorPositionFull() const;
-
-    /// Update full 23-DOF joint state from a /joint_states message.
-    void updateFullJointState(const std::vector<std::string>& names,
-                              const std::vector<double>& positions);
-
-    /// Sync active joint positions from q_ (5-DOF) into q_full_actual_ (23-DOF).
-    void syncActiveToFull();
 
     // ------------------------------------------------------------------
     // Getters
@@ -119,9 +107,9 @@ public:
     Eigen::VectorXd q_;        ///< Current config (5-DOF)
     Eigen::VectorXd dq_;       ///< Current velocities (5-DOF)
 
-    Eigen::VectorXd q_ref_full_;     ///< Full-model reference config (23-DOF)
-    Eigen::VectorXd q_full_actual_;  ///< Full-model actual config from /joint_states
-    bool q_full_initialized_{false}; ///< True after first joint state received
+    Eigen::VectorXd q_ref_full_;     ///< Full-model reference config for buildReducedModel (23-DOF)
+
+    // NOTE: Full-model FK (q_full_actual_, updateKinematicsFullActual, etc.) was removed.
 
 private:
     /// Identify which full-model joints to lock (all except active ones).
