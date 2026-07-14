@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Phase 2 MuJoCo physics simulation launch file.
+MuJoCo physics simulation launch — Arm-Hand decoupled control.
 
-Architecture:
-  reach_node ←→ /joint_commands /joint_states ←→ mujoco_bridge_node (MuJoCo)
-                                                        ↓
-                                               /actual_ee_pose /camera/...
-                                               RViz (optional)
+  reach_node (50Hz) ←→ /joint_commands /joint_states ←→ mujoco_bridge_node (200Hz)
+       ↑                                                        │
+  /target_pose (PoseStamped)                         /actual_ee_pose, /mujoco_jacobian
+  (shoulder-relative)                                              │
+                                                          RViz (optional)
+
+Usage:
+  ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
+    urdf_path:=/path/to/g1_23dof_rev_1_0.urdf \
+    scene_path:=/path/to/g1_grasp_scene.xml \
+    viewer:=true use_test_target:=false
 """
 import os, re
 
@@ -55,7 +61,10 @@ def launch_setup(context, *args, **kwargs):
 
         Node(package='g1_right_arm_reach', executable='reach_node',
              parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
-                         {'robot_model.urdf_path': urdf_path}],
+                         {'robot_model.urdf_path': urdf_path},
+                         {'pid.torque_mode': False},
+                         {'pid.gravity_compensation': False},
+                         {'manager.control_rate': 50.0}],
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='target_publisher_node',

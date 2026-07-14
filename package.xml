@@ -4,9 +4,9 @@
   <name>g1_right_arm_reach</name>
   <version>0.1.0</version>
   <description>
-    G1 humanoid robot right arm reaching controller.
-    Pure PID control with damped pseudoinverse IK, variable gain,
-    integral anti-windup, and null-space joint-limit avoidance.
+    G1 right arm end-effector control with Arm-Hand decoupled architecture.
+    4-DOF arm IK (damped pseudoinverse + null-space) for wrist positioning,
+    variable-DOF wrist solver for hand orientation. 23-DOF / 29-DOF compatible.
   </description>
   <maintainer email="user@example.com">G1 Developer</maintainer>
   <license>BSD-3-Clause</license>

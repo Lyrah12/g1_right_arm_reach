@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """
-mujoco_bridge_node.py — ROS2 ↔ MuJoCo 物理仿真桥接节点
-========================================================
+MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation.
 
-替代 joint_state_publisher 的纯运动学闭环，提供完整的物理仿真：
-  - 重力、碰撞、接触力
-  - 虚拟相机（RGB + 深度图）
-  - 腕部力/力矩传感器
+Pipelines:
+  /joint_commands (JointState)   → MuJoCo position-servo actuators
+  MuJoCo physics step (200 Hz)   → /joint_states, /actual_ee_pose, /mujoco_jacobian
 
-架构：
-  reach_node                     mujoco_bridge_node
-  ──────────                     ──────────────────
-  /joint_commands (JointState) ───→ 写入 MuJoCo ctrl
-                                    ↓ 步进物理仿真
-  /joint_states   (JointState) ←─── 读取传感器数据
-  /camera/rgb     (Image)      ←─── 渲染虚拟相机
-  /camera/depth   (Image)      ←─── 渲染深度图
-  /wrist_ft       (Wrench)     ←─── 腕部力/力矩（Phase 3）
+Also publishes: /camera/rgb, /camera/depth, /wrist_ft (optional).
 
-依赖：
-  pip install mujoco opencv-python
-  # cv_bridge 用于 ROS2 Image 转换（可选，无 cv_bridge 时用 numpy 裸发）
-
-用法：
-  ros2 run g1_right_arm_reach mujoco_bridge_node \
-      --ros-args -p scene_path:=/path/to/g1_grasp_scene.xml
+Dependencies: pip install mujoco opencv-python "numpy<2"
 """
 
 import os
@@ -295,6 +279,29 @@ class MuJoCoBridgeNode(Node):
             f"{self.init_pelvis_pos[1]:.3f}, {self.init_pelvis_pos[2]:.3f}]"
         )
 
+        # ─────────────────────────────────────────────────────────────
+        # 左臂归零：MJCF 默认 qpos0 可能非零，在锁死前强制归零
+        # 确保左右臂对称自然下垂
+        # ─────────────────────────────────────────────────────────────
+        left_arm_joints = [
+            'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
+            'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
+        ]
+        left_arm_zeroed = []
+        for joint_name in left_arm_joints:
+            if joint_name in self.actuator_map_primary:
+                act_id = self.actuator_map_primary[joint_name]
+                act_joint_id = self.model.actuator_trnid[act_id][0]
+                qpos_addr = self.model.jnt_qposadr[act_joint_id]
+                old_q = float(self.data.qpos[qpos_addr])
+                self.data.qpos[qpos_addr] = 0.0
+                short = joint_name.replace('left_', '').replace('_joint', '')
+                left_arm_zeroed.append(f"{short}: {old_q:.3f}→0.000")
+        if left_arm_zeroed:
+            self.get_logger().info(
+                f"左臂归零（锁死前）: {', '.join(left_arm_zeroed)}"
+            )
+
         # 锁定关节双重锁死：硬夹持（qpos 覆写）+ 位置伺服（步内维持）
         # 使用 list（非 tuple）以便运行时更新手臂关节的目标值
         self.locked_joint_clamps = []  # [[qpos_addr, target_val, dof_addr], ...]
@@ -379,11 +386,11 @@ class MuJoCoBridgeNode(Node):
         self.get_logger().info(f"右臂 MJCF 默认 qpos: {', '.join(default_arm_q)}")
 
         arm_ready_pose = {
-            'right_shoulder_pitch_joint': -0.2,   # 上臂微前倾（离开Z-min奇异点）
-            'right_shoulder_roll_joint':   0.0,   # 不外展
-            'right_shoulder_yaw_joint':    0.0,   # 旋转中立
-            'right_elbow_joint':           0.3,   # 肘微屈（离开伸直极限，留双向运动空间）
-            'right_wrist_roll_joint':      0.0,   # 腕中立
+            'right_shoulder_pitch_joint': -0.3,   # slight forward lean (avoids Jacobian singularity)
+            'right_shoulder_roll_joint':   0.0,
+            'right_shoulder_yaw_joint':    0.0,
+            'right_elbow_joint':           0.3,   # slight bend
+            'right_wrist_roll_joint':      0.0,
         }
         for joint_name, angle in arm_ready_pose.items():
             if joint_name in self.actuator_map:
@@ -494,7 +501,8 @@ class MuJoCoBridgeNode(Node):
         # -----------------------------------------------------------------
         # SECTION: ROS2 订阅 & 发布
         # -----------------------------------------------------------------
-        self.joint_cmd = {}   # {joint_name: position_rad}
+        self.joint_cmd = {}        # {joint_name: position_rad}
+        self.joint_cmd_effort = {}  # {joint_name: effort_Nm} (torque diagnostics)
         self.lock = threading.Lock()
 
         self.cmd_sub = self.create_subscription(
@@ -550,14 +558,18 @@ class MuJoCoBridgeNode(Node):
                 self.arm_joint_qpos_addrs.append(qpos_addr)
             else:
                 self.get_logger().warn(f"Jacobian: 关节 '{joint_name}' 不在 actuator_map 中")
-        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) == 5:
+        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) >= 5:
             self.jac_pub = self.create_publisher(Float64MultiArray, '/mujoco_jacobian', 10)
             self.get_logger().info(
-                f"MuJoCo 数值 Jacobian 发布已启用 (5 关节, qpos_addrs={self.arm_joint_qpos_addrs})"
+                f"MuJoCo 数值 Jacobian 发布已启用 "
+                f"({len(self.arm_joint_qpos_addrs)} 关节, qpos_addrs={self.arm_joint_qpos_addrs})"
             )
         else:
             self.jac_pub = None
-            self.get_logger().warn("Jacobian 发布禁用（EE body 或 arm joint qpos 地址缺失）")
+            self.get_logger().warn(
+                f"Jacobian 发布禁用（EE body={self.ee_body_id}, "
+                f"arm joint qpos_addrs={len(self.arm_joint_qpos_addrs)} 个）"
+            )
 
         # -----------------------------------------------------------------
         # SECTION: 仿真定时器
@@ -607,7 +619,11 @@ class MuJoCoBridgeNode(Node):
     # =========================================================================
 
     def _cmd_callback(self, msg: JointState):
-        """缓存 /joint_commands 中的关节位置。
+        """缓存 /joint_commands 中的关节位置和力矩。
+
+        torque_mode: 位置指令已通过 PID 的 τ→q 转换编码力矩前馈
+        （q_cmd = q_ik + (τ_cmd + Kv·dq) / Kp_inner）。
+        桥接节点直接使用位置指令，无需额外处理。
 
         线程安全：使用 lock 保护 joint_cmd 字典的写入。
 
@@ -617,6 +633,9 @@ class MuJoCoBridgeNode(Node):
         with self.lock:
             for name, pos in zip(msg.name, msg.position):
                 self.joint_cmd[name] = pos
+            # 缓存力矩信息（用于诊断日志）
+            for name, eff in zip(msg.name, msg.effort):
+                self.joint_cmd_effort[name] = eff
 
     # =========================================================================
     # MODULE: Physics Loop
@@ -632,12 +651,9 @@ class MuJoCoBridgeNode(Node):
           4. 每 N 步渲染并发布相机图像
           5. 发布腕部力/力矩
         """
-        # 1. 写入最新关节指令到执行器（带平滑，消除 20Hz→200Hz 阶跃）
-        #    reach_node 每 50ms 更新一次 /joint_commands，如果不加平滑，
-        #    MuJoCo 位置伺服会在每个新指令到达时面临目标阶跃 →
-        #    瞬态大扭矩 → 激起振荡。
-        #    平滑策略：指数移动平均，时间常数 ≈ 25ms（半个 reach_node 周期），
-        #    足够滤除阶跃同时保持响应速度。
+        # 1. 写入最新关节指令到执行器（带平滑，消除 50Hz→200Hz 阶跃）
+        #    reach_node 每 20ms 更新一次 /joint_commands（50Hz），
+        #    平滑策略：EMA，alpha=0.3 → τ ≈ 3步=15ms，滤除高频噪声。
         with self.lock:
             for joint_name, act_ids in self.actuator_map.items():
                 if joint_name in self.joint_cmd:
@@ -645,7 +661,7 @@ class MuJoCoBridgeNode(Node):
                     # 使用主执行器做 EMA 平滑
                     act_primary = self.actuator_map_primary[joint_name]
                     prev = self.ctrl_smoothed.get(act_primary, target)
-                    alpha = 0.2  # 每步移动 20% 向目标
+                    alpha = 0.3  # EMA: 每步移动 30% 向目标 (τ≈15ms at 200Hz)
                     smoothed = prev + alpha * (target - prev)
                     # motor → ctrl=0（零力矩）；position servo → ctrl=smoothed（位置目标）
                     for act_id in act_ids:
@@ -809,7 +825,7 @@ class MuJoCoBridgeNode(Node):
         扰动后恢复原始 qpos，不改变仿真状态。
         """
         eps = 0.001  # rad
-        J = np.zeros((3, 5), dtype=np.float64)
+        J = np.zeros((3, len(self.arm_joint_qpos_addrs)), dtype=np.float64)
 
         # 保存并扰动各关节
         for i, qpos_addr in enumerate(self.arm_joint_qpos_addrs):
@@ -835,7 +851,7 @@ class MuJoCoBridgeNode(Node):
         mujoco.mj_forward(self.model, self.data)
 
         msg = Float64MultiArray()
-        msg.data = J.flatten().tolist()  # row-major: [J00..J04, J10..J14, J20..J24]
+        msg.data = J.flatten().tolist()  # row-major: [J00..J06, J10..J16, J20..J26]
         self.jac_pub.publish(msg)
 
     def _publish_joint_states(self):

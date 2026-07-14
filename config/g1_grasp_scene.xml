@@ -65,36 +65,6 @@
     <light name="sun" directional="true" pos="2 2 3" dir="-0.5 -0.5 -1"
            diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
 
-    <!-- ---- 桌面（远离机器人 5cm）---------------------------------------- -->
-    <body name="table" pos="0.50 -0.15 0.75">
-      <geom name="table_top" type="box" size="0.40 0.30 0.02"
-            rgba="0.6 0.4 0.2 1"/>
-      <geom name="leg_fl" type="cylinder" size="0.02 0.35"
-            pos="-0.35 -0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
-      <geom name="leg_fr" type="cylinder" size="0.02 0.35"
-            pos="-0.35  0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
-      <geom name="leg_bl" type="cylinder" size="0.02 0.35"
-            pos=" 0.35 -0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
-      <geom name="leg_br" type="cylinder" size="0.02 0.35"
-            pos=" 0.35  0.25 -0.35" rgba="0.4 0.3 0.2 1"/>
-    </body>
-
-    <!-- ---- 物体1：杯子（世界坐标，几何中心；杯底z=0.77，杯口z=0.93）----- -->
-    <body name="cup" pos="0.2 0.0 0.85">
-      <geom name="cup_body" type="cylinder" size="0.03 0.08"
-            rgba="0.2 0.5 0.8 1" mass="0.15"/>
-      <geom name="cup_bottom" type="cylinder" size="0.028 0.005"
-            pos="0 0 -0.08" rgba="0.15 0.4 0.7 1" mass="0.01"/>
-      <geom name="cup_handle" type="cylinder" size="0.008 0.04"
-            pos="0.035 0 0.03" euler="0 0 0.8" rgba="0.2 0.5 0.8 1" mass="0.02"/>
-    </body>
-
-    <!-- ---- 物体2：方块（世界坐标，5cm立方体几何中心；底面z=0.77贴桌面）----- -->
-    <body name="block" pos="0.3 -0.10 0.795">
-      <geom name="block_geom" type="box" size="0.025 0.025 0.025"
-            rgba="0.9 0.3 0.3 1" mass="0.05"/>
-    </body>
-
     <!-- ---- 虚拟相机（模拟 G1 头部 RGB-D 相机）--------------------------- -->
     <camera name="head_cam"
             pos="0.02 0 0.65"
@@ -109,7 +79,7 @@
   <!--                                                                       -->
   <!-- 增益策略：                                                             -->
   <!--   稳定关节（腿/腰/左臂）：高 kp/kv → PD 刚度对抗重力，保持静止         -->
-  <!--   主动关节（右臂）：低 kp/kv → 学长经验值，外层 PID 补偿                -->
+  <!--   主动关节（右臂）：低 kp/kv → 经验值，外层 PID 补偿                -->
   <!-- ===================================================================== -->
   <actuator>
     <!-- ========== 右臂 5 关节（主动控制）— kp=300 高刚度 + kv=5 低阻尼 ======= -->
@@ -147,7 +117,7 @@
     <position name="act_waist_roll"  joint="waist_roll_joint"  kp="300" kv="20"/>
     <position name="act_waist_pitch" joint="waist_pitch_joint" kp="300" kv="20"/>
 
-    <!-- ========== 腕部 dummy 关节 ========== -->
+    <!-- ========== 腕部 dummy 关节（23-DOF 中不在运动链内，仅保持姿态）========== -->
     <position name="act_left_wrist_pitch" joint="left_wrist_pitch_joint" kp="30" kv="2"/>
     <position name="act_left_wrist_yaw"   joint="left_wrist_yaw_joint"   kp="30" kv="2"/>
     <position name="act_right_wrist_pitch" joint="right_wrist_pitch_joint" kp="30" kv="2"/>

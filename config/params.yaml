@@ -1,36 +1,89 @@
-# G1 Right Arm Reach Controller Parameters
+# =============================================================================
+# G1 Right Arm End-Effector Control — Parameters
+# =============================================================================
+# Architecture: Arm-Hand decoupling (23-DOF hard constraint)
+#   computeArm()   — 4-DOF (shoulder×3 + elbow) → 3-DOF wrist origin position
+#   computeWrist() — 1-DOF (wrist_roll) → hand orientation (under-actuated)
+#
+# Switch to 29-DOF model: wrist_pitch + wrist_yaw become active automatically.
+# Dexterous hand phase: add hand-specific params below the wrist section.
+# =============================================================================
 
 reach_node:
   ros__parameters:
 
+    # -------------------------------------------------------------------------
+    # Robot Model — joint grouping
+    # -------------------------------------------------------------------------
     robot_model:
       urdf_path: ""  # Set via launch argument
-      active_joints:
+
+      active_joints:                        # All 5 right-arm active joints
         - "right_shoulder_pitch_joint"
         - "right_shoulder_roll_joint"
         - "right_shoulder_yaw_joint"
         - "right_elbow_joint"
         - "right_wrist_roll_joint"
 
-    pid:
-      kp: 2.0
-      ki: 0.4
-      kd: 0.05
-      damping: 2.0e-4
-      tolerance: 0.01           # 1 cm
-      posture_gain: 0.2         # null-space pull toward preferred pose
-      posture_target: [-0.2, 0.0, 0.0, 0.3, 0.0]  # preferred joint posture (must match MuJoCo ready pose)
+      arm_joints:                           # Arm IK subset (4-DOF → 3-DOF position)
+        - "right_shoulder_pitch_joint"
+        - "right_shoulder_roll_joint"
+        - "right_shoulder_yaw_joint"
+        - "right_elbow_joint"
 
+      wrist_joints:                         # Wrist solver subset (variable DOF)
+        - "right_wrist_roll_joint"          #   Active in 23-DOF (1-DOF, under-actuated)
+        - "right_wrist_pitch_joint"         #   Active in 29-DOF (3-DOF, direct solve)
+        - "right_wrist_yaw_joint"           #   Inactive joints → warning, not error
+
+      ee_link: "right_wrist_roll_link"      # Position control target (wrist origin)
+
+    # -------------------------------------------------------------------------
+    # Arm IK — 4-DOF → 3-DOF position (damped pseudoinverse + null-space)
+    # -------------------------------------------------------------------------
+    pid:
+      kp: 2.0                    # Proportional gain
+      ki: 0.4                    # Integral gain (anti-windup limit 0.10)
+      kd: 0.05                   # Derivative gain
+      damping: 2.0e-4            # Damped pseudoinverse λ (adaptive, auto-increases near singularity)
+      tolerance: 0.01            # Position tolerance (1 cm)
+      posture_gain: 0.2          # Null-space attraction toward posture_target
+      posture_target: [-0.3, 0.0, 0.0, 0.3, 0.0]  # Slight forward lean — avoids |J| ≈ 1e-4 singularity
+
+      # -----------------------------------------------------------------------
+      # Wrist solver — variable DOF → 3-DOF orientation
+      # -----------------------------------------------------------------------
+      # 23-DOF: 1-DOF (wrist_roll) → 3×1 damped pseudoinverse (under-actuated)
+      # 29-DOF: 3-DOF (roll+pitch+yaw) → 3×3 direct solve
+      kp_wrist: 1.0              # Orientation P gain (rad/s per rad)
+      kd_wrist: 0.02             # Orientation D gain
+
+      # -----------------------------------------------------------------------
+      # Torque mode — DISABLED (J_pinv vs Jᵀ dual mapping caused oscillation)
+      # -----------------------------------------------------------------------
+      torque_mode: false
+      gravity_compensation: false
+      inner_servo_kp: 300.0
+      inner_servo_kv: 5.0
+
+    # -------------------------------------------------------------------------
+    # Node configuration
+    # -------------------------------------------------------------------------
     manager:
-      control_rate: 20.0
+      control_rate: 50.0         # Control loop frequency (Hz)
 
     reach_node:
-      base_offset: [0.0, 0.0, 0.793]   # pelvis world pos = MJCF qpos0 Z (bridge elevates +0.03 → actual z=0.823)
-      target_topic: "/target_point"
+      origin_frame: "right_shoulder"
+      pelvis_offset: [0.0, 0.0, 0.823]     # URDF pelvis → MuJoCo world Z alignment
+      target_topic: "/target_pose"          # PoseStamped, 6-DOF, shoulder-relative
+      target_point_topic: "/target_point"   # Point, 3-DOF (legacy)
       joint_state_topic: "/joint_states"
-      default_target: [0.20, -0.25, 0.893]  # world frame
+      default_target: [0.18, -0.05, -0.10]  # Shoulder-relative, ~21 cm reachable
+      default_orientation: [0.0, 0.0, 0.0, 1.0]  # Identity quaternion
 
-    # MuJoCo bridge (Phase 2)
+    # -------------------------------------------------------------------------
+    # MuJoCo bridge — physics simulation (200 Hz)
+    # -------------------------------------------------------------------------
     mujoco_bridge:
       ros__parameters:
         scene_path: ""
@@ -40,3 +93,13 @@ reach_node:
         publish_ft: true
         viewer: false
         base_frame: "pelvis"
+
+# =============================================================================
+# Dexterous Hand Phase (NEXT)
+# =============================================================================
+# When integrating a dexterous hand:
+#   1. Add hand_joints: [finger_1_j1, finger_1_j2, ...] below wrist_joints
+#   2. Add hand controller params: kp_hand, kd_hand, grasp_force_limit, etc.
+#   3. Hand control runs in parallel with arm IK (independent joint groups)
+#   4. Use GraspObject.action to sequence: approach → grasp → lift
+# =============================================================================

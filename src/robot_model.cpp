@@ -1,6 +1,6 @@
 /**
  * @file robot_model.cpp
- * Implements RobotModel: URDF loading, reduced-model building, FK, and joint limits.
+ * @brief URDF → reduced 5-DOF Pinocchio model. EE = wrist_roll_link origin.
  */
 
 #include "g1_right_arm_reach/robot_model.hpp"
@@ -46,9 +46,12 @@ RobotModel::RobotModel(
     reduced_model_ = pinocchio::buildReducedModel(full_model_, locked_joint_ids_full_, q_ref_full_);
     reduced_data_ = pinocchio::Data(reduced_model_);
 
-    // 5. Locate EE frames
-    ee_frame_id_full_ = findEndEffectorFrame(full_model_);   // full model
-    ee_frame_id_      = findEndEffectorFrame(reduced_model_); // reduced model
+    // 5. Locate EE frame (wrist origin = right_wrist_roll_link, NOT rubber_hand)
+    ee_frame_id_full_ = findEndEffectorFrame(full_model_);
+    ee_frame_id_      = findEndEffectorFrame(reduced_model_);
+
+    // 5b. Locate hand frame (rubber_hand, for orientation observation)
+    hand_frame_id_ = findFrameByName(reduced_model_, "right_wrist_roll_rubber_hand");
 
     // 6. Extract joint limits & init config
     extractJointLimits();
@@ -60,6 +63,42 @@ RobotModel::RobotModel(
               << reduced_model_.nq << " DOF (active=" << active_joint_ids_full_.size()
               << ", locked=" << locked_joint_ids_full_.size()
               << "), EE='" << full_model_.frames[ee_frame_id_full_].name << "'\n";
+}
+
+// ============================================================================
+// Arm/Wrist subset indices
+// ============================================================================
+
+void RobotModel::buildSubsetIndices(
+    const std::vector<std::string>& arm_joint_names,
+    const std::vector<std::string>& wrist_joint_names)
+{
+    arm_joint_indices_.clear();
+    wrist_joint_indices_.clear();
+
+    for (const auto& name : arm_joint_names) {
+        auto it = std::find(active_joint_names_.begin(), active_joint_names_.end(), name);
+        if (it != active_joint_names_.end())
+            arm_joint_indices_.push_back(static_cast<int>(std::distance(active_joint_names_.begin(), it)));
+        else
+            std::cerr << "[RobotModel] WARNING: arm joint '" << name << "' not in active_joints\n";
+    }
+
+    for (const auto& name : wrist_joint_names) {
+        auto it = std::find(active_joint_names_.begin(), active_joint_names_.end(), name);
+        if (it != active_joint_names_.end())
+            wrist_joint_indices_.push_back(static_cast<int>(std::distance(active_joint_names_.begin(), it)));
+        else
+            std::cerr << "[RobotModel] WARNING: wrist joint '" << name << "' not in active_joints\n";
+    }
+
+    std::cout << "[RobotModel] Arm indices: [";
+    for (size_t i = 0; i < arm_joint_indices_.size(); ++i)
+        std::cout << arm_joint_indices_[i] << (i + 1 < arm_joint_indices_.size() ? ", " : "");
+    std::cout << "]  Wrist indices: [";
+    for (size_t i = 0; i < wrist_joint_indices_.size(); ++i)
+        std::cout << wrist_joint_indices_[i] << (i + 1 < wrist_joint_indices_.size() ? ", " : "");
+    std::cout << "]\n";
 }
 
 // ============================================================================
@@ -84,13 +123,14 @@ std::vector<pinocchio::JointIndex> RobotModel::identifyJointsToLock(
 }
 
 // ============================================================================
-// EE frame lookup — unified for full & reduced models
+// Frame lookup helpers
 // ============================================================================
 
 pinocchio::FrameIndex RobotModel::findEndEffectorFrame(const pinocchio::Model& model) const
 {
-    // Exact match, right-side only (most specific first)
-    for (const auto& hint : {"right_wrist_roll_rubber_hand", "right_rubber_hand",
+    // Priority 1: wrist_roll_link (wrist joint origin, controlled by arm IK)
+    for (const auto& hint : {"right_wrist_roll_link", "right_wrist_roll",
+                              "right_wrist_roll_rubber_hand", "right_rubber_hand",
                               "right_palm", "right_hand", "right_gripper"}) {
         for (pinocchio::FrameIndex fid = 0; fid < model.nframes; ++fid)
             if (model.frames[fid].name == hint) return fid;
@@ -110,6 +150,14 @@ pinocchio::FrameIndex RobotModel::findEndEffectorFrame(const pinocchio::Model& m
     return model.nframes - 1;
 }
 
+pinocchio::FrameIndex RobotModel::findFrameByName(
+    const pinocchio::Model& model, const std::string& name) const
+{
+    for (pinocchio::FrameIndex fid = 0; fid < model.nframes; ++fid)
+        if (model.frames[fid].name == name) return fid;
+    return model.nframes - 1;  // fallback
+}
+
 // ============================================================================
 // Kinematics update
 // ============================================================================
@@ -123,6 +171,35 @@ void RobotModel::updateKinematics()
 Eigen::Vector3d RobotModel::getEndEffectorPosition() const
 {
     return reduced_data_.oMf[ee_frame_id_].translation();
+}
+
+Eigen::Matrix3d RobotModel::getEndEffectorRotation() const
+{
+    return reduced_data_.oMf[ee_frame_id_].rotation();
+}
+
+Eigen::Vector3d RobotModel::getWristPosition() const
+{
+    // EE frame IS the wrist origin (right_wrist_roll_link)
+    return reduced_data_.oMf[ee_frame_id_].translation();
+}
+
+Eigen::Matrix3d RobotModel::getHandOrientation() const
+{
+    // Hand frame (rubber_hand) — most distal frame, affected by all wrist joints
+    return reduced_data_.oMf[hand_frame_id_].rotation();
+}
+
+Eigen::Vector3d RobotModel::getRightShoulderPosition() const
+{
+    // Joint index 1 in the reduced model is the first non-universe joint
+    // (right_shoulder_pitch_joint). oMi[jid].translation() gives the world
+    // position of the joint's origin, which is the base of the upper arm.
+    pinocchio::JointIndex shoulder_jid = 1;
+    if (shoulder_jid < reduced_model_.joints.size()) {
+        return reduced_data_.oMi[shoulder_jid].translation();
+    }
+    return Eigen::Vector3d::Zero();
 }
 
 // ============================================================================
@@ -168,12 +245,19 @@ void RobotModel::printSummary() const
         std::string jname = (i < static_cast<int>(active_joint_names_.size()))
                             ? active_joint_names_[i]
                             : reduced_model_.names[static_cast<size_t>(i) + 1];
-        std::cout << "  [" << i << "] " << jname
+        // Mark arm vs wrist
+        bool is_arm = std::find(arm_joint_indices_.begin(), arm_joint_indices_.end(), i)
+                      != arm_joint_indices_.end();
+        bool is_wrist = std::find(wrist_joint_indices_.begin(), wrist_joint_indices_.end(), i)
+                        != wrist_joint_indices_.end();
+        const char* tag = is_arm ? " [ARM]" : (is_wrist ? " [WRIST]" : "");
+        std::cout << "  [" << i << "] " << jname << tag
                   << "  [" << q_min_(i) << ", " << q_max_(i) << "] rad"
                   << "  v_max=" << dq_max_(i) << " rad/s\n";
     }
-    std::cout << "\nEE: '" << reduced_model_.frames[ee_frame_id_].name
+    std::cout << "\nEE (wrist origin): '" << reduced_model_.frames[ee_frame_id_].name
               << "'  pos=" << getEndEffectorPosition().transpose()
+              << "\nHand (orientation): '" << reduced_model_.frames[hand_frame_id_].name << "'"
               << "\n=================================================\n\n";
 }
 

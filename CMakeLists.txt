@@ -1,11 +1,11 @@
 #
-# CMakeLists.txt — G1 Right Arm Reach
+# CMakeLists.txt — G1 Right Arm End-Effector Control
 #
-# Builds the g1_right_arm_reach ROS 2 package:
-#   - Core library (robot model + kinematics wrapping Pinocchio)
-#   - Controller library (PID)
-#   - ROS 2 nodes (reach_node, target_publisher)
-#   - GTest-based unit tests
+# Targets:
+#   g1_right_arm_core   — RobotModel + Kinematics (Pinocchio wrapper)
+#   g1_controllers      — PIDController (Arm-Hand decoupled IK)
+#   reach_node          — Main control node (50 Hz, Arm + Wrist IK)
+#   target_publisher    — Test utility node
 #
 
 cmake_minimum_required(VERSION 3.22)

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Phase 1 RViz kinematic demo launch file.
+RViz kinematic demo (no physics) — Arm-Hand decoupled IK visualization.
+
+Usage:
+  ros2 launch g1_right_arm_reach rviz_demo.launch.py \
+    urdf_path:=/path/to/g1_23dof_rev_1_0.urdf
 """
 import os
 
@@ -41,7 +45,10 @@ def launch_setup(context, *args, **kwargs):
 
         Node(package='g1_right_arm_reach', executable='reach_node',
              parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
-                         {'robot_model.urdf_path': urdf_path}],
+                         {'robot_model.urdf_path': urdf_path},
+                         {'pid.torque_mode': False},
+                         {'pid.gravity_compensation': False},
+                         {'manager.control_rate': 50.0}],
              output='screen'),
 
         Node(package='rviz2', executable='rviz2', arguments=['-d', rviz_config]),
