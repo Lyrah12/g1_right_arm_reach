@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation.
+MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation with position-servo actuation.
 
-Pipelines:
-  /joint_commands (JointState)   → MuJoCo position-servo actuators
-  MuJoCo physics step (200 Hz)   → /joint_states, /actual_ee_pose, /mujoco_jacobian
-
-Also publishes: /camera/rgb, /camera/depth, /wrist_ft (optional).
+Publishes: /joint_states, /actual_ee_pose, /actual_hand_orientation,
+           /mujoco_jacobian, /mujoco_wrist_jacobian (plus /camera/rgb, /camera/depth, /wrist_ft).
+Subscribes: /joint_commands (arm 4-DOF), /hand_commands (hand 23-DOF).
 
 Dependencies: pip install mujoco opencv-python "numpy<2"
 """
@@ -40,7 +38,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState, Image
-from geometry_msgs.msg import WrenchStamped, PointStamped
+from geometry_msgs.msg import WrenchStamped, PointStamped, QuaternionStamped
 from std_msgs.msg import Float64MultiArray
 from cv_bridge import CvBridge
 
@@ -49,23 +47,24 @@ from cv_bridge import CvBridge
 # MODULE: MuJoCoBridgeNode — ROS2 node that steps MuJoCo and bridges topics
 # ===========================================================================
 class MuJoCoBridgeNode(Node):
-    """MuJoCo 物理仿真桥接节点。
+    """MuJoCo physics bridge node.
 
-    职责：
-      1. 加载 MJCF 场景文件，初始化 MuJoCo 模型和数据
-      2. 订阅 /joint_commands，缓存最新关节指令
-      3. 以 physics_rate 的频率步进 MuJoCo 仿真
-      4. 发布 /joint_states（关节位置+速度）
-      5. 以 camera_rate 的频率渲染并发布虚拟相机图像
-      6. 发布 /wrist_ft（腕部力/力矩）
+    Responsibilities:
+      1. Load MJCF scene, initialize MuJoCo model and data
+      2. Subscribe /joint_commands and /hand_commands, cache latest commands
+      3. Step MuJoCo at physics_rate (200 Hz)
+      4. Publish /joint_states (positions + velocities)
+      5. Render and publish virtual camera images at camera_rate
+      6. Publish /wrist_ft (force/torque)
 
     Attributes:
-        model: MuJoCo MjModel。
-        data: MuJoCo MjData。
-        renderer: MuJoCo Renderer（用于离屏渲染相机图像）。
-        bridge: CvBridge（ROS2 ↔ OpenCV 图像转换）。
-        joint_cmd: 最新的关节指令 dict {joint_name: position_rad}。
-        lock: 线程锁，保护 joint_cmd 的读写。
+        model: MuJoCo MjModel.
+        data: MuJoCo MjData.
+        renderer: MuJoCo Renderer (off-screen rendering).
+        bridge: CvBridge (ROS2 ↔ OpenCV image conversion).
+        joint_cmd: Latest arm command dict {name: rad}.
+        hand_cmd: Latest hand command dict {name: rad}.
+        lock: Threading lock protecting command dicts.
     """
 
     def __init__(self):
@@ -98,10 +97,18 @@ class MuJoCoBridgeNode(Node):
             'right_shoulder_yaw_joint',
             'right_elbow_joint',
             'right_wrist_roll_joint',
-        ])  # 主动控制关节（由 /joint_commands 更新）
+            'right_wrist_pitch_joint',
+            'right_wrist_yaw_joint',
+        ])  # G1 右臂 7-DOF (arm 4 + wrist 3)，手指关节由 hand_controller 管理
         self.declare_parameter('clamp_arm_joints', False)  # 手臂关节硬夹持（默认关闭，靠位置伺服）
         self.declare_parameter('hard_clamp_pelvis', True)   # 硬夹持骨盆（固定机器人位置）
         self.declare_parameter('hard_clamp_joints', True)   # 硬夹持非右臂关节（除右臂外全部锁死）
+
+        # 手指执行器增益缩放（MJCF kp ~0.2-0.7 太低，仿真中需大幅提升）
+        self.declare_parameter('finger_kp_scale', 60.0)   # kp 倍率：默认 60× → kp = 5×60 = 300
+        self.declare_parameter('finger_kv_scale', 1.0)    # kv 倍率：默认 1× (no boost needed)
+        self.declare_parameter('finger_ema_alpha', 1.0)   # EMA 平滑系数（手指，1.0=无平滑）
+        self.declare_parameter('wrist_ema_alpha', 0.40)  # EMA 平滑系数（手腕 ↑ from 0.15 to reduce lag）
 
         # 实际读取硬夹持参数值（在 MuJoCo 加载后赋值）
         self.hard_clamp_pelvis = False
@@ -139,16 +146,18 @@ class MuJoCoBridgeNode(Node):
         # 诊断：打印所有顶层 body 名称（排查 weld 约束 body 名）
         # ─────────────────────────────────────────────────────────────
         body_names = []
-        for bid in range(min(self.model.nbody, 30)):
+        for bid in range(self.model.nbody):
             bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
             if bname:
                 parent_id = self.model.body_parentid[bid]
                 parent_name = mujoco.mj_id2name(
                     self.model, mujoco.mjtObj.mjOBJ_BODY, parent_id
                 ) if parent_id >= 0 else "world"
-                body_names.append(f"  [{bid}] '{bname}' (parent={parent_name})")
+                marker = " ★WUJI" if ("palm" in bname or "finger" in bname) else ""
+                marker = " ★WRIST_END" if bname == "right_wrist_yaw_link" else marker
+                body_names.append(f"  [{bid}] '{bname}' (parent={parent_name}){marker}")
         self.get_logger().info(
-            f"MJCF Body 树（前{min(self.model.nbody, 30)}个）:\n" +
+            f"MJCF Body 树（全部 {self.model.nbody} 个）:\n" +
             "\n".join(body_names)
         )
 
@@ -212,7 +221,8 @@ class MuJoCoBridgeNode(Node):
         arm_act_diag = []
         for joint_name in ['right_shoulder_pitch_joint', 'right_shoulder_roll_joint',
                            'right_shoulder_yaw_joint', 'right_elbow_joint',
-                           'right_wrist_roll_joint']:
+                           'right_wrist_roll_joint', 'right_wrist_pitch_joint',
+                           'right_wrist_yaw_joint']:
             if joint_name in self.actuator_map:
                 for act_id in self.actuator_map[joint_name]:
                     act_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_id)
@@ -233,9 +243,48 @@ class MuJoCoBridgeNode(Node):
             f"{len(self.actuator_position_ids)} 个 position servo (位置伺服)"
         )
 
+        # ─────────────────────────────────────────────────────────────
+        # 运行时提升手指 position servo 增益
+        # MJCF kp ~0.2-0.7 / kv ~0.008-0.03 — 为真实电机柔顺设计，仿真太慢
+        # 通过 gainprm[0]=kp / biasprm[2]=kv 倍率覆盖（不修改 MJCF 源文件）
+        # ─────────────────────────────────────────────────────────────
+        finger_kp_scale = self.get_parameter('finger_kp_scale').get_parameter_value().double_value
+        finger_kv_scale = self.get_parameter('finger_kv_scale').get_parameter_value().double_value
+        finger_scale_log = []
+        for joint_name, act_ids in self.actuator_map.items():
+            if 'finger' not in joint_name:
+                continue
+            for act_id in act_ids:
+                if act_id not in self.actuator_position_ids:
+                    continue
+                old_kp = float(self.model.actuator_gainprm[act_id][0])
+                old_kv = float(self.model.actuator_biasprm[act_id][2])
+                old_kp_fb = float(self.model.actuator_biasprm[act_id][1])  # -kp feedback term
+                new_kp = old_kp * finger_kp_scale
+                new_kv = old_kv * finger_kv_scale
+                new_kp_fb = old_kp_fb * finger_kp_scale  # scale position feedback to match
+                self.model.actuator_gainprm[act_id][0] = new_kp
+                self.model.actuator_biasprm[act_id][1] = new_kp_fb  # CRITICAL: keep force = scale×kp×(ctrl−q)
+                self.model.actuator_biasprm[act_id][2] = new_kv
+                short = joint_name.replace('right_', '').replace('_joint', '')
+                finger_scale_log.append(
+                    f"  {short}: kp {old_kp:.3f}→{new_kp:.1f} (×{finger_kp_scale:.0f}), "
+                    f"kp_fb {old_kp_fb:.3f}→{new_kp_fb:.1f}, "
+                    f"kv {old_kv:.4f}→{new_kv:.3f} (×{finger_kv_scale:.0f})"
+                )
+        self.get_logger().info(
+            f"手指执行器增益缩放 (kp×{finger_kp_scale:.0f}, kv×{finger_kv_scale:.0f}):\n"
+            + "\n".join(finger_scale_log)
+        )
+
         # 区分主动关节（右臂 5 DOF）与锁定关节（其余 18 DOF）
         active_joints = self.get_parameter('active_joints').get_parameter_value().string_array_value
         self.active_joint_names = set(active_joints)
+        self.wrist_joint_names = {  # 手腕关节 — 独立 EMA 平滑抑制 yaw 颤抖
+            'right_wrist_roll_joint',
+            'right_wrist_pitch_joint',
+            'right_wrist_yaw_joint',
+        }
         self.locked_joint_names = set()
         for joint_name in self.actuator_map:
             if joint_name not in self.active_joint_names:
@@ -286,6 +335,7 @@ class MuJoCoBridgeNode(Node):
         left_arm_joints = [
             'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
             'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
+            'left_wrist_pitch_joint', 'left_wrist_yaw_joint',
         ]
         left_arm_zeroed = []
         for joint_name in left_arm_joints:
@@ -308,8 +358,12 @@ class MuJoCoBridgeNode(Node):
         self.locked_joint_info = []    # [(joint_name, qpos_addr, init_q), ...] 诊断用
         self.arm_clamp_index = {}      # {joint_name: index_in_clamps} 快速查找
 
-        # 只采集非手臂锁定关节（手臂关节就在绪姿态之后采集）
+        # 只采集非手指、非右臂的锁定关节
+        # 手指关节由 hand_controller 通过 position servo 控制，硬夹持会导致
+        # servo 与夹持互相对抗 → 手指无法移动 + 反作用力引起手腕颤抖
         for joint_name in self.locked_joint_names:
+            if 'finger' in joint_name:
+                continue  # skip — hand_controller manages these via position servo
             act_id = self.actuator_map_primary[joint_name]
             act_joint_id = self.model.actuator_trnid[act_id][0]
             if act_joint_id >= 0 and act_joint_id < self.model.njnt:
@@ -375,7 +429,8 @@ class MuJoCoBridgeNode(Node):
         default_arm_q = []
         for joint_name in ['right_shoulder_pitch_joint', 'right_shoulder_roll_joint',
                            'right_shoulder_yaw_joint', 'right_elbow_joint',
-                           'right_wrist_roll_joint']:
+                           'right_wrist_roll_joint', 'right_wrist_pitch_joint',
+                           'right_wrist_yaw_joint']:
             if joint_name in self.actuator_map:
                 act_id = self.actuator_map_primary[joint_name]
                 act_joint_id = self.model.actuator_trnid[act_id][0]
@@ -390,7 +445,9 @@ class MuJoCoBridgeNode(Node):
             'right_shoulder_roll_joint':   0.0,
             'right_shoulder_yaw_joint':    0.0,
             'right_elbow_joint':           0.3,   # slight bend
-            'right_wrist_roll_joint':      0.0,
+            'right_wrist_roll_joint':      0.0,   # neutral — palm quat handles ALL orientation
+            'right_wrist_pitch_joint':     0.0,
+            'right_wrist_yaw_joint':       0.0,
         }
         for joint_name, angle in arm_ready_pose.items():
             if joint_name in self.actuator_map:
@@ -416,6 +473,56 @@ class MuJoCoBridgeNode(Node):
                 self.get_logger().warn(
                     f"  关节 '{joint_name}' 未在执行器映射中找到，跳过"
                 )
+
+        # ─────────────────────────────────────────────────────────────
+        # 手指默认半握姿态（Wuji Hand 20-DOF）
+        #   joint1 = MCP 弯曲, joint2 = 外展/内收, joint3 = PIP, joint4 = DIP
+        #   finger1 = 拇指（对掌，joint2 抬高 > 食指）, finger2-5 = 四指并拢
+        # ─────────────────────────────────────────────────────────────
+        finger_grasp_pose = {
+            # 拇指 (finger1) — 外展抬高 (joint2=0.3)，处于对掌预备位
+            'right_finger1_joint1': 0.6,
+            'right_finger1_joint2': 0.3,
+            'right_finger1_joint3': 0.5,
+            'right_finger1_joint4': 0.4,
+            # 食指 (finger2) — 四指并拢 (joint2=0)
+            'right_finger2_joint1': 0.8,
+            'right_finger2_joint2': 0.0,
+            'right_finger2_joint3': 0.7,
+            'right_finger2_joint4': 0.6,
+            # 中指 (finger3)
+            'right_finger3_joint1': 0.8,
+            'right_finger3_joint2': 0.0,
+            'right_finger3_joint3': 0.7,
+            'right_finger3_joint4': 0.6,
+            # 无名指 (finger4)
+            'right_finger4_joint1': 0.8,
+            'right_finger4_joint2': 0.0,
+            'right_finger4_joint3': 0.7,
+            'right_finger4_joint4': 0.6,
+            # 小指 (finger5)
+            'right_finger5_joint1': 0.8,
+            'right_finger5_joint2': 0.0,
+            'right_finger5_joint3': 0.7,
+            'right_finger5_joint4': 0.6,
+        }
+        finger_count = 0
+        for joint_name, angle in finger_grasp_pose.items():
+            if joint_name in self.actuator_map:
+                act_ids = self.actuator_map[joint_name]
+                act_id_primary = self.actuator_map_primary[joint_name]
+                act_joint_id = self.model.actuator_trnid[act_id_primary][0]
+                qpos_addr = self.model.jnt_qposadr[act_joint_id]
+                self.data.qpos[qpos_addr] = angle
+                for act_id in act_ids:
+                    if act_id in self.actuator_position_ids:
+                        self.data.ctrl[act_id] = angle
+                        self.ctrl_smoothed[act_id] = float(angle)
+                finger_count += 1
+        if finger_count > 0:
+            self.get_logger().info(
+                f"手指半握姿态: {finger_count} 关节已设置 (semi-grasp)"
+            )
 
         # 手臂关节硬夹持（由参数 clamp_arm_joints 控制）
         clamp_arm = self.get_parameter('clamp_arm_joints').get_parameter_value().bool_value
@@ -501,12 +608,17 @@ class MuJoCoBridgeNode(Node):
         # -----------------------------------------------------------------
         # SECTION: ROS2 订阅 & 发布
         # -----------------------------------------------------------------
-        self.joint_cmd = {}        # {joint_name: position_rad}
+        self.joint_cmd = {}        # {joint_name: position_rad} — arm+wrist (7-DOF)
         self.joint_cmd_effort = {}  # {joint_name: effort_Nm} (torque diagnostics)
+        self.hand_cmd = {}          # {joint_name: position_rad} — fingers (20-DOF)
         self.lock = threading.Lock()
 
         self.cmd_sub = self.create_subscription(
             JointState, '/joint_commands', self._cmd_callback, 10
+        )
+
+        self.hand_cmd_sub = self.create_subscription(
+            JointState, '/hand_commands', self._hand_cmd_callback, 10
         )
 
         self.js_pub = self.create_publisher(JointState, '/joint_states', 10)
@@ -526,20 +638,58 @@ class MuJoCoBridgeNode(Node):
             self.ft_pub = None
 
         # --- MuJoCo 真实末端位置发布（供 PID 使用，消除 URDF/MJCF FK 差异）---
+        # 29-DOF: right_wrist_yaw_link (最后腕关节的 link)
+        # 23-DOF: right_wrist_roll_rubber_hand (腕末端 rubber hand)
         self.ee_body_id = -1
         for bid in range(self.model.nbody):
             bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if bname == 'right_wrist_roll_rubber_hand':
+            if bname == 'right_wrist_yaw_link':
                 self.ee_body_id = bid
                 break
+        if self.ee_body_id < 0:
+            for bid in range(self.model.nbody):
+                bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
+                if bname == 'right_wrist_roll_rubber_hand':
+                    self.ee_body_id = bid
+                    break
         if self.ee_body_id >= 0:
+            ee_body_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, self.ee_body_id)
             self.ee_pub = self.create_publisher(PointStamped, '/actual_ee_pose', 10)
             self.get_logger().info(
-                f"真实末端位置发布: body='right_wrist_roll_rubber_hand' (ID={self.ee_body_id})"
+                f"真实末端位置发布: body='{ee_body_name}' (ID={self.ee_body_id})"
             )
         else:
             self.ee_pub = None
-            self.get_logger().warn("未找到 right_wrist_roll_rubber_hand body，末端位置不发布")
+            self.get_logger().warn(
+                "未找到 right_wrist_yaw_link 或 right_wrist_roll_rubber_hand body，"
+                "末端位置不发布"
+            )
+
+        # ─────────────────────────────────────────────────────────────
+        # Hand body (palm) for orientation publishing (Plan C: wrist in Hand module)
+        # ─────────────────────────────────────────────────────────────
+        self.hand_body_id = -1
+        for bid in range(self.model.nbody):
+            bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
+            if bname == 'right_palm_link':
+                self.hand_body_id = bid
+                break
+        if self.hand_body_id < 0:
+            # fallback: use wrist_yaw_link
+            self.hand_body_id = self.ee_body_id
+
+        if self.hand_body_id >= 0:
+            hb_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, self.hand_body_id)
+            self.hand_ori_pub = self.create_publisher(
+                QuaternionStamped, '/actual_hand_orientation', 10)
+            self.get_logger().info(
+                f"手部朝向发布: body='{hb_name}' (ID={self.hand_body_id})"
+            )
+        else:
+            self.hand_ori_pub = None
+            self.get_logger().warn("未找到手部body，朝向不发布")
 
         # --- MuJoCo 数值 Jacobian 发布（供 PID 使用，消除 URDF/MJCF Jacobian 差异）---
         arm_joint_order = [
@@ -548,6 +698,8 @@ class MuJoCoBridgeNode(Node):
             'right_shoulder_yaw_joint',
             'right_elbow_joint',
             'right_wrist_roll_joint',
+            'right_wrist_pitch_joint',
+            'right_wrist_yaw_joint',
         ]
         self.arm_joint_qpos_addrs = []  # [qpos_addr, ...] 按 arm_joint_order 顺序
         for joint_name in arm_joint_order:
@@ -558,17 +710,45 @@ class MuJoCoBridgeNode(Node):
                 self.arm_joint_qpos_addrs.append(qpos_addr)
             else:
                 self.get_logger().warn(f"Jacobian: 关节 '{joint_name}' 不在 actuator_map 中")
-        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) >= 5:
+        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) >= 7:
             self.jac_pub = self.create_publisher(Float64MultiArray, '/mujoco_jacobian', 10)
             self.get_logger().info(
                 f"MuJoCo 数值 Jacobian 发布已启用 "
-                f"({len(self.arm_joint_qpos_addrs)} 关节, qpos_addrs={self.arm_joint_qpos_addrs})"
+                f"({len(self.arm_joint_qpos_addrs)} 关节: arm 4 + wrist 3)"
             )
         else:
             self.jac_pub = None
             self.get_logger().warn(
                 f"Jacobian 发布禁用（EE body={self.ee_body_id}, "
                 f"arm joint qpos_addrs={len(self.arm_joint_qpos_addrs)} 个）"
+            )
+
+        # ─────────────────────────────────────────────────────────────
+        # Wrist orientation Jacobian (3×3) for hand_controller (Plan C)
+        # ─────────────────────────────────────────────────────────────
+        wrist_joint_order = [
+            'right_wrist_roll_joint',
+            'right_wrist_pitch_joint',
+            'right_wrist_yaw_joint',
+        ]
+        self.wrist_joint_qpos_addrs = []
+        for joint_name in wrist_joint_order:
+            if joint_name in self.actuator_map_primary:
+                act_id = self.actuator_map_primary[joint_name]
+                act_joint_id = self.model.actuator_trnid[act_id][0]
+                qpos_addr = self.model.jnt_qposadr[act_joint_id]
+                self.wrist_joint_qpos_addrs.append(qpos_addr)
+        if self.hand_body_id >= 0 and len(self.wrist_joint_qpos_addrs) == 3:
+            self.wrist_jac_pub = self.create_publisher(
+                Float64MultiArray, '/mujoco_wrist_jacobian', 10)
+            self.get_logger().info(
+                f"Wrist orientation Jacobian (3×3) → /mujoco_wrist_jacobian"
+            )
+        else:
+            self.wrist_jac_pub = None
+            self.get_logger().warn(
+                f"Wrist Jacobian 发布禁用 "
+                f"(hand_body={self.hand_body_id}, wrist_addrs={len(self.wrist_joint_qpos_addrs)})"
             )
 
         # -----------------------------------------------------------------
@@ -637,6 +817,16 @@ class MuJoCoBridgeNode(Node):
             for name, eff in zip(msg.name, msg.effort):
                 self.joint_cmd_effort[name] = eff
 
+    def _hand_cmd_callback(self, msg: JointState):
+        """缓存 /hand_commands 中的手指关节位置。
+
+        Args:
+            msg: sensor_msgs/JointState，来自 hand_controller 的手指关节指令。
+        """
+        with self.lock:
+            for name, pos in zip(msg.name, msg.position):
+                self.hand_cmd[name] = pos
+
     # =========================================================================
     # MODULE: Physics Loop
     # =========================================================================
@@ -655,13 +845,18 @@ class MuJoCoBridgeNode(Node):
         #    reach_node 每 20ms 更新一次 /joint_commands（50Hz），
         #    平滑策略：EMA，alpha=0.3 → τ ≈ 3步=15ms，滤除高频噪声。
         with self.lock:
+            alpha_wrist = self.get_parameter('wrist_ema_alpha').get_parameter_value().double_value
             for joint_name, act_ids in self.actuator_map.items():
                 if joint_name in self.joint_cmd:
                     target = self.joint_cmd[joint_name]
                     # 使用主执行器做 EMA 平滑
                     act_primary = self.actuator_map_primary[joint_name]
                     prev = self.ctrl_smoothed.get(act_primary, target)
-                    alpha = 0.3  # EMA: 每步移动 30% 向目标 (τ≈15ms at 200Hz)
+                    # 手腕关节用独立更低的 alpha（抑制 yaw 颤抖）
+                    if joint_name in self.wrist_joint_names:
+                        alpha = alpha_wrist
+                    else:
+                        alpha = 0.3  # 肩/肘关节 EMA: 每步移动 30% 向目标 (τ≈15ms at 200Hz)
                     smoothed = prev + alpha * (target - prev)
                     # motor → ctrl=0（零力矩）；position servo → ctrl=smoothed（位置目标）
                     for act_id in act_ids:
@@ -674,6 +869,23 @@ class MuJoCoBridgeNode(Node):
                     if joint_name in self.arm_clamp_index:
                         idx = self.arm_clamp_index[joint_name]
                         self.locked_joint_clamps[idx][1] = float(smoothed)
+                elif joint_name in self.hand_cmd:
+                    # 手指/手腕关节：来自 /hand_commands，独立 EMA 平滑
+                    target = self.hand_cmd[joint_name]
+                    act_primary = self.actuator_map_primary[joint_name]
+                    prev = self.ctrl_smoothed.get(act_primary, target)
+                    # 手腕关节用独立更低 alpha（抑制 yaw 颤抖）
+                    if joint_name in self.wrist_joint_names:
+                        alpha_hand = self.get_parameter('wrist_ema_alpha').get_parameter_value().double_value
+                    else:
+                        alpha_hand = self.get_parameter('finger_ema_alpha').get_parameter_value().double_value
+                    smoothed = prev + alpha_hand * (target - prev)
+                    for act_id in act_ids:
+                        if act_id in self.actuator_motor_ids:
+                            self.data.ctrl[act_id] = 0.0
+                        else:
+                            self.ctrl_smoothed[act_id] = smoothed
+                            self.data.ctrl[act_id] = float(smoothed)
                 elif joint_name in self.locked_joint_names:
                     # 锁定关节：motor ctrl 保持 0，position servo ctrl 保持初始值
                     # （已在 __init__ 中设好），不需要平滑（目标值不变）
@@ -782,11 +994,14 @@ class MuJoCoBridgeNode(Node):
         # 3. 发布关节状态
         self._publish_joint_states()
 
-        # 3.5 发布 MuJoCo 真实末端位置（20Hz，与 PID 同频）
+        # 3.5 发布 MuJoCo 真实末端位置 + 手部朝向 + Jacobian (20Hz，与 PID 同频)
         if self.ee_pub is not None and self.step_counter % 10 == 0:
             self._publish_ee_pose()
+            self._publish_hand_orientation()
             if self.jac_pub is not None:
                 self._publish_jacobian()
+            if self.wrist_jac_pub is not None:
+                self._publish_wrist_jacobian()
 
         # 4. 按降频渲染相机
         self.step_counter += 1
@@ -818,10 +1033,97 @@ class MuJoCoBridgeNode(Node):
         msg.point.z = float(pos[2])
         self.ee_pub.publish(msg)
 
-    def _publish_jacobian(self):
-        """发布 /mujoco_jacobian — MuJoCo 3×5 中心差分数值 Jacobian。
+    def _publish_hand_orientation(self):
+        """发布 /actual_hand_orientation — MuJoCo 中手掌的真实世界朝向 (quaternion)。"""
+        if self.hand_ori_pub is None or self.hand_body_id < 0:
+            return
+        xmat = self.data.xmat[self.hand_body_id]  # 9-element rotation matrix (row-major)
+        # Convert 3×3 rotation matrix to quaternion
+        R = xmat.reshape(3, 3)
+        # Use standard rotation-matrix-to-quaternion conversion
+        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+        if tr > 0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = float(R[2, 1] - R[1, 2]) / s
+            qy = float(R[0, 2] - R[2, 0]) / s
+            qz = float(R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            qw = float(R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = float(R[0, 1] + R[1, 0]) / s
+            qz = float(R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            qw = float(R[0, 2] - R[2, 0]) / s
+            qx = float(R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = float(R[1, 2] + R[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            qw = float(R[1, 0] - R[0, 1]) / s
+            qx = float(R[0, 2] + R[2, 0]) / s
+            qy = float(R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+        msg = QuaternionStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+        msg.quaternion.x = float(qx)
+        msg.quaternion.y = float(qy)
+        msg.quaternion.z = float(qz)
+        msg.quaternion.w = float(qw)
+        self.hand_ori_pub.publish(msg)
 
-        对 5 个主动关节分别 ±ε 扰动，用 mj_forward() 计算 EE 位移。
+    def _publish_wrist_jacobian(self):
+        """发布 /mujoco_wrist_jacobian — 3×3 手腕朝向 Jacobian (orientation, not position).
+
+        对 3 个腕关节分别 ±ε 扰动，观测 hand body 的朝向变化，
+        使用中心差分计算 ∂ω/∂q_wrist (3×3 矩阵)。
+        """
+        if self.wrist_jac_pub is None or self.hand_body_id < 0:
+            return
+        eps = 0.001
+        J = np.zeros((3, 3), dtype=np.float64)
+
+        for i, qpos_addr in enumerate(self.wrist_joint_qpos_addrs):
+            orig = float(self.data.qpos[qpos_addr])
+
+            # +ε
+            self.data.qpos[qpos_addr] = orig + eps
+            mujoco.mj_forward(self.model, self.data)
+            R_plus = self.data.xmat[self.hand_body_id].reshape(3, 3).copy()
+
+            # −ε
+            self.data.qpos[qpos_addr] = orig - eps
+            mujoco.mj_forward(self.model, self.data)
+            R_minus = self.data.xmat[self.hand_body_id].reshape(3, 3).copy()
+
+            # Orientation difference: R_diff = R_plus * R_minus^T
+            # For small rotations: R_diff ≈ I + [ω]×
+            R_diff = R_plus @ R_minus.T
+            omega = 0.5 * np.array([
+                R_diff[2, 1] - R_diff[1, 2],
+                R_diff[0, 2] - R_diff[2, 0],
+                R_diff[1, 0] - R_diff[0, 1],
+            ], dtype=np.float64)
+
+            J[:, i] = omega / (2.0 * eps)
+
+            # Restore
+            self.data.qpos[qpos_addr] = orig
+
+        # Restore full kinematic state
+        mujoco.mj_forward(self.model, self.data)
+
+        msg = Float64MultiArray()
+        msg.data = J.flatten().tolist()  # row-major: [J00, J01, J02, J10, J11, J12, J20, J21, J22]
+        self.wrist_jac_pub.publish(msg)
+
+    def _publish_jacobian(self):
+        """发布 /mujoco_jacobian — MuJoCo 3×7 中心差分数值 Jacobian。
+
+        对 7 个主动关节分别 ±ε 扰动，用 mj_forward() 计算 EE 位移。
         扰动后恢复原始 qpos，不改变仿真状态。
         """
         eps = 0.001  # rad

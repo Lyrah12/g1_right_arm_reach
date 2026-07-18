@@ -1,18 +1,20 @@
 <!--
-  g1_grasp_scene.xml — MuJoCo 仿真场景
-  =======================================
-  用于 G1 右臂抓取任务（Phase 1.5 物理仿真）。
+  g1_grasp_scene.xml — MuJoCo 仿真场景（无灵巧手，rubber hand）
+  ==============================================================
+  用于 G1 右臂位置控制（arm 4 + wrist 3 = 7-DOF）。
+  如需灵巧手版本，使用 g1_ftp_scene.xml (arm 7 + fingers 12 = 19-DOF)。
 
-  场景元素：
-    - G1 人形机器人（从 unitree_mujoco include）
-    - 地面 + 桌面
-    - 待抓取物体（杯子、方块）
-    - 虚拟头部相机（RGB-D）
-    - 位置执行器（覆盖 MJCF 自带的力矩电机，实现位置伺服）
+  Startup:
+    ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
+      urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf \
+      scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_grasp_scene.xml \
+      viewer:=true
 
-  路径说明：
-    - <include> 和 meshdir 使用绝对路径，需与 WSL2 用户目录一致
-    - 默认用户：YOUR_USERNAME，如有不同请 sed 替换
+  Startup (with Inspire Hand FTP):
+    ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
+      urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf \
+      scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_ftp_scene.xml \
+      viewer:=true
 -->
 <mujoco model="g1_grasp_scene">
 
@@ -32,9 +34,9 @@
   </visual>
 
   <!-- ===================================================================== -->
-  <!-- G1 机器人模型（完整 MJCF，含 worldbody + motor 执行器 + 传感器）       -->
+  <!-- G1 机器人模型（29-DOF: arm 4 + wrist 3 = 7 主动右臂关节）              -->
   <!-- ===================================================================== -->
-  <include file="/home/lyrah_ubuntu24/deps/unitree_mujoco/unitree_robots/g1/g1_23dof.xml"/>
+  <include file="/home/lyrah_ubuntu24/deps/unitree_mujoco/unitree_robots/g1/g1_29dof.xml"/>
 
   <!-- ===================================================================== -->
   <!-- 仿真选项（在 include 之后，确保覆盖 G1 MJCF 的可能设置）               -->
@@ -82,12 +84,14 @@
   <!--   主动关节（右臂）：低 kp/kv → 经验值，外层 PID 补偿                -->
   <!-- ===================================================================== -->
   <actuator>
-    <!-- ========== 右臂 5 关节（主动控制）— kp=300 高刚度 + kv=5 低阻尼 ======= -->
+    <!-- ========== 右臂 7 关节（主动控制）— kp=300 高刚度 + kv=5 低阻尼 ======= -->
     <position name="act_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="300" kv="5"/>
     <position name="act_shoulder_roll"  joint="right_shoulder_roll_joint"  kp="300" kv="5"/>
     <position name="act_shoulder_yaw"   joint="right_shoulder_yaw_joint"   kp="300" kv="5"/>
     <position name="act_elbow"          joint="right_elbow_joint"          kp="300" kv="5"/>
     <position name="act_wrist_roll"     joint="right_wrist_roll_joint"     kp="300" kv="5"/>
+    <position name="act_wrist_pitch"    joint="right_wrist_pitch_joint"    kp="300" kv="5"/>
+    <position name="act_wrist_yaw"      joint="right_wrist_yaw_joint"      kp="300" kv="5"/>
 
     <!-- ========== 左臂 5 关节（保持姿态）========== -->
     <position name="act_left_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="100" kv="5"/>
@@ -117,11 +121,9 @@
     <position name="act_waist_roll"  joint="waist_roll_joint"  kp="300" kv="20"/>
     <position name="act_waist_pitch" joint="waist_pitch_joint" kp="300" kv="20"/>
 
-    <!-- ========== 腕部 dummy 关节（23-DOF 中不在运动链内，仅保持姿态）========== -->
+    <!-- ========== 左腕 dummy 关节（23-DOF 游离体，仅保持姿态）========== -->
     <position name="act_left_wrist_pitch" joint="left_wrist_pitch_joint" kp="30" kv="2"/>
     <position name="act_left_wrist_yaw"   joint="left_wrist_yaw_joint"   kp="30" kv="2"/>
-    <position name="act_right_wrist_pitch" joint="right_wrist_pitch_joint" kp="30" kv="2"/>
-    <position name="act_right_wrist_yaw"   joint="right_wrist_yaw_joint"   kp="30" kv="2"/>
   </actuator>
 
   <!--

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-MuJoCo physics simulation launch — Arm-Hand decoupled control.
+MuJoCo physics simulation launch — Plan C: Arm-Hand fully decoupled.
 
-  reach_node (50Hz) ←→ /joint_commands /joint_states ←→ mujoco_bridge_node (200Hz)
-       ↑                                                        │
-  /target_pose (PoseStamped)                         /actual_ee_pose, /mujoco_jacobian
-  (shoulder-relative)                                              │
-                                                          RViz (optional)
+  reach_node (50Hz, 4-DOF)  +  hand_controller (50Hz, 23-DOF)
+       │                              │
+  /joint_commands (4-DOF)    /hand_commands (23-DOF)
+       │                              │
+       └──────────┬───────────────────┘
+                  ▼
+  mujoco_bridge_node (200Hz) — MuJoCo physics + position servo
+       │
+  /actual_ee_pose, /actual_hand_orientation,
+  /mujoco_jacobian, /mujoco_wrist_jacobian, /joint_states
 
 Usage:
   ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
-    urdf_path:=/path/to/g1_23dof_rev_1_0.urdf \
-    scene_path:=/path/to/g1_grasp_scene.xml \
-    viewer:=true use_test_target:=false
+    urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf \
+    scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_wuji_scene.xml \
+    viewer:=true
 """
 import os, re
 
@@ -34,7 +39,7 @@ def launch_setup(context, *args, **kwargs):
     pkg_share = FindPackageShare('g1_right_arm_reach').perform(context)
 
     if not urdf_path:
-        raise RuntimeError("urdf_path:=/path/to/g1_23dof_rev_1_0.urdf required")
+        raise RuntimeError("urdf_path:=/path/to/g1_29dof_rev_1_0.urdf required")
     if not scene_path:
         scene_path = os.path.join(pkg_share, 'config', 'g1_grasp_scene.xml')
 
@@ -51,12 +56,10 @@ def launch_setup(context, *args, **kwargs):
              parameters=[{'robot_description': robot_desc}], output='screen'),
 
         Node(package='g1_right_arm_reach', executable='mujoco_bridge_node.py',
-             parameters=[{'scene_path': scene_path, 'physics_rate': 200.0,
-                 'camera_rate': 15.0, 'publish_camera': False, 'publish_ft': True,
-                 'viewer': viewer.lower() == 'true',
-                 'active_joints': ['right_shoulder_pitch_joint',
-                     'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
-                     'right_elbow_joint', 'right_wrist_roll_joint']}],
+             name='mujoco_bridge',
+             parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
+                         {'scene_path': scene_path,
+                          'viewer': viewer.lower() == 'true'}],
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='reach_node',
@@ -65,6 +68,13 @@ def launch_setup(context, *args, **kwargs):
                          {'pid.torque_mode': False},
                          {'pid.gravity_compensation': False},
                          {'manager.control_rate': 50.0}],
+             output='screen'),
+
+        Node(package='g1_right_arm_reach', executable='hand_controller_node',
+             parameters=[os.path.join(pkg_share, 'config', 'params.yaml')],
+             output='screen'),
+
+        Node(package='g1_right_arm_reach', executable='action_sequencer_node',
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='target_publisher_node',
