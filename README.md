@@ -311,11 +311,11 @@ $$\Delta q = \alpha \cdot J^{+} \cdot e_{pos} + (I - J^{+}J) \cdot k_{posture} \
 
 $$e_{ori} = 2 \cdot \text{axis}(q_{des} \cdot q_{curr}^{-1}) \quad \text{(轴角误差)}$$
 
-$$\tau_{task} = k_p \cdot e_{ori} + k_i \cdot \int e_{ori}\\dt + k_d \cdot \dot{e}_{ori}$$
+$$\tau_{task} = k_p \cdot e_{ori} + k_i \cdot \int e_{ori} \cdot dt + k_d \cdot \dot{e}_{ori}$$
 
 $$\Delta q = J_{wrist}^{-1} \cdot \tau_{task} \quad \text{(MuJoCo 3×3 数值 Jacobian)}$$
 
-$$q_{cmd} = q_{ref} + \int \Delta q\\dt \quad \text{(基于偏移量，带抗饱和)}$$
+$$q_{cmd} = q_{ref} + \int \Delta q \cdot dt \quad \text{(基于偏移量，带抗饱和)}$$
 
 ### 手指：前馈阻抗控制
 
