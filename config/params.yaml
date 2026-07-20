@@ -1,40 +1,41 @@
 # =============================================================================
-# G1 Right Arm End-Effector Control — Parameters
+# G1 Right Arm + Dexterous Hand — Plan C (Arm-Hand Fully Decoupled)
 # =============================================================================
-# Architecture: Arm-Hand decoupling (23-DOF hard constraint)
-#   computeArm()   — 4-DOF (shoulder×3 + elbow) → 3-DOF wrist origin position
-#   computeWrist() — 1-DOF (wrist_roll) → hand orientation (under-actuated)
+# Arm (reach_node):   4-DOF IK (damped pseudoinverse) → wrist position
+# Hand (hand_controller): 23-DOF (wrist PID + finger impedance) → orientation + grasp
 #
-# Switch to 29-DOF model: wrist_pitch + wrist_yaw become active automatically.
-# Dexterous hand phase: add hand-specific params below the wrist section.
+# Arm:  Δq = α·J⁺·e_pos + (I−J⁺J)·k_posture·(q_pref−q)
+# Hand: τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act) → q_cmd = q_des + τ/Kp_inner
 # =============================================================================
 
 reach_node:
   ros__parameters:
 
     # -------------------------------------------------------------------------
-    # Robot Model — joint grouping
+    # Robot Model — joint grouping (Plan C: wrist → Hand module)
     # -------------------------------------------------------------------------
     robot_model:
       urdf_path: ""  # Set via launch argument
 
-      active_joints:                        # All 5 right-arm active joints
+      active_joints:                        # All right arm joints (for bridge Jacobian)
         - "right_shoulder_pitch_joint"
         - "right_shoulder_roll_joint"
         - "right_shoulder_yaw_joint"
         - "right_elbow_joint"
         - "right_wrist_roll_joint"
+        - "right_wrist_pitch_joint"
+        - "right_wrist_yaw_joint"
 
-      arm_joints:                           # Arm IK subset (4-DOF → 3-DOF position)
+      arm_joints:                           # Arm IK subset — 4-DOF position control
         - "right_shoulder_pitch_joint"
         - "right_shoulder_roll_joint"
         - "right_shoulder_yaw_joint"
         - "right_elbow_joint"
 
-      wrist_joints:                         # Wrist solver subset (variable DOF)
-        - "right_wrist_roll_joint"          #   Active in 23-DOF (1-DOF, under-actuated)
-        - "right_wrist_pitch_joint"         #   Active in 29-DOF (3-DOF, direct solve)
-        - "right_wrist_yaw_joint"           #   Inactive joints → warning, not error
+      wrist_joints:                         # Wrist joints (Plan C: control in hand_controller, listed for bridge Jacobian)
+        - "right_wrist_roll_joint"
+        - "right_wrist_pitch_joint"
+        - "right_wrist_yaw_joint"
 
       ee_link: "right_wrist_roll_link"      # Position control target (wrist origin)
 
@@ -45,21 +46,13 @@ reach_node:
       kp: 2.0                    # Proportional gain
       ki: 0.4                    # Integral gain (anti-windup limit 0.10)
       kd: 0.05                   # Derivative gain
-      damping: 2.0e-4            # Damped pseudoinverse λ (adaptive, auto-increases near singularity)
+      damping: 2.0e-4            # Damped pseudoinverse λ (adaptive)
       tolerance: 0.01            # Position tolerance (1 cm)
       posture_gain: 0.2          # Null-space attraction toward posture_target
-      posture_target: [-0.3, 0.0, 0.0, 0.3, 0.0]  # Slight forward lean — avoids |J| ≈ 1e-4 singularity
+      posture_target: [-0.3, 0.0, 0.0, 0.3]  # arm(4): slight forward lean + elbow bend
 
       # -----------------------------------------------------------------------
-      # Wrist solver — variable DOF → 3-DOF orientation
-      # -----------------------------------------------------------------------
-      # 23-DOF: 1-DOF (wrist_roll) → 3×1 damped pseudoinverse (under-actuated)
-      # 29-DOF: 3-DOF (roll+pitch+yaw) → 3×3 direct solve
-      kp_wrist: 1.0              # Orientation P gain (rad/s per rad)
-      kd_wrist: 0.02             # Orientation D gain
-
-      # -----------------------------------------------------------------------
-      # Torque mode — DISABLED (J_pinv vs Jᵀ dual mapping caused oscillation)
+      # Torque mode — DISABLED
       # -----------------------------------------------------------------------
       torque_mode: false
       gravity_compensation: false
@@ -75,31 +68,124 @@ reach_node:
     reach_node:
       origin_frame: "right_shoulder"
       pelvis_offset: [0.0, 0.0, 0.823]     # URDF pelvis → MuJoCo world Z alignment
-      target_topic: "/target_pose"          # PoseStamped, 6-DOF, shoulder-relative
-      target_point_topic: "/target_point"   # Point, 3-DOF (legacy)
+      target_point_topic: "/target_point"   # Point, 3-DOF (shoulder-relative XYZ)
       joint_state_topic: "/joint_states"
       default_target: [0.18, -0.05, -0.10]  # Shoulder-relative, ~21 cm reachable
-      default_orientation: [0.0, 0.0, 0.0, 1.0]  # Identity quaternion
-
-    # -------------------------------------------------------------------------
-    # MuJoCo bridge — physics simulation (200 Hz)
-    # -------------------------------------------------------------------------
-    mujoco_bridge:
-      ros__parameters:
-        scene_path: ""
-        physics_rate: 200.0
-        camera_rate: 15.0
-        publish_camera: false
-        publish_ft: true
-        viewer: false
-        base_frame: "pelvis"
 
 # =============================================================================
-# Dexterous Hand Phase (NEXT)
+# Dexterous Hand — Wuji Hand 2 (Plan C: wrist×3 + fingers×20 = 23-DOF)
 # =============================================================================
-# When integrating a dexterous hand:
-#   1. Add hand_joints: [finger_1_j1, finger_1_j2, ...] below wrist_joints
-#   2. Add hand controller params: kp_hand, kd_hand, grasp_force_limit, etc.
-#   3. Hand control runs in parallel with arm IK (independent joint groups)
-#   4. Use GraspObject.action to sequence: approach → grasp → lift
+hand_controller:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # Joint names — wrist (3) + fingers (5 × 4 = 20) = 23 DOF
+    # -------------------------------------------------------------------------
+    wrist_joint_names:
+      - "right_wrist_roll_joint"
+      - "right_wrist_pitch_joint"
+      - "right_wrist_yaw_joint"
+
+    finger_joint_names:
+      - "right_finger1_joint1"     # Thumb: base (CMC)
+      - "right_finger1_joint2"     # Thumb: abduction
+      - "right_finger1_joint3"     # Thumb: proximal (MCP)
+      - "right_finger1_joint4"     # Thumb: distal (IP)
+      - "right_finger2_joint1"     # Index: base
+      - "right_finger2_joint2"     # Index: abduction (splay)
+      - "right_finger2_joint3"     # Index: proximal (PIP)
+      - "right_finger2_joint4"     # Index: distal (DIP)
+      - "right_finger3_joint1"     # Middle: base
+      - "right_finger3_joint2"     # Middle: abduction (splay)
+      - "right_finger3_joint3"     # Middle: proximal (PIP)
+      - "right_finger3_joint4"     # Middle: distal (DIP)
+      - "right_finger4_joint1"     # Ring: base
+      - "right_finger4_joint2"     # Ring: abduction (splay)
+      - "right_finger4_joint3"     # Ring: proximal (PIP)
+      - "right_finger4_joint4"     # Ring: distal (DIP)
+      - "right_finger5_joint1"     # Pinky: base
+      - "right_finger5_joint2"     # Pinky: abduction (splay)
+      - "right_finger5_joint3"     # Pinky: proximal (PIP)
+      - "right_finger5_joint4"     # Pinky: distal (DIP)
+
+    # -------------------------------------------------------------------------
+    # Wrist orientation PID
+    # -------------------------------------------------------------------------
+    # Jacobian provided by /mujoco_wrist_jacobian (MuJoCo numerical, avoids FK mismatch).
+    kp_wrist: 2.0                # Orientation P gain
+    ki_wrist: 0.05               # Orientation I gain (minimal — deadband handles static error)
+    kd_wrist: 0.12               # Orientation D gain (damping to suppress jitter)
+    wrist_vel_limit: 3.0         # Max wrist joint velocity (rad/s)
+    wrist_delta_limit: 0.12      # Max per-cycle wrist joint delta (rad)
+    wrist_offset_limit: 2.0      # ±max wrist offset from ready pose (rad)
+
+    # -------------------------------------------------------------------------
+    # Finger impedance control
+    # -------------------------------------------------------------------------
+    # τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act)
+    # Encoded as: q_cmd = q_des + τ / inner_servo_kp (position-encoded torque)
+    kp_finger: 500.0              # Finger stiffness (N·m/rad)
+    kd_finger: 0.5               # Finger damping (N·m·s/rad)
+    tau_max_finger: 200.0         # Max finger torque (N·m)
+    finger_delta_limit: 1.5      # Max per-cycle finger joint delta (rad)
+
+    # Inner-loop gain — MUST match actual MuJoCo position-servo kp in scene XML.
+    # Kp_inner = original_kp × finger_kp_scale (bridge scales both gainprm + biasprm).
+    inner_servo_kp: 400.0
+
+    # Anti-penetration: position-based contact detection.
+    # After trajectory completes (des_q frozen at target), if position error
+    # exceeds blocked_error AND velocity < vel_threshold, finger is blocked.
+    # Action: des_q → actual_q (kill servo force, freeze at contact position).
+    # Recovery: if object slips, des_q ramps back toward target at 0.5 rad/s.
+    grasp_blocked_error: 0.15    # rad — tracking error that means "blocked"
+    grasp_vel_threshold: 0.3     # rad/s — below this, finger is "stopped"
+
+    # -------------------------------------------------------------------------
+    # Grasp timing
+    # -------------------------------------------------------------------------
+    interp_duration: 0.02         # Default grasp action interpolation time (s)
+
+    # -------------------------------------------------------------------------
+    # Topics
+    # -------------------------------------------------------------------------
+    hand_command_topic: "/hand_command"
+    joint_state_topic: "/joint_states"
+    hand_orientation_topic: "/actual_hand_orientation"
+    wrist_jacobian_topic: "/mujoco_wrist_jacobian"
+
 # =============================================================================
+# MuJoCo bridge — physics simulation (200 Hz)
+# =============================================================================
+mujoco_bridge:
+  ros__parameters:
+    scene_path: ""
+    physics_rate: 200.0
+    camera_rate: 15.0
+    publish_camera: false
+    publish_ft: true
+    viewer: false
+    base_frame: "pelvis"
+
+    # Active joints: arm 4 + wrist 3 (Jacobian extraction only).
+    # Arm 4 commanded from reach_node, wrist 3 + fingers 20 from hand_controller.
+    active_joints:
+      - "right_shoulder_pitch_joint"
+      - "right_shoulder_roll_joint"
+      - "right_shoulder_yaw_joint"
+      - "right_elbow_joint"
+      - "right_wrist_roll_joint"
+      - "right_wrist_pitch_joint"
+      - "right_wrist_yaw_joint"
+
+    # Finger position-servo gain scaling (MJCF defaults ~0.2-0.7 kp → too slow).
+    # gainprm[0] AND biasprm[1] scaled together → force = scale×kp×(ctrl−q) (correct).
+    finger_kp_scale: 80.0      # kp = old_kp × 80 = 400
+    finger_kv_scale: 1.0       # kv = old_kv × 1.0
+    finger_ema_alpha: 1.0      # EMA smoothing (1.0 = no smoothing)
+    wrist_ema_alpha: 1.0       # Wrist EMA (1.0 = no smoothing)
+
+    # Hard clamping
+    hard_clamp_pelvis: true
+    hard_clamp_joints: true
+    clamp_arm_joints: false

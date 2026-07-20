@@ -1,0 +1,54 @@
+<!-- Wuji Hand Right - assets + actuators (auto-generated) -->
+<!-- NOTE: mesh paths are absolute. <mujoco> wrapper is XML root only (no <compiler>). -->
+<mujoco>
+  <asset>
+    <mesh name="right_palm_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_palm_link.STL" />
+    <mesh name="right_finger1_link1" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger1_link1.STL" />
+    <mesh name="right_finger1_link2" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger1_link2.STL" />
+    <mesh name="right_finger1_link3" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger1_link3.STL" />
+    <mesh name="right_finger1_link4" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger1_link4.STL" />
+    <mesh name="right_finger1_tip_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger1_tip_link.STL" />
+    <mesh name="right_finger2_link1" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger2_link1.STL" />
+    <mesh name="right_finger2_link2" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger2_link2.STL" />
+    <mesh name="right_finger2_link3" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger2_link3.STL" />
+    <mesh name="right_finger2_link4" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger2_link4.STL" />
+    <mesh name="right_finger2_tip_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger2_tip_link.STL" />
+    <mesh name="right_finger3_link1" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger3_link1.STL" />
+    <mesh name="right_finger3_link2" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger3_link2.STL" />
+    <mesh name="right_finger3_link3" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger3_link3.STL" />
+    <mesh name="right_finger3_link4" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger3_link4.STL" />
+    <mesh name="right_finger3_tip_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger3_tip_link.STL" />
+    <mesh name="right_finger4_link1" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger4_link1.STL" />
+    <mesh name="right_finger4_link2" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger4_link2.STL" />
+    <mesh name="right_finger4_link3" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger4_link3.STL" />
+    <mesh name="right_finger4_link4" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger4_link4.STL" />
+    <mesh name="right_finger4_tip_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger4_tip_link.STL" />
+    <mesh name="right_finger5_link1" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger5_link1.STL" />
+    <mesh name="right_finger5_link2" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger5_link2.STL" />
+    <mesh name="right_finger5_link3" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger5_link3.STL" />
+    <mesh name="right_finger5_link4" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger5_link4.STL" />
+    <mesh name="right_finger5_tip_link" content_type="model/stl" file="/home/lyrah/deps/wuji-hand-description/meshes/right/right_finger5_tip_link.STL" />
+  </asset>
+  <actuator>
+    <position name="right_finger1_joint1_actuator" joint="right_finger1_joint1" kp="5" kv="0.5" ctrlrange="0.0475 1.603" forcerange="-0.4452 0.4452" />
+    <position name="right_finger1_joint2_actuator" joint="right_finger1_joint2" kp="5" kv="0.5" ctrlrange="-0.1387 0.9324" forcerange="-0.4259 0.4259" />
+    <position name="right_finger1_joint3_actuator" joint="right_finger1_joint3" kp="5" kv="0.5" ctrlrange="-0.4642 1.562" forcerange="-0.1888 0.1888" />
+    <position name="right_finger1_joint4_actuator" joint="right_finger1_joint4" kp="5" kv="0.5" ctrlrange="-0.4699 1.5568" forcerange="-0.1468 0.1468" />
+    <position name="right_finger2_joint1_actuator" joint="right_finger2_joint1" kp="5" kv="0.5" ctrlrange="-0.1585 1.56" forcerange="-0.6188 0.6188" />
+    <position name="right_finger2_joint2_actuator" joint="right_finger2_joint2" kp="5" kv="0.5" ctrlrange="-0.37 0.37" forcerange="-0.1822 0.1822" />
+    <position name="right_finger2_joint3_actuator" joint="right_finger2_joint3" kp="5" kv="0.5" ctrlrange="-0.4777 1.548" forcerange="-0.2251 0.2251" />
+    <position name="right_finger2_joint4_actuator" joint="right_finger2_joint4" kp="5" kv="0.5" ctrlrange="-0.4683 1.575" forcerange="-0.2170 0.2170" />
+    <position name="right_finger3_joint1_actuator" joint="right_finger3_joint1" kp="5" kv="0.5" ctrlrange="-0.1644 1.5516" forcerange="-0.6494 0.6494" />
+    <position name="right_finger3_joint2_actuator" joint="right_finger3_joint2" kp="5" kv="0.5" ctrlrange="-0.37 0.37" forcerange="-0.1827 0.1827" />
+    <position name="right_finger3_joint3_actuator" joint="right_finger3_joint3" kp="5" kv="0.5" ctrlrange="-0.4739 1.551" forcerange="-0.2078 0.2078" />
+    <position name="right_finger3_joint4_actuator" joint="right_finger3_joint4" kp="5" kv="0.5" ctrlrange="-0.4684 1.5745" forcerange="-0.2018 0.2018" />
+    <position name="right_finger4_joint1_actuator" joint="right_finger4_joint1" kp="5" kv="0.5" ctrlrange="-0.1554 1.558" forcerange="-0.6389 0.6389" />
+    <position name="right_finger4_joint2_actuator" joint="right_finger4_joint2" kp="5" kv="0.5" ctrlrange="-0.37 0.37" forcerange="-0.1832 0.1832" />
+    <position name="right_finger4_joint3_actuator" joint="right_finger4_joint3" kp="5" kv="0.5" ctrlrange="-0.4765 1.5487" forcerange="-0.2249 0.2249" />
+    <position name="right_finger4_joint4_actuator" joint="right_finger4_joint4" kp="5" kv="0.5" ctrlrange="-0.4777 1.563" forcerange="-0.2044 0.2044" />
+    <position name="right_finger5_joint1_actuator" joint="right_finger5_joint1" kp="5" kv="0.5" ctrlrange="-0.1626 1.558" forcerange="-0.6441 0.6441" />
+    <position name="right_finger5_joint2_actuator" joint="right_finger5_joint2" kp="5" kv="0.5" ctrlrange="-0.37 0.37" forcerange="-0.1798 0.1798" />
+    <position name="right_finger5_joint3_actuator" joint="right_finger5_joint3" kp="5" kv="0.5" ctrlrange="-0.4768 1.549" forcerange="-0.2384 0.2384" />
+    <position name="right_finger5_joint4_actuator" joint="right_finger5_joint4" kp="5" kv="0.5" ctrlrange="-0.4683 1.573" forcerange="-0.1866 0.1866" />
+  </actuator>
+</mujoco>

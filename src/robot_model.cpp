@@ -1,6 +1,6 @@
 /**
  * @file robot_model.cpp
- * @brief URDF → reduced 5-DOF Pinocchio model. EE = wrist_roll_link origin.
+ * @brief URDF → reduced 7-DOF Pinocchio model. EE = wrist_roll_link origin.
  */
 
 #include "g1_right_arm_reach/robot_model.hpp"
@@ -42,7 +42,7 @@ RobotModel::RobotModel(
         }
     }
 
-    // 4. Build reduced model (5-DOF right arm)
+    // 4. Build reduced model (7-DOF right arm)
     reduced_model_ = pinocchio::buildReducedModel(full_model_, locked_joint_ids_full_, q_ref_full_);
     reduced_data_ = pinocchio::Data(reduced_model_);
 

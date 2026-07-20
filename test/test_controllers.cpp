@@ -40,7 +40,9 @@ protected:
             "right_shoulder_roll_joint",
             "right_shoulder_yaw_joint",
             "right_elbow_joint",
-            "right_wrist_roll_joint"
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint"
         };
 
         robot_ = std::make_unique<RobotModel>(urdf_path_, active_joints_);

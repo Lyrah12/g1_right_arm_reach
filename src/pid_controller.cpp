@@ -145,13 +145,7 @@ ControlResult PIDController::computeArm(
         if (robot_.q_(i) >= robot_.q_max_(i) && dq_arm(k) > 0.0) dq_arm(k) = 0.0;
     }
 
-    // --- Integrate arm joints only ---
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        robot_.q_(i) = pinocchio::integrate(robot_.reduced_model_, robot_.q_,
-                                            Eigen::VectorXd::Unit(nv, i) * dq_arm(k) * dt)(i);
-    }
-    // Simpler: direct addition for 1-DOF revolute joints
+    // --- Integrate arm joints (direct addition — 1-DOF revolute joints) ---
     for (int k = 0; k < n_arm; ++k) {
         int i = robot_.arm_joint_indices_[k];
         robot_.q_(i) = current_q(i) + dq_arm(k) * dt;

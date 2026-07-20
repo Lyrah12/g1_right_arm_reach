@@ -1,0 +1,163 @@
+<!--
+  g1_wuji_scene.xml — G1 29-DOF + Wuji Hand 2 复合仿真场景
+  =====================================================================
+  前置条件 (WSL2):
+    bash scripts/setup_wuji_hand.sh
+
+  启动:
+    ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
+      urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf \
+      scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_wuji_scene.xml \
+      viewer:=true
+
+  架构:
+    Wuji palm + 5 手指 → 注入到 G1 MJCF 的 right_wrist_yaw_link 内部
+    → kinematic 子节点（无需 weld 约束）
+  =====================================================================
+-->
+<mujoco model="g1_wuji_scene">
+
+  <!-- ===================================================================== -->
+  <!-- 可视化选项                                                             -->
+  <!-- ===================================================================== -->
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <!-- ===================================================================== -->
+  <!-- G1 29-DOF + Wuji 手掌/手指（注入版，wuji palm 是 wrist 的 kinematic 子节点） -->
+  <!--   由 setup_wuji_hand.sh 自动生成到 G1 MJCF 目录                        -->
+  <!--   相对路径已修复为绝对路径，rubber_hand 视觉已隐藏                       -->
+  <!-- ===================================================================== -->
+  <include file="/home/lyrah/deps/unitree_mujoco/unitree_robots/g1/g1_29dof_wuji.xml"/>
+
+  <!-- ===================================================================== -->
+  <!-- Wuji Hand 2 — mesh assets (STL defs) + finger actuators (kp=5, kv=0.5)  -->
+  <!--   body tree 已注入到上面 g1_29dof_wuji.xml，此处只包含 mesh 和执行器     -->
+  <!-- ===================================================================== -->
+  <include file="/home/lyrah/g1_ws/src/g1_right_arm_reach/config/wuji_hand_right_patched.xml"/>
+
+  <!-- ===================================================================== -->
+  <!-- 仿真选项                                                               -->
+  <!-- ===================================================================== -->
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <!-- ===================================================================== -->
+  <!-- 全局关节阻尼                                                           -->
+  <!-- ===================================================================== -->
+  <default>
+    <joint damping="2"/>
+  </default>
+
+  <!-- ===================================================================== -->
+  <!-- 场景几何体                                                             -->
+  <!-- ===================================================================== -->
+  <worldbody>
+
+    <!-- 地面 -->
+    <geom name="floor" type="plane" size="0 0 0.05"
+          friction="1.0 0.5 0.5"
+          rgba="0.8 0.8 0.8 1"/>
+
+    <!-- 光照 -->
+    <light name="sun" directional="true" pos="2 2 3" dir="-0.5 -0.5 -1"
+           diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+
+    <!-- 虚拟相机 -->
+    <camera name="head_cam"
+            pos="0.02 0 0.65"
+            xyaxes="1 0 0 0 0.7 0.7"
+            fovy="60"
+            resolution="640 480"/>
+
+    <!-- ================================================================= -->
+    <!-- 高脚小桌子 + 圆柱形细长物体（抓取测试目标）                       -->
+    <!--   桌子位置: 机器人右前方，桌面高 ~0.9m                              -->
+    <!--   圆柱体: 半径 1.2cm, 高 12cm, 蓝色，立在桌面上                     -->
+    <!--   桌子无 joint → 固定在世界坐标系                                 -->
+    <!--   圆柱体有 freejoint → 自由落体到桌面，可被抓取                     -->
+    <!-- ================================================================= -->
+
+    <!-- 高脚小桌子（4 条圆柱腿 + 方形桌面，桌面 10cm×10cm） -->
+    <body name="tall_table" pos="0.38 -0.22 0.0">
+      <!-- 四条腿（圆柱体: radius=0.01, half-height=0.45 → 总高 0.9m） -->
+      <geom name="table_leg_fl" type="cylinder" size="0.01 0.45"
+            pos="-0.035 -0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_fr" type="cylinder" size="0.01 0.45"
+            pos=" 0.035 -0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_bl" type="cylinder" size="0.01 0.45"
+            pos="-0.035  0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_br" type="cylinder" size="0.01 0.45"
+            pos=" 0.035  0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <!-- 桌面（box: 0.05×0.05×0.015 half-extents → 10cm×10cm×3cm） -->
+      <geom name="table_top" type="box" size="0.05 0.05 0.015"
+            pos="0 0 0.915" rgba="0.65 0.42 0.18 1"
+            friction="0.8 0.5 0.3"
+            solref="0.02 1.0"
+            solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- 圆柱形细长物体（自由落体，可被抓取）                               -->
+    <!--   密度 8000 ≈ 钢 (~430g)，摩擦 0.6/0.4/0.2，硬接触                  -->
+    <body name="target_cylinder" pos="0.38 -0.22 0.95">
+      <freejoint/>
+      <geom name="cylinder_geom" type="cylinder" size="0.020 0.06"
+            density="8000"
+            friction="2.0 1.0 0.5"
+            solref="0.01 1.0"
+            solimp="0.95 0.99 0.0005"
+            rgba="0.15 0.45 0.75 1"/>
+    </body>
+
+  </worldbody>
+
+  <!-- ===================================================================== -->
+  <!-- 执行器                                                                 -->
+  <!--   注意: Weld 约束已删除 — Wuji palm 现在是 wrist 的 kinematic 子节点    -->
+  <!--   G1 自带的 <motor> 执行器会被覆盖 (ctrl→0 禁用)                        -->
+  <!-- ===================================================================== -->
+  <actuator>
+    <!-- ========== 右臂 7 关节（主动控制: arm 4 + wrist 3）================== -->
+    <position name="act_r_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="300" kv="5"/>
+    <position name="act_r_shoulder_roll"  joint="right_shoulder_roll_joint"  kp="300" kv="5"/>
+    <position name="act_r_shoulder_yaw"   joint="right_shoulder_yaw_joint"   kp="300" kv="5"/>
+    <position name="act_r_elbow"          joint="right_elbow_joint"          kp="300" kv="5"/>
+    <position name="act_r_wrist_roll"     joint="right_wrist_roll_joint"     kp="60" kv="2"/>
+    <position name="act_r_wrist_pitch"    joint="right_wrist_pitch_joint"    kp="60" kv="4"/>
+    <position name="act_r_wrist_yaw"      joint="right_wrist_yaw_joint"      kp="60" kv="5"/>
+
+    <!-- Wuji 手指 20 关节 — 由 wuji_hand_right_patched.xml <include> 自带 -->
+
+    <!-- ========== 左臂 7 关节（锁定姿态）=================================== -->
+    <position name="act_l_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="100" kv="5"/>
+    <position name="act_l_shoulder_roll"  joint="left_shoulder_roll_joint"  kp="100" kv="5"/>
+    <position name="act_l_shoulder_yaw"   joint="left_shoulder_yaw_joint"   kp="100" kv="5"/>
+    <position name="act_l_elbow"          joint="left_elbow_joint"          kp="100" kv="5"/>
+    <position name="act_l_wrist_roll"     joint="left_wrist_roll_joint"     kp="100" kv="5"/>
+    <position name="act_l_wrist_pitch"    joint="left_wrist_pitch_joint"    kp="30"  kv="2"/>
+    <position name="act_l_wrist_yaw"      joint="left_wrist_yaw_joint"      kp="30"  kv="2"/>
+
+    <!-- ========== 左腿 6 关节 ========== -->
+    <position name="act_left_hip_pitch"   joint="left_hip_pitch_joint"   kp="600" kv="50"/>
+    <position name="act_left_hip_roll"    joint="left_hip_roll_joint"    kp="600" kv="50"/>
+    <position name="act_left_hip_yaw"     joint="left_hip_yaw_joint"     kp="600" kv="50"/>
+    <position name="act_left_knee"        joint="left_knee_joint"        kp="600" kv="50"/>
+    <position name="act_left_ankle_pitch" joint="left_ankle_pitch_joint" kp="600" kv="50"/>
+    <position name="act_left_ankle_roll"  joint="left_ankle_roll_joint"  kp="600" kv="50"/>
+
+    <!-- ========== 右腿 6 关节 ========== -->
+    <position name="act_right_hip_pitch"   joint="right_hip_pitch_joint"   kp="600" kv="50"/>
+    <position name="act_right_hip_roll"    joint="right_hip_roll_joint"    kp="600" kv="50"/>
+    <position name="act_right_hip_yaw"     joint="right_hip_yaw_joint"     kp="600" kv="50"/>
+    <position name="act_right_knee"        joint="right_knee_joint"        kp="600" kv="50"/>
+    <position name="act_right_ankle_pitch" joint="right_ankle_pitch_joint" kp="600" kv="50"/>
+    <position name="act_right_ankle_roll"  joint="right_ankle_roll_joint"  kp="600" kv="50"/>
+
+    <!-- ========== 腰部 3 关节 ========== -->
+    <position name="act_waist_yaw"   joint="waist_yaw_joint"   kp="300" kv="20"/>
+    <position name="act_waist_roll"  joint="waist_roll_joint"  kp="300" kv="20"/>
+    <position name="act_waist_pitch" joint="waist_pitch_joint" kp="300" kv="20"/>
+  </actuator>
+
+</mujoco>

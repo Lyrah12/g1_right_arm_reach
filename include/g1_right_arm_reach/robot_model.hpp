@@ -1,5 +1,5 @@
 /** @file robot_model.hpp
- *  @brief G1 right-arm model: URDF → reduced 5-DOF Pinocchio model.
+ *  @brief G1 right-arm model: URDF → reduced 7-DOF Pinocchio model.
  *
  *  RobotModel is the single source of truth for kinematic structure.
  *  Supports Arm-Hand decoupling via buildSubsetIndices():
@@ -34,7 +34,7 @@ namespace g1_right_arm_reach {
  * @brief Core robot model manager for the G1 right arm.
  *
  * Loads the full G1 URDF, then builds a reduced model with only the
- * right arm's 5 active joints.  All other joints (left arm, legs, waist) are
+ * right arm's 7 active joints.  All other joints (left arm, legs, waist) are
  * locked at their reference configuration and replaced by FIXED_JOINT frames
  * in the reduced model.
  *
@@ -44,9 +44,9 @@ class RobotModel {
 public:
     // --- Construction ---
 
-    /// Load URDF, build reduced 5-DOF right-arm model.
+    /// Load URDF, build reduced 7-DOF right-arm model.
     /// @param urdf_path          Absolute path to G1 URDF.
-    /// @param active_joint_names 5 right-arm joint names.
+    /// @param active_joint_names 7 right-arm joint names.
     /// @param q_ref_full         Full-model reference config (empty = neutral).
     RobotModel(const std::string& urdf_path,
                const std::vector<std::string>& active_joint_names,

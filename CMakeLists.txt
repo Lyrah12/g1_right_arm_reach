@@ -1,11 +1,16 @@
 #
-# CMakeLists.txt — G1 Right Arm End-Effector Control
+# CMakeLists.txt — G1 Right Arm + Dexterous Hand Control (Plan C)
 #
-# Targets:
+# Libraries:
 #   g1_right_arm_core   — RobotModel + Kinematics (Pinocchio wrapper)
-#   g1_controllers      — PIDController (Arm-Hand decoupled IK)
-#   reach_node          — Main control node (50 Hz, Arm + Wrist IK)
-#   target_publisher    — Test utility node
+#   g1_controllers      — PIDController (damped pseudoinverse IK)
+#   grasp_library       — 15 pre-defined grasp patterns
+#
+# Nodes:
+#   reach_node          — Arm IK (50 Hz, 4-DOF → 3-DOF position)
+#   hand_controller_node — Hand control (50 Hz, 23-DOF wrist+fingers)
+#   action_sequencer_node — State machine coordinator (50 Hz)
+#   target_publisher    — Test utility
 #
 
 cmake_minimum_required(VERSION 3.22)
@@ -48,6 +53,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/DetectedObjectArray.msg"
     "msg/ArmStatus.msg"
     "msg/GraspResult.msg"
+    "msg/GraspCommand.msg"
+    "msg/ActionCommand.msg"
+    "msg/HandCommand.msg"
     # --- Actions ---
     "action/GraspObject.action"
     DEPENDENCIES
@@ -96,25 +104,60 @@ target_link_libraries(g1_controllers
     Eigen3::Eigen
 )
 
+# MODULE: Grasp Library — standalone grasp pattern registry
+# ============================================================================
+
+# grasp_library: provides 15+ pre-defined grasp patterns for Wuji Hand 2.
+# ROS-independent — can be used by any node (hand_controller, action_sequencer,
+# or future vision-grasp integration nodes).
+add_library(grasp_library SHARED
+    src/grasp_library.cpp
+)
+target_include_directories(grasp_library PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
 # MODULE: Executables — ROS 2 nodes
 # ============================================================================
 
-# reach_node: main ROS 2 node that subscribes to a 3D target point,
-# runs the IK controller loop, and publishes joint commands / markers.
+# reach_node: Arm IK (50 Hz). Subscribes /target_point (3-DOF, shoulder-relative),
+# runs damped pseudoinverse IK, publishes /joint_commands (4-DOF arm).
 add_executable(reach_node src/reach_node.cpp)
 target_link_libraries(reach_node g1_right_arm_core g1_controllers)
 ament_target_dependencies(reach_node rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs)
 rosidl_target_interfaces(reach_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-# target_publisher_node: testing utility that publishes a marker pose so the
-# reach_node has a target to track without needing external input.
+# target_publisher_node: Test utility for publishing marker poses.
 add_executable(target_publisher_node src/target_publisher_node.cpp)
 ament_target_dependencies(target_publisher_node rclcpp geometry_msgs)
+
+# hand_controller_node: Hand module (50 Hz, Plan C). 23-DOF (wrist×3 + fingers×20).
+# Wrist: orientation PID + MuJoCo 3×3 Jacobian. Fingers: impedance control + smoothstep.
+add_executable(hand_controller_node src/hand_controller_node.cpp)
+target_include_directories(hand_controller_node PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(hand_controller_node grasp_library Eigen3::Eigen)
+ament_target_dependencies(hand_controller_node rclcpp std_msgs sensor_msgs geometry_msgs)
+rosidl_target_interfaces(hand_controller_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
+# action_sequencer_node: Action coordinator (50 Hz, Plan C).
+# State machine: IDLE → REACHING → SETTLING → GRASPING → DONE.
+# Position → /target_point, Orientation+Grasp → /hand_command.
+add_executable(action_sequencer_node src/action_sequencer_node.cpp)
+target_include_directories(action_sequencer_node PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(action_sequencer_node grasp_library Eigen3::Eigen)
+ament_target_dependencies(action_sequencer_node rclcpp std_msgs sensor_msgs geometry_msgs)
+rosidl_target_interfaces(action_sequencer_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 # MODULE: Install
 # ============================================================================
 
-install(TARGETS g1_right_arm_core g1_controllers reach_node target_publisher_node
+install(TARGETS g1_right_arm_core g1_controllers grasp_library
+    reach_node target_publisher_node hand_controller_node action_sequencer_node
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -124,9 +167,11 @@ install(DIRECTORY include/
     DESTINATION include
 )
 
-# Install Python scripts (MuJoCo bridge, utilities)
+# Install Python scripts (MuJoCo bridge, CLI, utilities)
 install(PROGRAMS
     scripts/mujoco_bridge_node.py
+    scripts/action_cli.py
+    scripts/setup_wuji_hand.sh
     DESTINATION lib/${PROJECT_NAME}
 )
 
