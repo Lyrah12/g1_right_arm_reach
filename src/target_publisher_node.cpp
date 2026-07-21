@@ -1,6 +1,6 @@
 /** @file target_publisher_node.cpp
- *  Test utility: publishes a configurable 6-DOF target pose on /target_pose
- *  (PoseStamped) at a fixed rate.  Backward compatible via /target_point.
+ *  Test utility: publishes a configurable 3-DOF target position on /target_pose
+ *  (PoseStamped) and /target_point (Point) at a fixed rate.
  *
  *  Usage:
  *    ros2 run g1_right_arm_reach target_publisher_node

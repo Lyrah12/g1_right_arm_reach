@@ -94,11 +94,11 @@
 - **臂手解耦架构** —— 4-DOF 手臂 IK + 23-DOF 手部控制，模块完全独立
 - **阻尼伪逆 IK** —— 4-DOF → 3-DOF，自适应阻尼 + 零空间姿态吸引
 - **腕部朝向 PID** —— MuJoCo 3×3 数值 Jacobian（避免 URDF FK 模型不匹配）
-- **手指阻抗控制** —— 位置编码力矩 + smoothstep 轨迹生成
+- **手指阻抗控制** —— 位置编码力矩，直接跳变 + 阻抗控制器过渡
 - **15 种预定义抓取模式** —— 精细抓取、力量抓取、手势姿态
 - **动作编排状态机** —— IDLE → REACHING → SETTLING → GRASPING，带收敛检测
 - **统一命令行工具** —— 交互模式支持 RPY 朝向、单次命令和 Topic 级访问
-- **200 Hz MuJoCo 物理仿真** —— 位置伺服执行器，支持分组 EMA 平滑和增益缩放
+- **200 Hz MuJoCo 物理仿真** —— 位置伺服执行器，支持分组 EMA 平滑
 - **运行时参数调节** —— 所有增益可通过 `ros2 param set` 动态调整，无需重启
 
 ## 快速开始
@@ -319,7 +319,7 @@ $$q_{cmd} = q_{ref} + \int \Delta q\\dt \quad \text{(基于偏移量，带抗饱
 
 ### 手指：前馈阻抗控制
 
-$$q_{des}(t) = \text{smoothstep}(q_{start} \rightarrow q_{target}, t / duration)$$
+$$q_{des} = q_{target}\quad\text{(收到抓取指令时直接跳变)}$$
 
 $$\tau_{des} = k_p^{finger} \cdot (q_{des} - q_{act}) + k_d^{finger} \cdot (0 - \dot{q}_{act})$$
 
@@ -337,7 +337,7 @@ $$q_{cmd} = q_{des} + \frac{\tau_{des}}{k_p^{inner}} \quad \text{(位置编码�
 | `pid.ki` | 0.4 | IK 积分增益（抗饱和上限 0.10） |
 | `pid.kd` | 0.05 | IK 微分增益 |
 | `pid.damping` | 2e−4 | 阻尼伪逆 λ（自适应） |
-| `pid.tolerance` | 0.02 | 位置收敛容差 (m) |
+| `pid.tolerance` | 0.005 | 位置收敛容差 (m) |
 | `pid.posture_gain` | 0.2 | 零空间姿态吸引强度 |
 
 ### 手部控制器
@@ -348,18 +348,17 @@ $$q_{cmd} = q_{des} + \frac{\tau_{des}}{k_p^{inner}} \quad \text{(位置编码�
 | `ki_wrist` | 0.05 | 腕部朝向 I 增益 |
 | `kd_wrist` | 0.12 | 腕部朝向 D 增益 |
 | `wrist_offset_limit` | 2.0 | 腕部偏移上限（相对就绪姿态，rad） |
-| `kp_finger` | 500.0 | 手指阻抗刚度 (N·m/rad) |
+| `kp_finger` | 50.0 | 手指阻抗刚度 (N·m/rad) |
 | `kd_finger` | 0.5 | 手指阻抗阻尼 (N·m·s/rad) |
-| `inner_servo_kp` | 400.0 | MuJoCo 内环 kp（必须与 MJCF 缩放一致） |
+| `inner_servo_kp` | 5.0 | MuJoCo 内环 kp（必须匹配 MJCF 手指 kp） |
 
 ### MuJoCo 桥接
 
 | 参数 | 默认值 | 说明 |
 |-----------|---------|-------------|
 | `physics_rate` | 200.0 | 物理步进频率 (Hz) |
-| `finger_kp_scale` | 80.0 | 手指伺服 kp 倍率 |
-| `finger_kv_scale` | 1.0 | 手指伺服 kv 倍率 |
 | `wrist_ema_alpha` | 1.0 | 腕部 EMA 平滑 |
+| `finger_ema_alpha` | 1.0 | 手指 EMA 平滑 |
 
 ## Topic 总览
 

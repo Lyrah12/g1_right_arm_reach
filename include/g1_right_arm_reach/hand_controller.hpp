@@ -85,9 +85,6 @@ private:
     /// Impedance: τ = Kp·(des − act) + Kd·(0 − dq), encoded as position offset.
     void stepFingerControl();
 
-    /// Smoothstep trajectory: start_q → target_q over interp_duration.
-    void stepFingerTrajectory(double dt);
-
     // ========================================================================
     // State
     // ========================================================================
@@ -139,6 +136,7 @@ private:
     Eigen::Vector3d wrist_error_integral_{0.0, 0.0, 0.0};
     Eigen::Vector3d wrist_prev_error_{0.0, 0.0, 0.0};
     bool wrist_first_{true};
+    bool wrist_frozen_{false};  ///< hysteresis: true once error drops below 0.03, resets at >0.07
 
     /// Cache of last user quat (before composing with current palm).
     /// Used to detect repeated publishes from sequencer (avoid recomposition).
@@ -148,14 +146,10 @@ private:
 
     // --- Finger state ---
     Eigen::VectorXd finger_target_q_;   // 20-DOF target (from grasp pattern)
-    Eigen::VectorXd finger_start_q_;    // 20-DOF start (captured at command time)
-    Eigen::VectorXd finger_des_q_;      // 20-DOF feedforward desired (smoothstep output)
+    Eigen::VectorXd finger_des_q_;      // 20-DOF desired (set to target on grasp cmd, held for impedance)
     Eigen::VectorXd finger_cmd_q_;      // 20-DOF actual command (des_q + impedance offset)
     Eigen::VectorXd finger_effort_;     // 20-DOF joint torque from /joint_states effort (N·m)
 
-    bool finger_active_{false};
-    double finger_interp_elapsed_{0.0};
-    double finger_interp_duration_{0.02};
     std::string current_grasp_type_;
 
     bool joint_state_received_{false};
@@ -168,13 +162,11 @@ private:
     double wrist_vel_limit_{3.0};
     double wrist_delta_limit_{0.12};
 
-    double kp_finger_{500.0};
+    double kp_finger_{50.0};
     double kd_finger_{0.5};
     double tau_max_finger_{200.0};
     double finger_delta_limit_{1.5};
-    double inner_servo_kp_{400.0};
-    double grasp_blocked_error_{0.15}; // rad — position error threshold (finger blocked by object)
-    double grasp_vel_threshold_{0.3};  // rad/s — below this velocity, finger is "stopped"
+    double inner_servo_kp_{5.0};
 };
 
 }  // namespace g1_right_arm_reach

@@ -13,8 +13,6 @@
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
-#include <iostream>
-#include <cmath>
 
 namespace g1_right_arm_reach {
 

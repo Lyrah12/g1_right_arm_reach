@@ -6,7 +6,7 @@
  *    Orientation + grasp → /hand_command → hand_controller (23-DOF)
  *
  *  State machine:
- *    IDLE → REACHING → SETTLING → GRASPING → DONE → IDLE
+ *    IDLE → REACHING → SETTLING → GRASPING → IDLE
  *
  *  Subscribes to /action_command (ActionCommand) for high-level commands.
  *  Monitors /debug/position_error for convergence decisions.

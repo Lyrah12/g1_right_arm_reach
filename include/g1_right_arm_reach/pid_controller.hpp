@@ -64,7 +64,7 @@ class PIDController {
 public:
     PIDController(RobotModel& robot, Kinematics& kin,
                   double kp = 2.0, double ki = 0.4, double kd = 0.05,
-                  double damping = 2e-4, double tolerance = 0.01,
+                  double damping = 2e-4, double tolerance = 0.005,
                   double posture_gain = 0.2);
 
     /// Set the preferred joint posture for null-space attraction (full 5-DOF).
@@ -175,7 +175,7 @@ private:
 
     // Torque mode (disabled — kept for future re-evaluation)
     bool torque_mode_ = false, gravity_comp_ = true;
-    double inner_servo_kp_ = 300.0, inner_servo_kv_ = 5.0;
+    double inner_servo_kp_ = 5.0, inner_servo_kv_ = 5.0;
 
     // Arm PID state
     Eigen::Vector3d prev_error_pos_{Eigen::Vector3d::Zero()};

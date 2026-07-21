@@ -149,7 +149,7 @@ add_executable(action_sequencer_node src/action_sequencer_node.cpp)
 target_include_directories(action_sequencer_node PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(action_sequencer_node grasp_library Eigen3::Eigen)
+target_link_libraries(action_sequencer_node Eigen3::Eigen)
 ament_target_dependencies(action_sequencer_node rclcpp std_msgs sensor_msgs geometry_msgs)
 rosidl_target_interfaces(action_sequencer_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 

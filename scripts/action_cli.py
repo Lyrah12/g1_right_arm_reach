@@ -20,8 +20,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from g1_right_arm_reach.msg import GraspCommand, ActionCommand
+from g1_right_arm_reach.msg import ActionCommand
 
 
 # ===========================================================================
@@ -241,9 +240,9 @@ def cmd_interactive(args):
 
     print(f"""
 {Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗
-║   G1 Right Arm + Wuji Hand 2 — Interactive CLI     ║
+║   G1 Right Arm + Wuji Hand 2 — Interactive CLI       ║
 ║   3-DOF: x y z pattern                               ║
-║   6-DOF: x y z rpy R P Y pattern [dur]              ║
+║   6-DOF: x y z rpy R P Y pattern [dur]               ║
 ║   RPY/yaw are RELATIVE to current palm orientation   ║
 ╚══════════════════════════════════════════════════════╝{Colors.RESET}
 

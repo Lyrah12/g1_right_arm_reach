@@ -77,14 +77,11 @@ HandController::HandController()
     this->declare_parameter("wrist_delta_limit", 0.12);
     this->declare_parameter("wrist_offset_limit", 2.0);
 
-    this->declare_parameter("kp_finger", 500.0);
+    this->declare_parameter("kp_finger", 50.0);
     this->declare_parameter("kd_finger", 0.5);
     this->declare_parameter("tau_max_finger", 200.0);
     this->declare_parameter("finger_delta_limit", 1.5);
-    this->declare_parameter("inner_servo_kp", 400.0);
-    this->declare_parameter("interp_duration", 0.02);
-    this->declare_parameter("grasp_blocked_error", 0.15);
-    this->declare_parameter("grasp_vel_threshold", 0.3);
+    this->declare_parameter("inner_servo_kp", 5.0);
 
     kp_wrist_ = this->get_parameter("kp_wrist").as_double();
     ki_wrist_ = this->get_parameter("ki_wrist").as_double();
@@ -98,14 +95,11 @@ HandController::HandController()
     tau_max_finger_ = this->get_parameter("tau_max_finger").as_double();
     finger_delta_limit_ = this->get_parameter("finger_delta_limit").as_double();
     inner_servo_kp_ = this->get_parameter("inner_servo_kp").as_double();
-    grasp_blocked_error_ = this->get_parameter("grasp_blocked_error").as_double();
-    grasp_vel_threshold_ = this->get_parameter("grasp_vel_threshold").as_double();
 
     // --- State vectors ---
     actual_q_ = Eigen::VectorXd::Zero(n_total_);
     actual_dq_ = Eigen::VectorXd::Zero(n_total_);
     finger_target_q_ = Eigen::VectorXd::Zero(n_fingers_);
-    finger_start_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_des_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_cmd_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_effort_ = Eigen::VectorXd::Zero(n_fingers_);
@@ -163,10 +157,6 @@ HandController::HandController()
                 else if (p.get_name() == "tau_max_finger") tau_max_finger_ = p.as_double();
                 else if (p.get_name() == "inner_servo_kp" && p.as_double() > 0.0)
                     inner_servo_kp_ = p.as_double();
-                else if (p.get_name() == "grasp_blocked_error" && p.as_double() > 0.0)
-                    grasp_blocked_error_ = p.as_double();
-                else if (p.get_name() == "grasp_vel_threshold" && p.as_double() > 0.0)
-                    grasp_vel_threshold_ = p.as_double();
             }
             return result;
         });
@@ -274,11 +264,6 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
     // --- Finger grasp target ---
     const std::string& gtype = msg->grasp_type;
     if (!gtype.empty()) {
-        // Use ACTUAL positions as interpolation start
-        for (int j = 0; j < n_fingers_; ++j) {
-            finger_start_q_(j) = actual_q_(n_wrist_ + j);
-        }
-
         if (gtype == "custom") {
             // custom mode not supported in HandCommand yet; fallback to home
             RCLCPP_WARN(get_logger(), "Custom grasp not yet supported in HandCommand. Using 'home'.");
@@ -300,10 +285,8 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
             }
         }
 
-        finger_interp_elapsed_ = 0.0;
-        finger_interp_duration_ = (msg->grasp_duration > 0.0) ? msg->grasp_duration
-            : this->get_parameter("interp_duration").as_double();
-        finger_active_ = true;
+        // Snap des_q directly to target — impedance controller handles transition.
+        finger_des_q_ = finger_target_q_;
         current_grasp_type_ = gtype;
     }
 }
@@ -441,13 +424,6 @@ void HandController::controlLoop()
 {
     if (!joint_state_received_) return;
 
-    // Update feedforward finger trajectory (always runs if active)
-    if (finger_active_) {
-        stepFingerTrajectory(dt_);
-    }
-    // When idle: finger_des_q_ stays frozen at first-joint_state snapshot.
-    // stepFingerControl publishes cmd = des_q → bridge servo holds position.
-
     // Wrist orientation control — gated on FRESH feedback (~20 Hz).
     // Without this gate, 50 Hz control with 20 Hz feedback causes stale-Jacobian divergence.
     // Effective dt (dt_ × cycles) corrects integral starvation and derivative over-amplification.
@@ -516,39 +492,10 @@ void HandController::controlLoop()
         double f4 = actual_q_(n_wrist_ + 12);
         double f5 = actual_q_(n_wrist_ + 16);
 
-        if (finger_active_) {
-            printf("[Wrist] x=%.3f y=%.3f z=%.3f dR=%.2f dP=%.2f dY=%.2f err=%.3f%s | %s F1:%.2f>%.2f F2:%.2f>%.2f F3:%.2f>%.2f F4:%.2f>%.2f F5:%.2f>%.2f\n",
-                actual_ee_x_, actual_ee_y_, actual_ee_z_,
-                rpy_rel(0), rpy_rel(1), rpy_rel(2), ori_err, ori_mark,
-                current_grasp_type_.c_str(),
-                f1, finger_des_q_(0),
-                f2, finger_des_q_(4),
-                f3, finger_des_q_(8),
-                f4, finger_des_q_(12),
-                f5, finger_des_q_(16));
-        } else {
-            printf("[Wrist] x=%.3f y=%.3f z=%.3f dR=%.2f dP=%.2f dY=%.2f err=%.3f%s | F1:%.2f F2:%.2f F3:%.2f F4:%.2f F5:%.2f\n",
-                actual_ee_x_, actual_ee_y_, actual_ee_z_,
-                rpy_rel(0), rpy_rel(1), rpy_rel(2), ori_err, ori_mark,
-                f1, f2, f3, f4, f5);
-        }
-        fflush(stdout);
-    }
-
-    // --- Grasp completion check ---
-    if (finger_active_ && finger_interp_elapsed_ >= finger_interp_duration_) {
-        finger_active_ = false;
-        double max_err = 0.0;
-        for (int j = 0; j < n_fingers_; ++j)
-            max_err = std::max(max_err, std::abs(finger_target_q_(j) - actual_q_(n_wrist_ + j)));
-        printf("[GRASP] Converged: %s | tgt F1:%.2f F2:%.2f F3:%.2f F4:%.2f F5:%.2f | act F1:%.2f F2:%.2f F3:%.2f F4:%.2f F5:%.2f | max_err=%.3f\n",
-            current_grasp_type_.c_str(),
-            finger_target_q_(0), finger_target_q_(4),
-            finger_target_q_(8), finger_target_q_(12),
-            finger_target_q_(16),
-            actual_q_(n_wrist_ + 0), actual_q_(n_wrist_ + 4),
-            actual_q_(n_wrist_ + 8), actual_q_(n_wrist_ + 12),
-            actual_q_(n_wrist_ + 16), max_err);
+        printf("[Wrist] x=%.3f y=%.3f z=%.3f dR=%.2f dP=%.2f dY=%.2f err=%.3f%s | F1:%.2f F2:%.2f F3:%.2f F4:%.2f F5:%.2f\n",
+            actual_ee_x_, actual_ee_y_, actual_ee_z_,
+            rpy_rel(0), rpy_rel(1), rpy_rel(2), ori_err, ori_mark,
+            f1, f2, f3, f4, f5);
         fflush(stdout);
     }
 }
@@ -580,12 +527,24 @@ void HandController::stepWristControl(double dt)
     Eigen::Vector3d error_ori = orientationError(target_ori_, current_hand_ori_);
     double ori_err_norm = error_ori.norm();
 
-    // Deadband: freeze at ori_err < 0.05 rad (~2.9°) to prevent post-convergence
-    // tremor near singular wrist configurations.
-    if (ori_err_norm < 0.05) {
-        wrist_error_integral_.setZero();
-        wrist_prev_error_ = error_ori;
-        return;
+    // Deadband with hysteresis: once frozen (error < 0.03), stay frozen until
+    // error exceeds 0.07 rad. Prevents PID from oscillating on/off near the
+    // 0.05 rad threshold due to MuJoCo numerical noise (~±0.01 rad).
+    // Without hysteresis: every noise spike above 0.05 triggers one-cycle PID →
+    // wrist twitches at ~20 Hz. With hysteresis: once settled, stays settled.
+    if (wrist_frozen_) {
+        if (ori_err_norm > 0.07) {
+            wrist_frozen_ = false;  // re-activate
+        } else {
+            wrist_error_integral_.setZero();
+            return;
+        }
+    } else {
+        if (ori_err_norm < 0.03) {
+            wrist_frozen_ = true;   // enter frozen state
+            wrist_error_integral_.setZero();
+            return;
+        }
     }
 
     // 2. PID → task angular velocity
@@ -650,90 +609,32 @@ void HandController::stepWristControl(double dt)
 // Finger impedance control
 // ============================================================================
 
-void HandController::stepFingerTrajectory(double dt)
-{
-    finger_interp_elapsed_ += dt;
-    double alpha = (finger_interp_duration_ > 1e-6)
-        ? std::min(1.0, finger_interp_elapsed_ / finger_interp_duration_)
-        : 1.0;
-
-    // Smoothstep: alpha = 3t² − 2t³
-    double t = alpha;
-    double eased = 3.0 * t * t - 2.0 * t * t * t;
-
-    for (int j = 0; j < n_fingers_; ++j) {
-        finger_des_q_(j) = finger_start_q_(j)
-            + eased * (finger_target_q_(j) - finger_start_q_(j));
-    }
-}
-
 void HandController::stepFingerControl()
 {
     for (int j = 0; j < n_fingers_; ++j) {
-        int idx = n_wrist_ + j;  // index into actual_q_ / actual_dq_
-
-        // ── Idle: impedance hold (closed-loop position maintenance) ──
-        // Pure position servo (cmd=des_q) has effective stiffness = kp_servo=5,
-        // which is too weak to resist finger drift under load.
-        // Impedance hold boosts effective stiffness to kp_servo×(1+kp_finger/inner_servo_kp)
-        // ≈ 11.25, providing stronger recovery force within forcerange limits.
-        if (!finger_active_) {
-            double e = finger_des_q_(j) - actual_q_(idx);
-            double tau = kp_finger_ * e + kd_finger_ * (-actual_dq_(idx));
-            tau = std::max(-tau_max_finger_, std::min(tau_max_finger_, tau));
-            double q_cmd = finger_des_q_(j) + tau / inner_servo_kp_;
-
-            // Per-cycle delta limit (safety)
-            double delta = q_cmd - actual_q_(idx);
-            if (delta > finger_delta_limit_)       q_cmd = actual_q_(idx) + finger_delta_limit_;
-            else if (delta < -finger_delta_limit_)   q_cmd = actual_q_(idx) - finger_delta_limit_;
-
-            finger_cmd_q_(j) = q_cmd;
-            // Keep internal state in sync (avoid stale values affecting next grasp)
-            finger_start_q_(j) = actual_q_(idx);
-            finger_target_q_(j) = actual_q_(idx);
-            continue;
-        }
-
-        // ── Active grasp: impedance control ──
-        // Position error against FEEDFORWARD target (des_q, NOT self-referencing)
-        //   During trajectory: des_q = smoothstep(t) → track planned motion
-        //   After trajectory:   des_q = target_q (fixed) → P controller toward target
+        int idx = n_wrist_ + j;
         double e = finger_des_q_(j) - actual_q_(idx);
 
-        // Impedance torque: τ = Kp * e + Kd * (0 − dq_act)
+        // Impedance torque: τ = Kp·e + Kd·(0 − dq)
         double tau = kp_finger_ * e + kd_finger_ * (-actual_dq_(idx));
-
-        // Clamp torque
         if (tau > tau_max_finger_)       tau = tau_max_finger_;
         else if (tau < -tau_max_finger_)  tau = -tau_max_finger_;
 
-        // Encode as position offset: q_cmd = q_des + τ / Kp_inner
-        // (MuJoCo position servo will produce force ≈ Kp_inner × (q_cmd − q_act) ≈ τ)
+        // Encode as position offset: q_cmd = des_q + τ / Kp_inner
         double q_cmd = finger_des_q_(j) + tau / inner_servo_kp_;
 
-        // Per-cycle delta limit (safety — relative to actual position)
+        // Per-cycle delta limit (safety)
         double delta = q_cmd - actual_q_(idx);
-        if (delta > finger_delta_limit_)        q_cmd = actual_q_(idx) + finger_delta_limit_;
+        if (delta > finger_delta_limit_)       q_cmd = actual_q_(idx) + finger_delta_limit_;
         else if (delta < -finger_delta_limit_)   q_cmd = actual_q_(idx) - finger_delta_limit_;
 
-        // ── Force-limited grasp (anti-penetration) ──
-        // Limit q_cmd to actual + lead. Caps MuJoCo servo force to kp×lead.
-        // During trajectory: lead=1.0 (max speed, ~50 rad/s at 50 Hz ≈ delta_limit).
-        // After trajectory:  lead=0.08 (gentle contact, 300×0.08=24 N·m).
-        // NOTE: do NOT cap finger_des_q_ — it serves as the final target after
-        // trajectory ends (idle branch: ctrl = des_q). Capping it would
-        // permanently prevent the finger from reaching the full target.
-        bool closing = (finger_target_q_(j) > finger_start_q_(j));
+        // Anti-penetration: cap closing-direction command to actual + lead
+        bool closing = (finger_des_q_(j) > actual_q_(idx));
         if (closing) {
-            double lead = finger_active_ ? 1.0 : 0.08;
-            double max_cmd = actual_q_(idx) + lead;
-            if (q_cmd > max_cmd) {
-                q_cmd = max_cmd;
-            }
+            double max_cmd = actual_q_(idx) + 1.0;  // lead=1.0 rad
+            if (q_cmd > max_cmd) q_cmd = max_cmd;
         }
 
-        // Store in separate command variable (do NOT overwrite des_q!)
         finger_cmd_q_(j) = q_cmd;
     }
 }

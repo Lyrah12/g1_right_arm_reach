@@ -12,7 +12,6 @@ Dependencies: pip install mujoco opencv-python "numpy<2"
 import os
 import sys
 import threading
-from pathlib import Path
 
 import numpy as np
 
@@ -36,7 +35,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState, Image
 from geometry_msgs.msg import WrenchStamped, PointStamped, QuaternionStamped
 from std_msgs.msg import Float64MultiArray
@@ -103,10 +101,8 @@ class MuJoCoBridgeNode(Node):
         self.declare_parameter('clamp_arm_joints', False)  # 手臂关节硬夹持（默认关闭，靠位置伺服）
         self.declare_parameter('hard_clamp_pelvis', True)   # 硬夹持骨盆（固定机器人位置）
         self.declare_parameter('hard_clamp_joints', True)   # 硬夹持非右臂关节（除右臂外全部锁死）
+        self.declare_parameter('publish_locked_joint_hold', False)  # 发布 /locked_joint_hold（实物部署用）
 
-        # 手指执行器增益缩放（MJCF kp ~0.2-0.7 太低，仿真中需大幅提升）
-        self.declare_parameter('finger_kp_scale', 60.0)   # kp 倍率：默认 60× → kp = 5×60 = 300
-        self.declare_parameter('finger_kv_scale', 1.0)    # kv 倍率：默认 1× (no boost needed)
         self.declare_parameter('finger_ema_alpha', 1.0)   # EMA 平滑系数（手指，1.0=无平滑）
         self.declare_parameter('wrist_ema_alpha', 1.0)  # EMA 平滑系数（手腕, 1.0=无平滑）
 
@@ -205,46 +201,7 @@ class MuJoCoBridgeNode(Node):
             f"{len(self.actuator_position_ids)} 个 position servo (位置伺服)"
         )
 
-        # ─────────────────────────────────────────────────────────────
-        # 运行时提升手指 position servo 增益
-        # MJCF kp ~0.2-0.7 / kv ~0.008-0.03 — 为真实电机柔顺设计，仿真太慢
-        # 通过 gainprm / biasprm 等比例缩放，保持正确位置伺服公式
-        #
-        # MuJoCo position servo 力公式:
-        #   force = gainprm[0] × ctrl + biasprm[1] × q + biasprm[2] × q̇
-        #
-        # MJCF <position kp="K"> → gainprm[0]=K, biasprm[1]=−K, biasprm[2]=−kv
-        #   原始: force = K×(ctrl−q) − kv×q̇
-        #   scale: force = (K×s)×(ctrl−q) − (kv×s_v)×q̇  ← 正确缩放
-        #   必须同时缩放 gainprm[0] 和 biasprm[1] 否则平衡点偏移。
-        # ─────────────────────────────────────────────────────────────
-        finger_kp_scale = self.get_parameter('finger_kp_scale').get_parameter_value().double_value
-        finger_kv_scale = self.get_parameter('finger_kv_scale').get_parameter_value().double_value
-        finger_count = 0
-        for joint_name, act_ids in self.actuator_map.items():
-            if 'finger' not in joint_name:
-                continue
-            for act_id in act_ids:
-                if act_id not in self.actuator_position_ids:
-                    continue
-                old_kp = float(self.model.actuator_gainprm[act_id][0])
-                old_kv_fb = float(self.model.actuator_biasprm[act_id][2])
-                old_kp_fb = float(self.model.actuator_biasprm[act_id][1])
-
-                new_kp = old_kp * finger_kp_scale
-                new_kv = old_kv_fb * finger_kv_scale
-                new_kp_fb = old_kp_fb * finger_kp_scale  # CRITICAL: scale position feedback
-
-                self.model.actuator_gainprm[act_id][0] = new_kp
-                self.model.actuator_biasprm[act_id][1] = new_kp_fb
-                self.model.actuator_biasprm[act_id][2] = new_kv
-                finger_count += 1
-        self.get_logger().info(
-            f"手指执行器增益缩放: {finger_count} joints, "
-            f"kp×{finger_kp_scale:.0f}, kv×{finger_kv_scale:.0f}"
-        )
-
-        # 区分主动关节（右臂 5 DOF）与锁定关节（其余 18 DOF）
+        # 区分主动关节（右臂 7 DOF: arm 4 + wrist 3）与锁定关节
         active_joints = self.get_parameter('active_joints').get_parameter_value().string_array_value
         self.active_joint_names = set(active_joints)
         self.wrist_joint_names = {  # 手腕关节 — 独立 EMA 平滑抑制 yaw 颤抖
@@ -386,7 +343,7 @@ class MuJoCoBridgeNode(Node):
 
         # ─────────────────────────────────────────────────────────────
         # 设置右臂 "预备跑" 姿态（微屈肘，手在前方 ≈ 跑步预备姿势）
-        # 在 MJCF 默认站立姿态基础上覆盖右臂 5 关节
+        # 在 MJCF 默认站立姿态基础上覆盖右臂 7 关节
         # ─────────────────────────────────────────────────────────────
 
         # EMA 平滑滤波器状态（必须在 ready pose 之前初始化）
@@ -603,6 +560,15 @@ class MuJoCoBridgeNode(Node):
             self.ft_pub = self.create_publisher(WrenchStamped, '/wrist_ft', 10)
         else:
             self.ft_pub = None
+
+        # /locked_joint_hold — 锁定关节的保持位置（实物部署时替代硬夹持）
+        # 仿真中默认关闭（hard_clamp 更可靠），实物部署时启用。
+        # Unitree SDK 桥接节点订阅此 topic 来维持非右臂关节静止。
+        publish_locked_hold = self.get_parameter('publish_locked_joint_hold').get_parameter_value().bool_value
+        if publish_locked_hold:
+            self.locked_hold_pub = self.create_publisher(JointState, '/locked_joint_hold', 10)
+        else:
+            self.locked_hold_pub = None
 
         # --- MuJoCo 真实末端位置发布（供 PID 使用，消除 URDF/MJCF FK 差异）---
         # 29-DOF: right_wrist_yaw_link (最后腕关节的 link)
@@ -906,6 +872,10 @@ class MuJoCoBridgeNode(Node):
         # 3. 发布关节状态
         self._publish_joint_states()
 
+        # 3.25 发布锁定关节保持位置（实物部署用，20 秒一次即可）
+        if self.locked_hold_pub is not None and self.step_counter % 4000 == 0:
+            self._publish_locked_joint_hold()
+
         # 3.5 发布 MuJoCo 真实末端位置 + 手部朝向 + Jacobian (20Hz，与 PID 同频)
         if self.ee_pub is not None and self.step_counter % 10 == 0:
             self._publish_ee_pose()
@@ -1201,6 +1171,35 @@ class MuJoCoBridgeNode(Node):
                 msg.wrench.torque.z = float(self.data.sensordata[sens_addr + 2])
 
         self.ft_pub.publish(msg)
+
+    def _publish_locked_joint_hold(self):
+        """发布 /locked_joint_hold — 锁定关节的保持位置命令。
+
+        实物部署时，Unitree SDK 桥接节点订阅此 topic，将保持指令转发至
+        G1 真实机器人的关节控制器，替代仿真中的硬夹持（qpos 覆写）。
+
+        与 hard_clamp 的区别：
+          - hard_clamp: 每步覆写 qpos → 完美冻结，仅仿真可行
+          - locked_joint_hold: ROS2 topic → SDK → 真实关节位置伺服
+            （kp 需足够大，否则重力矩导致姿态漂移）
+        """
+        if not self.locked_joint_info:
+            return
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+        for joint_name, qpos_addr, init_q in self.locked_joint_info:
+            if joint_name in self.active_joint_names:
+                continue  # 右臂关节由 hand_controller 管理，不在此列
+            if 'finger' in joint_name:
+                continue  # 手指由 hand_controller 管理
+            msg.name.append(joint_name)
+            # 发送初始锁定位置（而非当前 qpos，避免漂移累积）
+            msg.position.append(init_q)
+            msg.velocity.append(0.0)
+            msg.effort.append(0.0)
+        if msg.name:
+            self.locked_hold_pub.publish(msg)
 
     # =========================================================================
     # MODULE: Cleanup

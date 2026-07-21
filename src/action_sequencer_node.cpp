@@ -229,10 +229,12 @@ void ActionSequencerNode::startGrasping()
     state_elapsed_ = 0.0;
 
     // Phase 2: grasp only. Identity quat → hold wrist orientation. grasp_type → close fingers.
+    // grasp_duration=0.0: hand controller uses its own interp_duration (0.02s ≈ 1 cycle).
+    // The sequencer's grasp_duration_ governs its own GRASPING state timeout (line 371).
     auto cmd = msg::HandCommand();
     cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;  // identity → hold
     cmd.grasp_type = grasp_type_;
-    cmd.grasp_duration = grasp_duration_;
+    cmd.grasp_duration = 0.0;
     cmd.force_limit = 0.0;
     hand_cmd_pub_->publish(cmd);
 

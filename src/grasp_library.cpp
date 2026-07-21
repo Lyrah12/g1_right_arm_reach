@@ -24,8 +24,6 @@
 
 #include "g1_right_arm_reach/grasp_library.hpp"
 
-#include <algorithm>
-
 namespace g1_right_arm_reach {
 
 // ============================================================================

@@ -57,7 +57,7 @@ public:
         this->declare_parameter("pid.ki", 0.4);
         this->declare_parameter("pid.kd", 0.05);
         this->declare_parameter("pid.damping", 2.0e-4);
-        this->declare_parameter("pid.tolerance", 0.01);
+        this->declare_parameter("pid.tolerance", 0.005);
         this->declare_parameter("pid.posture_gain", 0.2);
         this->declare_parameter("pid.posture_target",
             std::vector<double>{-0.3, 0.0, 0.0, 0.3});  // arm(4) only
@@ -65,7 +65,7 @@ public:
         this->declare_parameter("pid.kd_wrist", 0.02);
         this->declare_parameter("pid.torque_mode", false);
         this->declare_parameter("pid.gravity_compensation", false);
-        this->declare_parameter("pid.inner_servo_kp", 300.0);
+        this->declare_parameter("pid.inner_servo_kp", 5.0);
         this->declare_parameter("pid.inner_servo_kv", 5.0);
 
         // --- Parameters: reach_node ---
@@ -371,9 +371,11 @@ private:
     {
         if (!has_target_) return;
         robot_->updateKinematics();
+        // Marker frame_id is "pelvis" (matches RViz fixed frame), so compute
+        // target position in pelvis frame — do NOT add pelvis_offset_ here.
+        // pelvis_offset_ is only needed when converting to MuJoCo world coords.
         Eigen::Vector3d shoulder_urdf = robot_->getRightShoulderPosition();
-        Eigen::Vector3d shoulder_world = shoulder_urdf + pelvis_offset_;
-        Eigen::Vector3d target_world = shoulder_world + target_pos_;
+        Eigen::Vector3d target_in_pelvis = shoulder_urdf + target_pos_;
 
         auto marker = visualization_msgs::msg::Marker();
         marker.header.frame_id = "pelvis";
@@ -381,9 +383,9 @@ private:
         marker.ns = "target"; marker.id = 0;
         marker.type = visualization_msgs::msg::Marker::SPHERE;
         marker.action = visualization_msgs::msg::Marker::ADD;
-        marker.pose.position.x = target_world.x();
-        marker.pose.position.y = target_world.y();
-        marker.pose.position.z = target_world.z();
+        marker.pose.position.x = target_in_pelvis.x();
+        marker.pose.position.y = target_in_pelvis.y();
+        marker.pose.position.z = target_in_pelvis.z();
         marker.pose.orientation.w = 1.0;
         marker.scale.x = 0.03; marker.scale.y = 0.03; marker.scale.z = 0.03;
         marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0; marker.color.a = 0.8;

@@ -10,7 +10,6 @@
 #include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <cmath>
-#include <iostream>
 
 namespace g1_right_arm_reach {
 

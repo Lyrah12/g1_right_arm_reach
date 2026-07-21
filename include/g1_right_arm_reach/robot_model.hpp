@@ -60,7 +60,6 @@ public:
 
     void updateKinematics();
     Eigen::Vector3d getEndEffectorPosition() const;       ///< EE (wrist origin) position
-    Eigen::Matrix3d getEndEffectorRotation() const;       ///< EE orientation
     Eigen::Vector3d getWristPosition() const;              ///< Alias, = EE position
     Eigen::Vector3d getRightShoulderPosition() const;      ///< Shoulder joint origin (world)
     Eigen::Matrix3d getHandOrientation() const;            ///< Rubber_hand orientation (distal)

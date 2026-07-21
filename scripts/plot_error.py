@@ -15,7 +15,6 @@ prints summary statistics, saves a CSV, and generates a matplotlib plot.
 import argparse
 import csv
 import os
-import signal
 import sys
 import time
 from datetime import datetime

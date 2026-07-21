@@ -37,17 +37,15 @@ reach_node:
         - "right_wrist_pitch_joint"
         - "right_wrist_yaw_joint"
 
-      ee_link: "right_wrist_roll_link"      # Position control target (wrist origin)
-
     # -------------------------------------------------------------------------
     # Arm IK — 4-DOF → 3-DOF position (damped pseudoinverse + null-space)
     # -------------------------------------------------------------------------
     pid:
-      kp: 2.0                    # Proportional gain
+      kp: 3.0                    # Proportional gain (task-space velocity per meter error)
       ki: 0.4                    # Integral gain (anti-windup limit 0.10)
       kd: 0.05                   # Derivative gain
       damping: 2.0e-4            # Damped pseudoinverse λ (adaptive)
-      tolerance: 0.01            # Position tolerance (1 cm)
+      tolerance: 0.005           # Position tolerance (5 mm)
       posture_gain: 0.2          # Null-space attraction toward posture_target
       posture_target: [-0.3, 0.0, 0.0, 0.3]  # arm(4): slight forward lean + elbow bend
 
@@ -56,7 +54,7 @@ reach_node:
       # -----------------------------------------------------------------------
       torque_mode: false
       gravity_compensation: false
-      inner_servo_kp: 300.0
+      inner_servo_kp: 5.0
       inner_servo_kv: 5.0
 
     # -------------------------------------------------------------------------
@@ -124,27 +122,14 @@ hand_controller:
     # -------------------------------------------------------------------------
     # τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act)
     # Encoded as: q_cmd = q_des + τ / inner_servo_kp (position-encoded torque)
-    kp_finger: 500.0              # Finger stiffness (N·m/rad)
+    kp_finger: 50.0               # Finger stiffness (N·m/rad) — effective = 5+50 = 55
     kd_finger: 0.5               # Finger damping (N·m·s/rad)
     tau_max_finger: 200.0         # Max finger torque (N·m)
     finger_delta_limit: 1.5      # Max per-cycle finger joint delta (rad)
 
-    # Inner-loop gain — MUST match actual MuJoCo position-servo kp in scene XML.
-    # Kp_inner = original_kp × finger_kp_scale (bridge scales both gainprm + biasprm).
-    inner_servo_kp: 400.0
-
-    # Anti-penetration: position-based contact detection.
-    # After trajectory completes (des_q frozen at target), if position error
-    # exceeds blocked_error AND velocity < vel_threshold, finger is blocked.
-    # Action: des_q → actual_q (kill servo force, freeze at contact position).
-    # Recovery: if object slips, des_q ramps back toward target at 0.5 rad/s.
-    grasp_blocked_error: 0.15    # rad — tracking error that means "blocked"
-    grasp_vel_threshold: 0.3     # rad/s — below this, finger is "stopped"
-
-    # -------------------------------------------------------------------------
-    # Grasp timing
-    # -------------------------------------------------------------------------
-    interp_duration: 0.02         # Default grasp action interpolation time (s)
+    # Finger position-servo: original MJCF kp=5 kv=0.5 (no runtime scaling needed).
+    # Kp_inner MUST match actual MuJoCo position-servo kp in scene XML.
+    inner_servo_kp: 5.0
 
     # -------------------------------------------------------------------------
     # Topics
@@ -178,10 +163,6 @@ mujoco_bridge:
       - "right_wrist_pitch_joint"
       - "right_wrist_yaw_joint"
 
-    # Finger position-servo gain scaling (MJCF defaults ~0.2-0.7 kp → too slow).
-    # gainprm[0] AND biasprm[1] scaled together → force = scale×kp×(ctrl−q) (correct).
-    finger_kp_scale: 80.0      # kp = old_kp × 80 = 400
-    finger_kv_scale: 1.0       # kv = old_kv × 1.0
     finger_ema_alpha: 1.0      # EMA smoothing (1.0 = no smoothing)
     wrist_ema_alpha: 1.0       # Wrist EMA (1.0 = no smoothing)
 

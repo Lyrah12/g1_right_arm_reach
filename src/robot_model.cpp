@@ -173,11 +173,6 @@ Eigen::Vector3d RobotModel::getEndEffectorPosition() const
     return reduced_data_.oMf[ee_frame_id_].translation();
 }
 
-Eigen::Matrix3d RobotModel::getEndEffectorRotation() const
-{
-    return reduced_data_.oMf[ee_frame_id_].rotation();
-}
-
 Eigen::Vector3d RobotModel::getWristPosition() const
 {
     // EE frame IS the wrist origin (right_wrist_roll_link)

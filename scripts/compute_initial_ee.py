@@ -66,7 +66,7 @@ def find_ee_frame(model, side="right"):
 # MODULE: main — load URDF, build reduced model, compute FK for 4 scenarios
 # ============================================================================
 def main():
-    """Load a G1 URDF, reduce it to the 5 right-arm joints, then compute FK
+    """Load a G1 URDF, reduce it to the 7 right-arm joints, then compute FK
     under four different joint configurations to characterise the workspace.
 
     The scenarios are:
@@ -209,8 +209,7 @@ def main():
     print(f"  X: min={min(x_vals):.3f}, max={max(x_vals):.3f} m  ({min(x_vals)*100:.0f} ~ {max(x_vals)*100:.0f} cm)")
     print(f"  Y: min={min(y_vals):.3f}, max={max(y_vals):.3f} m  ({min(y_vals)*100:.0f} ~ {max(y_vals)*100:.0f} cm)")
     print(f"  Z: min={min(z_vals):.3f}, max={max(z_vals):.3f} m  ({min(z_vals)*100:.0f} ~ {max(z_vals)*100:.0f} cm)")
-    print(f"\n  Known test target (0.15, -0.25, 0.15): reached 0.5cm error ✓")
-    print(f"  Known test target (0.30, -0.40, 0.20): stuck at 11.5cm   ✗")
+    print(f"\n  Reachable workspace sampled. Use the XYZ ranges above to plan targets.")
 
 if __name__ == "__main__":
     main()
