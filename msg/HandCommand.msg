@@ -13,7 +13,3 @@ float64  ori_w  1.0
 # ── Grasp parameters ──
 string   grasp_type          # Pattern name from GraspLibrary
 float64  grasp_duration 0.5  # Interpolation duration (s)
-
-# ── Compliance (reserved) ──
-float64  force_limit  0.0    # Max joint torque (N·m), 0 = position only
-string   control_mode  "impedance"  # "impedance" | "position" (future)

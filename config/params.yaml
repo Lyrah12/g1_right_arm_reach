@@ -2,7 +2,7 @@
 # G1 Right Arm + Dexterous Hand — Plan C (Arm-Hand Fully Decoupled)
 # =============================================================================
 # Arm (reach_node):   4-DOF IK (damped pseudoinverse) → wrist position
-# Hand (hand_controller): 23-DOF (wrist PID + finger impedance) → orientation + grasp
+# Hand (hand_controller): 9-DOF (wrist×3 + fingers×6) → orientation + grasp
 #
 # Arm:  Δq = α·J⁺·e_pos + (I−J⁺J)·k_posture·(q_pref−q)
 # Hand: τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act) → q_cmd = q_des + τ/Kp_inner
@@ -131,8 +131,6 @@ hand_controller:
     ki_wrist: 0.05               # Orientation I gain (minimal — deadband handles static error)
     kd_wrist: 0.8                # Orientation D gain (raised from 0.12 → overdamped, kills 1 Hz)
     wrist_joint_damping: 0.6     # Joint-space velocity damping τ += −kd·dq (N·m·s/rad)
-    wrist_vel_limit: 3.0         # Max wrist joint velocity (rad/s)
-    wrist_delta_limit: 0.12      # Max per-cycle wrist joint delta (rad)
     wrist_offset_limit: 2.0      # ±max wrist offset from ready pose (rad)
 
     # -------------------------------------------------------------------------
@@ -143,9 +141,6 @@ hand_controller:
     kd_finger: 0.3               # Finger damping (N·m·s/rad)
     tau_max_finger: 1.5           # Max finger torque (N·m) — matches scene motor forcerange
     tau_max_wrist: 13.4           # Max wrist torque (N·m) — 5010 pitch/yaw
-    finger_delta_limit: 1.5      # Max per-cycle finger joint delta (rad)
-
-    inner_servo_kp: 5.0           # legacy (unused in torque mode)
 
     # -------------------------------------------------------------------------
     # Topics

@@ -3,7 +3,7 @@
  *
  *  Plan C Architecture:
  *    Position (XYZ) → /target_point → reach_node (4-DOF arm IK)
- *    Orientation + grasp → /hand_command → hand_controller (23-DOF)
+ *    Orientation + grasp → /hand_command → hand_controller (9-DOF)
  *
  *  State machine:
  *    IDLE → REACHING → SETTLING → GRASPING → IDLE
@@ -19,7 +19,6 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <std_msgs/msg/float64.hpp>
 
-#include "g1_right_arm_reach/msg/grasp_command.hpp"
 #include "g1_right_arm_reach/msg/action_command.hpp"
 #include "g1_right_arm_reach/msg/hand_command.hpp"
 
@@ -56,9 +55,6 @@ private:
     // Plan C: position → /target_point, orientation + grasp → /hand_command
     rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr point_pub_;
     rclcpp::Publisher<msg::HandCommand>::SharedPtr hand_cmd_pub_;
-
-    // Legacy: /grasp_command for hand-only actions (backward compat)
-    rclcpp::Publisher<msg::GraspCommand>::SharedPtr grasp_pub_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;
 

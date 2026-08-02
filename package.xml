@@ -21,7 +21,6 @@
   <depend>pinocchio</depend>
   <depend>visualization_msgs</depend>
   <depend>eigen</depend>
-  <depend>action_msgs</depend>
   <depend>cv_bridge</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>

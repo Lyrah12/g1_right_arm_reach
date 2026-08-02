@@ -2,9 +2,9 @@
  * @file grasp_library.hpp
  * @brief Dexterous hand grasp pattern library (ROS-independent).
  *
- * Defines 15 pre-defined grasp patterns for Wuji Hand 2
- * (20-DOF: 5 fingers × 4 joints). Used by both hand_controller_node
- * and action_sequencer_node.
+ * Defines 15 pre-defined grasp patterns for the Inspire RH56 hand
+ * (6 active joints: thumb yaw/pitch + 4 finger proximal).
+ * Used by hand_controller_node.
  *
  * Adding a new pattern: add a new entry in initBuiltinPatterns().
  * No other files need modification.

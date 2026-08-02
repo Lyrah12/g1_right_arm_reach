@@ -40,28 +40,18 @@ find_package(visualization_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
-find_package(action_msgs REQUIRED)
 
-# MODULE: Custom Messages and Actions
+# MODULE: Custom Messages
 # ============================================================================
 
-# Generate ROS2 interfaces for vision-grasp communication.
-# These are used by reach_node (C++) and mujoco_bridge_node (Python).
+# Generate ROS2 interfaces for arm-hand control.
+# These are used by action_sequencer (C++) and action_cli (Python).
 rosidl_generate_interfaces(${PROJECT_NAME}
-    # --- Messages ---
-    "msg/DetectedObject.msg"
-    "msg/DetectedObjectArray.msg"
-    "msg/ArmStatus.msg"
-    "msg/GraspResult.msg"
-    "msg/GraspCommand.msg"
     "msg/ActionCommand.msg"
     "msg/HandCommand.msg"
-    # --- Actions ---
-    "action/GraspObject.action"
     DEPENDENCIES
         std_msgs
         geometry_msgs
-        action_msgs
     ADD_LINTER_TESTS
 )
 

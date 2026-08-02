@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Action CLI — unified terminal interface for G1 right arm + Wuji Hand 2 (Plan C).
+Action CLI — unified terminal interface for G1 right arm + Inspire RH56 hand (Plan C).
 
   Position (XYZ)   → /target_point  → reach_node (4-DOF arm IK)
-  Orientation+grasp → /hand_command  → hand_controller (23-DOF)
+  Orientation+grasp → /hand_command  → hand_controller (9-DOF)
 
 Usage:
   python3 action_cli.py reach <x> <y> <z> [--ori qx qy qz qw]
@@ -257,7 +257,7 @@ def cmd_interactive(args):
 
     print(f"""
 {Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════════════════╗
-║   G1 Right Arm + Wuji Hand 2 — Interactive CLI       ║
+║   G1 Right Arm + Inspire RH56 — Interactive CLI      ║
 ║   3-DOF: x y z pattern                               ║
 ║   6-DOF: x y z rpy R P Y pattern [dur]               ║
 ║   RPY/yaw are RELATIVE to current palm orientation   ║
@@ -498,7 +498,7 @@ def cmd_interactive(args):
 # ===========================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description='G1 Right Arm + Wuji Hand 2 — Action CLI',
+        description='G1 Right Arm + Inspire RH56 — Action CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

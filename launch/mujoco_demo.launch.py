@@ -2,9 +2,9 @@
 """
 MuJoCo physics simulation launch — Plan C: Arm-Hand fully decoupled.
 
-  reach_node (50Hz, 4-DOF)  +  hand_controller (50Hz, 23-DOF)
+  reach_node (50Hz, 4-DOF)  +  hand_controller (50Hz, 9-DOF)
        │                              │
-  /joint_commands (4-DOF)    /hand_commands (23-DOF)
+  /joint_commands (4-DOF)    /hand_commands (9-DOF)
        │                              │
        └──────────┬───────────────────┘
                   ▼

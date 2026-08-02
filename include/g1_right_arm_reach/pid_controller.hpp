@@ -66,7 +66,7 @@ public:
                   double damping = 2e-4, double tolerance = 0.005,
                   double posture_gain = 0.2);
 
-    /// Set the preferred joint posture for null-space attraction (full 5-DOF).
+    /// Set the preferred joint posture for null-space attraction (full reduced model).
     void setPostureTarget(const Eigen::VectorXd& q_pref) {
         if (q_pref.size() == posture_target_.size())
             posture_target_ = q_pref;
@@ -79,8 +79,8 @@ public:
     /// Run one arm control cycle: 4-DOF → 3-DOF wrist origin position.
     /// Modifies only arm joints (indices 0-3) in robot_.q_.
     /// @param target_pos  Desired wrist origin position (shoulder-relative)
-    /// @param current_q   Current full 5-DOF joint positions
-    /// @param current_dq  Current full 5-DOF joint velocities
+    /// @param current_q   Current full reduced-model joint positions
+    /// @param current_dq  Current full reduced-model joint velocities
     /// @param dt          Control period (s)
     /// @param external_error Override internal FK error
     ControlResult computeArm(const Eigen::Vector3d& target_pos,

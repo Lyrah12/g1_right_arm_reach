@@ -4,7 +4,7 @@ MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation with position-servo actuat
 
 Publishes: /joint_states, /actual_ee_pose, /actual_hand_orientation,
            /mujoco_jacobian, /mujoco_wrist_jacobian (plus /camera/rgb, /camera/depth, /wrist_ft).
-Subscribes: /joint_commands (arm 4-DOF), /hand_commands (hand 23-DOF).
+Subscribes: /joint_commands (arm 4-DOF), /hand_commands (hand 9-DOF).
 
 Dependencies: pip install mujoco opencv-python "numpy<2"
 """
@@ -84,11 +84,10 @@ class MuJoCoBridgeNode(Node):
         self.declare_parameter('physics_rate', 200.0)       # Hz
         self.declare_parameter('camera_rate', 15.0)         # Hz（相机渲染较耗性能）
         self.declare_parameter('camera_name', 'head_cam')   # MJCF 中相机名称
-        self.declare_parameter('publish_camera', True)
+        self.declare_parameter('publish_camera', False)     # 默认关闭（params.yaml 覆盖；性能）
         self.declare_parameter('publish_ft', True)
         self.declare_parameter('base_frame', 'pelvis')
         self.declare_parameter('viewer', False)             # 是否打开交互式窗口
-        self.declare_parameter('domain_id', 0)              # DDS domain（0=默认）
         self.declare_parameter('active_joints', [
             'right_shoulder_pitch_joint',
             'right_shoulder_roll_joint',
@@ -128,11 +127,11 @@ class MuJoCoBridgeNode(Node):
         # -----------------------------------------------------------------
         scene_path = self.get_parameter('scene_path').get_parameter_value().string_value
         if not scene_path:
-            # 默认路径：<package_share>/config/g1_grasp_scene.xml
+            # 默认路径：<package_share>/config/g1_inspire_scene.xml
             from ament_index_python.packages import get_package_share_directory
             try:
                 share_dir = get_package_share_directory('g1_right_arm_reach')
-                scene_path = os.path.join(share_dir, 'config', 'g1_grasp_scene.xml')
+                scene_path = os.path.join(share_dir, 'config', 'g1_inspire_scene.xml')
             except Exception:
                 self.get_logger().fatal(
                     "无法解析场景文件路径！请通过 --ros-args -p scene_path:=/path/to/scene.xml 指定"
@@ -609,8 +608,8 @@ class MuJoCoBridgeNode(Node):
             self.locked_hold_pub = None
 
         # --- MuJoCo 真实末端位置发布（供 PID 使用，消除 URDF/MJCF FK 差异）---
-        # 29-DOF: right_wrist_yaw_link (最后腕关节的 link)
-        # 23-DOF: right_wrist_roll_rubber_hand (腕末端 rubber hand)
+        # 优先: right_wrist_yaw_link (最后腕关节的 link)
+        # 回退: right_wrist_roll_rubber_hand (腕末端 rubber hand)
         self.ee_body_id = -1
         for bid in range(self.model.nbody):
             bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
@@ -643,7 +642,7 @@ class MuJoCoBridgeNode(Node):
         self.hand_body_id = -1
         for bid in range(self.model.nbody):
             bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if bname in ('R_hand_base_link', 'right_palm_link'):  # Inspire / legacy Wuji
+            if bname in ('R_hand_base_link', 'right_palm_link'):  # Inspire hand base
                 self.hand_body_id = bid
                 break
         if self.hand_body_id < 0:

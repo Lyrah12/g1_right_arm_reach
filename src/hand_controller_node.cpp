@@ -109,39 +109,29 @@ HandController::HandController()
     this->declare_parameter("ki_wrist", 0.05);
     this->declare_parameter("kd_wrist", 0.8);
     this->declare_parameter("wrist_joint_damping", 0.6);
-    this->declare_parameter("wrist_vel_limit", 3.0);
-    this->declare_parameter("wrist_delta_limit", 0.12);
     this->declare_parameter("wrist_offset_limit", 2.0);
 
     this->declare_parameter("kp_finger", 50.0);
     this->declare_parameter("kd_finger", 0.5);
     this->declare_parameter("tau_max_finger", 1.5);   // hand motor torque limit (N·m)
     this->declare_parameter("tau_max_wrist", 13.4);   // 5010 wrist torque limit (N·m)
-    this->declare_parameter("finger_delta_limit", 1.5);
-    this->declare_parameter("inner_servo_kp", 5.0);
 
     kp_wrist_ = this->get_parameter("kp_wrist").as_double();
     ki_wrist_ = this->get_parameter("ki_wrist").as_double();
     kd_wrist_ = this->get_parameter("kd_wrist").as_double();
     wrist_joint_damping_ = this->get_parameter("wrist_joint_damping").as_double();
-    wrist_vel_limit_ = this->get_parameter("wrist_vel_limit").as_double();
-    wrist_delta_limit_ = this->get_parameter("wrist_delta_limit").as_double();
     wrist_offset_limit_ = this->get_parameter("wrist_offset_limit").as_double();
 
     kp_finger_ = this->get_parameter("kp_finger").as_double();
     kd_finger_ = this->get_parameter("kd_finger").as_double();
     tau_max_finger_ = this->get_parameter("tau_max_finger").as_double();
     tau_max_wrist_ = this->get_parameter("tau_max_wrist").as_double();
-    finger_delta_limit_ = this->get_parameter("finger_delta_limit").as_double();
-    inner_servo_kp_ = this->get_parameter("inner_servo_kp").as_double();
 
     // --- State vectors ---
     actual_q_ = Eigen::VectorXd::Zero(n_total_);
     actual_dq_ = Eigen::VectorXd::Zero(n_total_);
     finger_target_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_des_q_ = Eigen::VectorXd::Zero(n_fingers_);
-    finger_cmd_q_ = Eigen::VectorXd::Zero(n_fingers_);
-    finger_effort_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_cmd_tau_ = Eigen::VectorXd::Zero(n_fingers_);
 
     // --- ROS2 communication ---
@@ -204,8 +194,6 @@ HandController::HandController()
                 else if (p.get_name() == "tau_max_finger") tau_max_finger_ = p.as_double();
                 else if (p.get_name() == "tau_max_wrist" && p.as_double() > 0.0)
                     tau_max_wrist_ = p.as_double();
-                else if (p.get_name() == "inner_servo_kp" && p.as_double() > 0.0)
-                    inner_servo_kp_ = p.as_double();
             }
             return result;
         });
@@ -342,7 +330,6 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
 
         // Snap des_q directly to target — impedance controller handles transition.
         finger_des_q_ = finger_target_q_;
-        current_grasp_type_ = gtype;
     }
 }
 
@@ -385,7 +372,7 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
         }
     }
 
-    // Read finger joints (indices 3..22)
+    // Read finger joints (indices 3..8 — 6 active Inspire joints)
     for (int j = 0; j < n_fingers_; ++j) {
         for (size_t i = 0; i < msg->name.size(); ++i) {
             if (msg->name[i] == finger_names_[j]) {
@@ -393,8 +380,6 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
                 actual_q_(idx) = msg->position[i];
                 if (i < msg->velocity.size())
                     actual_dq_(idx) = msg->velocity[i];
-                if (i < msg->effort.size())
-                    finger_effort_(j) = msg->effort[i];
 
                 if (first_time) {
                     // Initialize finger feedforward target = actual position
@@ -411,8 +396,6 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
         // The bridge's ready pose holds wrist at 0 via position servo (kp=300).
         // Offset will be modified by stepWristControl when orientation PID activates.
         wrist_offset_ = Eigen::Vector3d(0.0, 0.0, 0.0);
-        // Initialize finger command = actual position
-        finger_cmd_q_ = actual_q_.tail(n_fingers_);
         RCLCPP_INFO(get_logger(),
             "First joint_state received. Wrist act=[%.3f,%.3f,%.3f]. "
             "Offset=0. PID activates on first orientation+Jacobian.",
@@ -426,7 +409,6 @@ void HandController::eePoseCallback(
     actual_ee_x_ = msg->point.x;
     actual_ee_y_ = msg->point.y;
     actual_ee_z_ = msg->point.z;
-    ee_pose_received_ = true;
 }
 
 void HandController::handOrientationCallback(
@@ -812,7 +794,6 @@ void HandController::stepFingerControl()
         else if (tau < -tau_max_finger_)  tau = -tau_max_finger_;
 
         finger_cmd_tau_(j) = tau;
-        finger_cmd_q_(j) = actual_q_(idx);  // diagnostic: current position
     }
 }
 

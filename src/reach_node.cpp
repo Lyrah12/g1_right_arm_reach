@@ -4,7 +4,7 @@
  *
  * Plan C Architecture (Arm-Hand fully decoupled):
  *   Arm module (this node): shoulder×3 + elbow = 4-DOF → wrist origin position (3×4 IK)
- *   Hand module (hand_controller): wrist×3 + fingers×20 → orientation + grasp
+ *   Hand module (hand_controller): wrist×3 + fingers×6 → orientation + grasp
  *
  * Subscribes:  /target_point (Point, 3-DOF, shoulder-relative)
  *              /joint_states, /actual_ee_pose
@@ -62,8 +62,6 @@ public:
         this->declare_parameter("pid.posture_gain", 0.2);
         this->declare_parameter("pid.posture_target",
             std::vector<double>{0.0, 0.0, 0.0, 0.0});  // arm(4) — natural hang + forearm forward
-        this->declare_parameter("pid.kp_wrist", 1.0);     // unused, kept for compat
-        this->declare_parameter("pid.kd_wrist", 0.02);
         this->declare_parameter("pid.torque_mode", false);
         this->declare_parameter("pid.gravity_compensation", false);
         this->declare_parameter("pid.inner_servo_kp", 5.0);
@@ -300,9 +298,14 @@ private:
     {
         if (!joint_state_received_) return;
 
+        // --- EE world position: MuJoCo /actual_ee_pose (sim) or Pinocchio FK (hardware) ---
+        // On real hardware /actual_ee_pose does not exist; compute from the URDF
+        // (see getEEWorld()).
+        Eigen::Vector3d ee_world = getEEWorld();
+
         // --- No target yet → gravity hold (arm must not free-fall under gravity) ---
         // Publishes τ = g − kv·dq for the arm joints, keeping the arm where it is.
-        if (!has_target_ || !ee_pose_received_) {
+        if (!has_target_) {
             ControlResult hold = pid_->computeGravityHold(robot_->q_, robot_->dq_);
             if (hold.torque_command.size() == static_cast<int>(robot_->arm_joint_indices_.size())) {
                 last_arm_tau_ = hold.torque_command;
@@ -322,8 +325,8 @@ private:
         // --- Target in world frame ---
         Eigen::Vector3d target_world = shoulder_world + target_pos_;
 
-        // --- Position error from MuJoCo ground-truth ---
-        double position_error = (target_world - actual_ee_world_).norm();
+        // --- Position error (MuJoCo ground-truth if available, else Pinocchio FK) ---
+        double position_error = (target_world - ee_world).norm();
 
         // --- Convergence lock (position only) ---
         // TORQUE mode: never early-return on convergence — must keep sending
@@ -340,7 +343,7 @@ private:
             locked_ = true; converged_q_ = robot_->q_;
             if (!torque_mode) {
                 printf("[WRIST] Position converged: x=%.3f y=%.3f z=%.3f (err=%.3f m)\n",
-                    actual_ee_world_.x(), actual_ee_world_.y(), actual_ee_world_.z(),
+                    ee_world.x(), ee_world.y(), ee_world.z(),
                     position_error);
                 fflush(stdout);
                 publishJointStates(); publishTargetMarker(); return;
@@ -348,7 +351,7 @@ private:
         }
 
         // --- Compute shoulder-relative error ---
-        Eigen::Vector3d error_shoulder = target_pos_ - (actual_ee_world_ - shoulder_world);
+        Eigen::Vector3d error_shoulder = target_pos_ - (ee_world - shoulder_world);
 
         // --- Arm IK (4-DOF → 3-DOF position) ---
         ControlResult arm_result = pid_->computeArm(target_pos_, q, dq, dt_, &error_shoulder);
@@ -419,7 +422,7 @@ private:
                    "tau[%.1f %.1f %.1f %.1f] int=%.3f ns=%.2f "
                    "dq[%.2f %.2f %.2f %.2f] grav=PINOCCHIO gd=%.2f\n",
                 target_pos_.x(), target_pos_.y(), target_pos_.z(),
-                actual_ee_world_.x(), actual_ee_world_.y(), actual_ee_world_.z(),
+                getEEWorld().x(), getEEWorld().y(), getEEWorld().z(),
                 position_error, q0, q1, q2, q3,
                 t0, t1, t2, t3,
                 last_integral_norm_, last_nullspace_norm_,
@@ -428,6 +431,20 @@ private:
             fflush(stdout);
         }
 
+    }
+
+    // ========================================================================
+    // Helpers
+    // ========================================================================
+
+    /// EE world position. Prefers MuJoCo /actual_ee_pose (sim); on real hardware
+    /// that topic does not exist, so fall back to Pinocchio FK (URDF pelvis frame
+    /// + pelvis_offset_ → world, matching the MuJoCo right_wrist_yaw_link body).
+    Eigen::Vector3d getEEWorld()
+    {
+        if (ee_pose_received_) return actual_ee_world_;
+        robot_->updateKinematics();
+        return robot_->getWristPosition() + pelvis_offset_;
     }
 
     // ========================================================================

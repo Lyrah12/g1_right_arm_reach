@@ -4,7 +4,7 @@
  *
  * Plan C Architecture:
  *   Position (XYZ)   → /target_point  → reach_node (4-DOF arm IK)
- *   Orientation+grasp → /hand_command  → hand_controller (23-DOF)
+ *   Orientation+grasp → /hand_command  → hand_controller (9-DOF)
  *
  * State machine:
  *   IDLE → (command) → REACHING → (converged) → SETTLING → (settled) → GRASPING → (done) → IDLE
@@ -53,10 +53,6 @@ ActionSequencerNode::ActionSequencerNode()
     // Orientation + grasp → /hand_command (hand_controller)
     hand_cmd_pub_ = this->create_publisher<msg::HandCommand>(
         "/hand_command", 10);
-
-    // Legacy: /grasp_command for hand-only actions (backward compat)
-    grasp_pub_ = this->create_publisher<msg::GraspCommand>(
-        "/grasp_command", 10);
 
     // --- Control timer (50 Hz) ---
     dt_ = 0.02;
@@ -237,15 +233,7 @@ void ActionSequencerNode::startGrasping()
     cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;  // identity → hold
     cmd.grasp_type = grasp_type_;
     cmd.grasp_duration = 0.0;
-    cmd.force_limit = 0.0;
     hand_cmd_pub_->publish(cmd);
-
-    // Also publish legacy /grasp_command for backward compatibility
-    auto legacy = msg::GraspCommand();
-    legacy.grasp_type = grasp_type_;
-    legacy.duration = grasp_duration_;
-    legacy.force_limit = 0.0;
-    grasp_pub_->publish(legacy);
 }
 
 void ActionSequencerNode::finishAction(bool success)

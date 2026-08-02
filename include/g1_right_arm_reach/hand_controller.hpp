@@ -138,29 +138,21 @@ private:
     Eigen::VectorXd actual_dq_;    // 9-DOF
 
     // --- Wrist state ---
-    Eigen::Vector3d target_ori_quat_vec_;  // [x, y, z, w] from HandCommand (unused w/ default)
-
     /// Default target = injection quat [0.5, 0.5, 0.5, 0.5] (fingers +X, palm −Y at wrist=0).
     /// Overridden on first HandCommand or orientation callback.
     Eigen::Quaterniond target_ori_{0.5, 0.5, 0.5, 0.5};
     bool has_ori_target_{false};  // true after first HandCommand or orientation capture
 
-    /// Wrist command = fixed reference + clamped PID offset (anti-windup).
-    ///   wrist_cmd = wrist_ref_ + wrist_offset_
-    ///   wrist_ref_ = [0,0,0] (ready pose, NEVER changes)
-    ///   wrist_offset_ += dq * dt, clamped to ±wrist_offset_limit_
-    /// Fixed reference ensures servo always pulls toward ready pose,
-    /// preventing drift-following (act + offset → follows drift).
-    Eigen::Vector3d wrist_ref_{0.0, 0.0, 0.0};
+    /// Wrist PID offset (anti-windup): wrist_cmd_tau computed by stepWristControl,
+    /// clamped to ±wrist_offset_limit_ (set by params.yaml).
     Eigen::Vector3d wrist_offset_{0.0, 0.0, 0.0};
-    double wrist_offset_limit_{2.0};  // ±2.0 rad max offset (set by params.yaml)
+    double wrist_offset_limit_{2.0};
 
     Eigen::Quaterniond current_hand_ori_{1.0, 0.0, 0.0, 0.0};  // from /actual_hand_orientation
     bool hand_ori_received_{false};
     bool hand_ori_fresh_{false};    // true when new ori data arrived this cycle
 
-    double actual_ee_x_{0.0}, actual_ee_y_{0.0}, actual_ee_z_{0.0};  // from /actual_ee_pose
-    bool ee_pose_received_{false};
+    double actual_ee_x_{0.0}, actual_ee_y_{0.0}, actual_ee_z_{0.0};  // from /actual_ee_pose (diagnostic)
 
     Eigen::Matrix3d wrist_jacobian_{Eigen::Matrix3d::Identity()};  // 3×3 from /mujoco_wrist_jacobian
     bool wrist_jac_received_{false};
@@ -184,15 +176,11 @@ private:
     // --- Finger state ---
     Eigen::VectorXd finger_target_q_;   // n_fingers target (from grasp pattern)
     Eigen::VectorXd finger_des_q_;      // n_fingers desired (set to target on grasp cmd, held for impedance)
-    Eigen::VectorXd finger_cmd_q_;      // n_fingers actual position (diagnostic)
-    Eigen::VectorXd finger_effort_;     // n_fingers joint torque from /joint_states effort (N·m)
 
     // --- Torque output (torque mode) ---
     Eigen::Vector3d wrist_cmd_tau_{0.0, 0.0, 0.0};   // wrist joint torque command (N·m)
     Eigen::VectorXd finger_cmd_tau_;                 // finger joint torque command (N·m)
     double tau_max_wrist_{13.4};                     // ±max wrist torque (5010: 13.4 N·m)
-
-    std::string current_grasp_type_;
 
     bool joint_state_received_{false};
     double dt_{0.02};
@@ -202,14 +190,10 @@ private:
     double ki_wrist_{0.05};
     double kd_wrist_{0.8};
     double wrist_joint_damping_{0.6};   // joint-space velocity damping (N·m·s/rad)
-    double wrist_vel_limit_{3.0};
-    double wrist_delta_limit_{0.12};
 
     double kp_finger_{50.0};
     double kd_finger_{0.5};
     double tau_max_finger_{200.0};
-    double finger_delta_limit_{1.5};
-    double inner_servo_kp_{5.0};
 };
 
 }  // namespace g1_right_arm_reach

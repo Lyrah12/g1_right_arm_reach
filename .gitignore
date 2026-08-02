@@ -25,6 +25,3 @@ Thumbs.db
 
 # Claude
 .claude/
-
-# External hand description (downloaded separately)
-wuji-hand-description-main/
