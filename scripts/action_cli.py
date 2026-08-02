@@ -266,8 +266,8 @@ def cmd_interactive(args):
 {Colors.GREEN}Examples:{Colors.RESET}
   {Colors.CYAN}0.20 -0.05 -0.10 close{Colors.RESET}              → 3-DOF reach + grasp
   {Colors.CYAN}0.20 -0.05 -0.10 rpy 0 0 0 close{Colors.RESET}    → RPY=0 (hold palm ori)
-  {Colors.CYAN}0.20 -0.05 -0.10 rpy 0 0 1.57 pinch{Colors.RESET} → yaw=+90°, pinch
-  {Colors.CYAN}0.20 -0.05 -0.10 rpy 0 1.57 0 close{Colors.RESET} → pitch=+90°, close
+  {Colors.CYAN}0.20 -0.05 -0.10 rpy 0 0 0.5 pinch{Colors.RESET} → yaw=+0.5rad (≈29°), pinch
+  {Colors.CYAN}0.20 -0.05 -0.10 rpy 0 0.5 0 close{Colors.RESET} → pitch=+0.5rad (≈29°), close
   {Colors.CYAN}home{Colors.RESET}                                  → ready pose + home grasp
   {Colors.CYAN}open{Colors.RESET}                                  → open hand
 
@@ -304,7 +304,7 @@ def cmd_interactive(args):
 {Colors.CYAN}Examples:{Colors.RESET}
   {Colors.GREEN}0.20 -0.05 -0.10 close{Colors.RESET}              → 3-DOF grasp
   {Colors.GREEN}0.20 -0.05 -0.10 rpy 0 0 0 close{Colors.RESET}    → 6-DOF, identity rotation
-  {Colors.GREEN}0.20 -0.05 -0.10 rpy 0 1.57 0 pinch{Colors.RESET} → pitch=90°, pinch
+  {Colors.GREEN}0.20 -0.05 -0.10 rpy 0 0.5 0 pinch{Colors.RESET} → pitch=0.5rad (≈29°), pinch
   {Colors.GREEN}home | open | list{Colors.RESET}
 """)
                 continue
