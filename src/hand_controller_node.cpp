@@ -37,6 +37,11 @@ HandController::HandController()
     : Node("hand_controller")
 {
     // --- Parameters: joint names ---
+    this->declare_parameter("robot_model.urdf_path", "");
+    this->declare_parameter("robot_model.arm_joints",
+        std::vector<std::string>{"right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+            "right_elbow_joint"});
     this->declare_parameter("wrist_joint_names",
         std::vector<std::string>{
             "right_wrist_roll_joint",
@@ -65,6 +70,39 @@ HandController::HandController()
     all_names_.reserve(n_total_);
     for (const auto& n : wrist_names_) all_names_.push_back(n);
     for (const auto& n : finger_names_) all_names_.push_back(n);
+
+    // --- Pinocchio model (hardware path) ---
+    // Loads the right-arm URDF so wrist orientation / Jacobian / gravity can be
+    // computed without the MuJoCo bridge. On real hardware the MuJoCo topics
+    // (/actual_hand_orientation, /mujoco_wrist_jacobian, /mujoco_gravity) do not
+    // exist; Pinocchio is the primary source and the MuJoCo topics override it
+    // when they arrive (exact-sim enhancement in simulation).
+    {
+        std::string urdf_path = this->get_parameter("robot_model.urdf_path").as_string();
+        if (urdf_path.empty()) {
+            RCLCPP_WARN(get_logger(),
+                "robot_model.urdf_path not set — wrist feedback from MuJoCo topics only. "
+                "On real hardware set urdf_path to the G1 URDF.");
+        } else {
+            auto arm_names = this->get_parameter("robot_model.arm_joints").as_string_array();
+            pin_arm_names_.assign(arm_names.begin(), arm_names.end());
+            std::vector<std::string> active_names;
+            active_names.insert(active_names.end(), arm_names.begin(), arm_names.end());
+            active_names.insert(active_names.end(), wrist_names_.begin(), wrist_names_.end());
+
+            robot_ = std::make_unique<RobotModel>(urdf_path, active_names);
+            robot_->buildSubsetIndices(
+                std::vector<std::string>(arm_names.begin(), arm_names.end()),
+                wrist_names_);
+            pin_arm_count_ = static_cast<int>(arm_names.size());
+            kin_ = std::make_unique<Kinematics>(*robot_);
+            pinocchio_ready_ = true;
+            RCLCPP_INFO(get_logger(),
+                "Pinocchio model ready: %d arm + %d wrist joints. "
+                "Wrist ori/Jacobian/gravity computed locally (hardware path).",
+                pin_arm_count_, n_wrist_);
+        }
+    }
 
     // --- Parameters: control gains ---
     this->declare_parameter("kp_wrist", 3.5);
@@ -227,7 +265,13 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
             if (user_changed) {
                 last_user_ori_ = new_target;
 
-                if (hand_ori_received_) {
+                // Compose against the palm orientation source actually available:
+                //   - sim:  hand_ori_received_ (MuJoCo /actual_hand_orientation)
+                //   - hardware: pin_fb_ready_  (Pinocchio FK)
+                // Otherwise defer — the first ori callback / refreshPinocchio()
+                // will recompose when the source becomes available.
+                bool palm_known = hand_ori_received_ || pin_fb_ready_;
+                if (palm_known) {
                     // Compose user rotation with current palm orientation
                     Eigen::Quaterniond abs_target = current_hand_ori_ * new_target;
                     abs_target.normalize();
@@ -243,8 +287,8 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
                             jump, jump * 57.3, wrist_offset_limit_);
                     }
                 } else {
-                    // Palm orientation not yet received -> defer composition.
-                    // handOrientationCallback will recompose when first ori arrives.
+                    // Palm orientation not yet available -> defer composition.
+                    // First ori callback / refreshPinocchio() will recompose.
                     target_ori_ = new_target;  // temporary, will be replaced
                 }
 
@@ -316,6 +360,27 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
                 if (i < msg->velocity.size())
                     actual_dq_(j) = msg->velocity[i];
                 break;
+            }
+        }
+    }
+
+    // Sync right-arm joints (arm + wrist) into the Pinocchio model so
+    // refreshPinocchio() can compute FK/Jacobian/gravity from the real state.
+    if (pinocchio_ready_) {
+        for (size_t k = 0; k < pin_arm_names_.size() && k < robot_->q_.size(); ++k) {
+            for (size_t i = 0; i < msg->name.size(); ++i) {
+                if (msg->name[i] == pin_arm_names_[k]) {
+                    robot_->q_(static_cast<int>(k)) = msg->position[i];
+                    break;
+                }
+            }
+        }
+        for (int j = 0; j < n_wrist_; ++j) {
+            for (size_t i = 0; i < msg->name.size(); ++i) {
+                if (msg->name[i] == wrist_names_[j]) {
+                    robot_->q_(pin_arm_count_ + j) = msg->position[i];
+                    break;
+                }
             }
         }
     }
@@ -465,19 +530,43 @@ void HandController::controlLoop()
 {
     if (!joint_state_received_) return;
 
-    // Wrist orientation control — gated on FRESH feedback (~20 Hz).
-    // Without this gate, 50 Hz control with 20 Hz feedback causes stale-Jacobian divergence.
-    // Effective dt (dt_ × cycles) corrects integral starvation and derivative over-amplification.
+    // Hardware-fidelity (2026-08-02): Pinocchio is the PRIMARY wrist feedback
+    // source — real hardware has no MuJoCo, so ori/Jacobian/gravity are computed
+    // locally from the URDF. The MuJoCo topics (/actual_hand_orientation,
+    // /mujoco_wrist_jacobian, /mujoco_gravity) act as an exact-sim override when
+    // they arrive, preserving the previously-verified simulation behavior.
+    //
+    // Feedback path selection (fully isolated):
+    //   - mujoco_available: all three MuJoCo topics received → use them, 20 Hz-
+    //     gated as before (verified sim behavior).
+    //   - otherwise (real hardware): Pinocchio, refreshed every cycle at 50 Hz.
+    const bool mujoco_available = hand_ori_received_ && wrist_jac_received_
+                               && gravity_received_;
+    if (pinocchio_ready_ && !mujoco_available)
+        refreshPinocchio();
+
+    // Wrist orientation control. In sim this is gated on FRESH MuJoCo feedback
+    // (~20 Hz) — without the gate, 50 Hz control with 20 Hz feedback causes
+    // stale-Jacobian divergence. On hardware (no MuJoCo topics) Pinocchio runs
+    // every cycle at 50 Hz. Effective dt (dt_ × cycles) corrects integral
+    // starvation and derivative over-amplification.
 
     // Gravity-hold wrist torque FIRST, then stepWristControl overrides with the full PID
-    // torque when fresh feedback is available. Prevents the wrist from free-falling under
+    // torque when feedback is available. Prevents the wrist from free-falling under
     // the hand mass when the orientation PID is frozen/absent — root cause of the
     // ~1 Hz wrist droop/oscillation.
     applyWristHold();
 
     wrist_cycles_since_step_++;
-    if (has_ori_target_ && hand_ori_received_ && wrist_jac_received_
-        && hand_ori_fresh_ && wrist_jac_fresh_) {
+
+    bool fb_ready;
+    if (mujoco_available) {
+        fb_ready = hand_ori_fresh_ && wrist_jac_fresh_;
+    } else {
+        fb_ready = pin_fb_ready_;
+    }
+
+    if (has_ori_target_ && fb_ready) {
         double effective_dt = dt_ * wrist_cycles_since_step_;
         stepWristControl(effective_dt);
         wrist_cycles_since_step_ = 0;
@@ -524,7 +613,8 @@ void HandController::controlLoop()
         // near singularities — a tiny quat change can flip R/P/Y by π.
         Eigen::Vector3d rpy_rel(0, 0, 0);
         double ori_err = -1.0;
-        if (hand_ori_received_ && has_ori_target_) {
+        bool ori_source_ready = hand_ori_received_ || pin_fb_ready_;
+        if (ori_source_ready && has_ori_target_) {
             ori_err = orientationError(target_ori_, current_hand_ori_).norm();
             // Error vector is axis-angle; approximate small-error RPY = error vector
             rpy_rel = orientationError(target_ori_, current_hand_ori_);
@@ -572,6 +662,62 @@ Eigen::Vector3d HandController::orientationError(
     double w = q_err.w();
     double scale = (w >= 0.0) ? 2.0 : -2.0;
     return Eigen::Vector3d(scale * q_err.x(), scale * q_err.y(), scale * q_err.z());
+}
+
+// ============================================================================
+// Pinocchio fallback (hardware path)
+// ============================================================================
+
+void HandController::refreshPinocchio()
+{
+    if (!pinocchio_ready_ || !robot_ || !kin_) return;
+
+    // Update FK from the synced /joint_states (arm + wrist positions).
+    robot_->updateKinematics();
+
+    // 1. Palm orientation = hand frame rotation (world frame).
+    //    Note: the patched URDF lumps the Inspire hand into right_wrist_yaw_link,
+    //    so getHandOrientation() resolves to that frame's rotation — equivalent
+    //    to MuJoCo's /actual_hand_orientation for the wrist PID.
+    current_hand_ori_ = Eigen::Quaterniond(robot_->getHandOrientation());
+    current_hand_ori_.normalize();
+
+    // 1b. First-orientation handling (mirrors handOrientationCallback). On real
+    //     hardware /actual_hand_orientation never arrives, so Pinocchio must
+    //     trigger the deferred composition of a relative target received earlier.
+    if (!pin_fb_ready_) {
+        pin_fb_ready_ = true;
+        if (has_ori_target_ && last_user_ori_.w() > 1e-9) {
+            // A relative HandCommand arrived before Pinocchio was ready → compose now.
+            Eigen::Quaterniond abs_target = current_hand_ori_ * last_user_ori_;
+            abs_target.normalize();
+            target_ori_ = abs_target;
+            RCLCPP_INFO(get_logger(),
+                "First Pinocchio ori. Deferred compose: user→abs Target=[%.3f,%.3f,%.3f,%.3f]",
+                target_ori_.w(), target_ori_.x(), target_ori_.y(), target_ori_.z());
+        } else if (!has_ori_target_) {
+            // No prior command → wrist stays in gravity-hold (no orientation chase).
+            RCLCPP_INFO(get_logger(),
+                "First Pinocchio ori, no command → wrist joint-angle hold.");
+        }
+    }
+
+    // 2. Wrist 3×3 orientation Jacobian (numerical, Pinocchio).
+    //    Fixed-size assignment: Eigen permits Dynamic→Fixed only when the runtime
+    //    column count equals the fixed size — here n_wrist_ is always 3.
+    Eigen::Matrix<double, 3, Eigen::Dynamic> J(3, n_wrist_);
+    kin_->computeWristOrientationJacobian(J);
+    if (J.cols() == 3) wrist_jacobian_ = J;  // compile-time 3×3 = runtime 3×3
+
+    // 3. Wrist gravity torque (7-DOF model; wrist = last 3 indices).
+    //    Includes the Inspire hand mass (lumped into the yaw link), matching
+    //    MuJoCo's /mujoco_gravity on the 4..6 slice.
+    Eigen::VectorXd tau_g;
+    kin_->computeGravityTorque(tau_g);
+    if (tau_g.size() >= pin_arm_count_ + n_wrist_) {
+        for (int j = 0; j < n_wrist_; ++j)
+            wrist_gravity_(j) = tau_g(pin_arm_count_ + j);
+    }
 }
 
 void HandController::applyWristHold()

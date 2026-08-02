@@ -46,6 +46,11 @@ protected:
         };
 
         robot_ = std::make_unique<RobotModel>(urdf_path_, active_joints_);
+        robot_->buildSubsetIndices(
+            {"right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+             "right_shoulder_yaw_joint", "right_elbow_joint"},   // arm
+            {"right_wrist_roll_joint", "right_wrist_pitch_joint",
+             "right_wrist_yaw_joint"});                          // wrist
         kin_ = std::make_unique<Kinematics>(*robot_);
 
         pid_ = std::make_unique<PIDController>(
@@ -76,7 +81,7 @@ protected:
         pid_->reset();
         double final_error = 0.0;
         for (int i = 0; i < steps; ++i) {
-            auto result = pid_->compute(target, robot_->q_, robot_->dq_, dt);
+            auto result = pid_->computeArm(target, robot_->q_, robot_->dq_, dt);
             final_error = result.position_error;
             if (result.position_error < 0.01) break;  // early convergence
         }
@@ -116,7 +121,7 @@ TEST_F(ControllerTest, PIDRespectsJointLimits) {
         robot_->setNeutralConfig();
         pid_->reset();
         for (int i = 0; i < 500; ++i) {
-            pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+            pid_->computeArm(target, robot_->q_, robot_->dq_, 0.05);
         }
         // After running, all joints must be within limits
         for (int j = 0; j < robot_->reduced_model_.nv; ++j) {
@@ -138,18 +143,18 @@ TEST_F(ControllerTest, PIDResetClearsState) {
     // Record the result from a freshly-reset controller.
     robot_->setNeutralConfig();
     pid_->reset();
-    auto result_fresh = pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+    auto result_fresh = pid_->computeArm(target, robot_->q_, robot_->dq_, 0.05);
 
     // Run many steps to accumulate integral error and derivative history.
     for (int i = 0; i < 100; ++i) {
-        pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+        pid_->computeArm(target, robot_->q_, robot_->dq_, 0.05);
     }
 
     // Reset, re-initialize the robot, and verify the controller behaves
     // identically to a fresh one (integral = 0, first_call = true).
     robot_->setNeutralConfig();
     pid_->reset();
-    auto result_after_reset = pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+    auto result_after_reset = pid_->computeArm(target, robot_->q_, robot_->dq_, 0.05);
 
     // The first command after reset must match the first command from fresh.
     EXPECT_TRUE(result_fresh.command.isApprox(result_after_reset.command, 1e-6));
@@ -164,7 +169,7 @@ TEST_F(ControllerTest, ControlResultFields) {
     Eigen::Vector3d target(0.30, -0.40, 0.20);
     robot_->setNeutralConfig();
 
-    auto result = pid_->compute(target, robot_->q_, robot_->dq_, 0.05);
+    auto result = pid_->computeArm(target, robot_->q_, robot_->dq_, 0.05);
 
     EXPECT_TRUE(result.success);
     EXPECT_EQ(result.command.size(), robot_->reduced_model_.nv);

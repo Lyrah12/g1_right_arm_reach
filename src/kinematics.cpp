@@ -1,6 +1,6 @@
 /**
  * @file kinematics.cpp
- * @brief Numerical Jacobians (subset + full), damped pseudoinverse, gravity torque.
+ * @brief Numerical Jacobians (arm/wrist subsets), damped pseudoinverse, gravity torque.
  *
  * Arm-Hand decoupling: computeArmPositionJacobian (3×4) and
  * computeWristOrientationJacobian (3×N) perturb only the relevant joint subsets,
@@ -45,45 +45,6 @@ void Kinematics::computePositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic
         Eigen::Vector3d p_minus = robot_.getEndEffectorPosition();
 
         J_pos.col(i) = (p_plus - p_minus) / (2.0 * eps);
-    }
-
-    robot_.q_ = q_save;
-    robot_.updateKinematics();
-}
-
-// ============================================================================
-// Full 6×N Jacobian (position + angular velocity, world frame)
-// ============================================================================
-
-void Kinematics::computeFullJacobian(Eigen::Matrix<double, 6, Eigen::Dynamic>& J_full)
-{
-    const int nv = robot_.reduced_model_.nv;
-    const double eps = 1e-5;
-
-    Eigen::VectorXd q_save = robot_.q_;
-    robot_.updateKinematics();
-
-    Eigen::Vector3d p0 = robot_.getEndEffectorPosition();
-    Eigen::Quaterniond q0 = getEEOrientation();
-
-    for (int i = 0; i < nv; ++i) {
-        robot_.q_ = q_save;  robot_.q_(i) += eps;
-        robot_.updateKinematics();
-        Eigen::Vector3d p_plus = robot_.getEndEffectorPosition();
-        Eigen::Quaterniond q_plus = getEEOrientation();
-
-        robot_.q_ = q_save;  robot_.q_(i) -= eps;
-        robot_.updateKinematics();
-        Eigen::Vector3d p_minus = robot_.getEndEffectorPosition();
-        Eigen::Quaterniond q_minus = getEEOrientation();
-
-        J_full.block<3, 1>(0, i) = (p_plus - p_minus) / (2.0 * eps);
-
-        Eigen::Quaterniond dq_ori = q_plus * q_minus.inverse();
-        dq_ori.normalize();
-        Eigen::AngleAxisd aa(dq_ori);
-        Eigen::Vector3d omega = aa.axis() * aa.angle() / (2.0 * eps);
-        J_full.block<3, 1>(3, i) = omega;
     }
 
     robot_.q_ = q_save;
@@ -227,20 +188,6 @@ void Kinematics::dampedPseudoInverse(
     Eigen::Matrix3d JJt = J_pos * J_pos.transpose();
     JJt.diagonal().array() += damping;
     J_pinv = J_pos.transpose() * JJt.ldlt().solve(Eigen::Matrix3d::Identity());
-}
-
-// ============================================================================
-// Damped pseudoinverse (6×N)
-// ============================================================================
-
-void Kinematics::dampedPseudoInverse6D(
-    const Eigen::Matrix<double, 6, Eigen::Dynamic>& J_full,
-    double damping,
-    Eigen::Matrix<double, Eigen::Dynamic, 6>& J_pinv) const
-{
-    Eigen::Matrix<double, 6, 6> JJt = J_full * J_full.transpose();
-    JJt.diagonal().array() += damping;
-    J_pinv = J_full.transpose() * JJt.ldlt().solve(Eigen::Matrix<double, 6, 6>::Identity());
 }
 
 }  // namespace g1_right_arm_reach

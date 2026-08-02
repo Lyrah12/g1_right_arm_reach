@@ -1,13 +1,12 @@
 /** @file pid_controller.hpp
- *  @brief Task-space PID with damped pseudoinverse IK.
+ *  @brief Task-space PID with damped pseudoinverse IK (arm position control).
  *
  *  Arm-Hand decoupled control:
- *    computeArm()   — 4-DOF arm → 3-DOF wrist-origin position (3×4 damped pinv + null-space)
- *    computeWrist() — variable-DOF wrist → 3-DOF hand orientation (3×N auto-adapting solver)
+ *    computeArm()       — 4-DOF arm → 3-DOF wrist-origin position (3×4 damped pinv + null-space)
+ *    computeGravityHold — arm torque when no target yet (prevents free-fall)
  *
- *  computeWrist supports 1~3 wrist DOF without code changes.
- *  23-DOF model: wrist_roll only (1-DOF, under-actuated → damped pseudoinverse).
- *  29-DOF model: wrist_roll+pitch+yaw (3-DOF, square Jacobian → direct solve).
+ *  Wrist orientation is handled entirely by HandController (see hand_controller.hpp),
+ *  so this class no longer exposes a wrist solver.
  */
 
 #ifndef G1_RIGHT_ARM_REACH__PID_CONTROLLER_HPP_
@@ -90,42 +89,6 @@ public:
                              double dt,
                              const Eigen::Vector3d* external_error = nullptr);
 
-    // ======================================================================
-    // Wrist solver — orientation control (primary interface, 1~3 DOF)
-    // ======================================================================
-
-    /// Run one wrist control cycle: 3-DOF → 3-DOF hand orientation.
-    /// Modifies only wrist joints (indices 4-6) in robot_.q_.
-    /// @param target_ori  Desired hand orientation quaternion (world frame)
-    /// @param current_q   Current full 5-DOF joint positions
-    /// @param current_dq  Current full 5-DOF joint velocities
-    /// @param dt          Control period (s)
-    ControlResult computeWrist(const Eigen::Quaterniond& target_ori,
-                               const Eigen::VectorXd& current_q,
-                               const Eigen::VectorXd& current_dq,
-                               double dt);
-
-    // ======================================================================
-    // Legacy (kept for backward compatibility, not used in normal operation)
-    // ======================================================================
-
-    /// @deprecated Use computeArm() + computeWrist() instead.
-    ControlResult compute(const Eigen::Vector3d& target,
-                          const Eigen::VectorXd& current_q,
-                          const Eigen::VectorXd& current_dq,
-                          double dt,
-                          const Eigen::Vector3d* external_error = nullptr,
-                          const Eigen::Matrix<double, 3, Eigen::Dynamic>* external_jacobian = nullptr);
-
-    /// @deprecated Use computeArm() + computeWrist() instead.
-    ControlResult computePose(const Eigen::Vector3d& target_pos,
-                              const Eigen::Quaterniond& target_ori,
-                              const Eigen::VectorXd& current_q,
-                              const Eigen::VectorXd& current_dq,
-                              double dt,
-                              const Eigen::Vector3d* external_error = nullptr,
-                              const Eigen::Matrix<double, 6, Eigen::Dynamic>* external_jacobian_6d = nullptr);
-
     /// Reset all integral/derivative state.
     void reset();
 
@@ -136,8 +99,6 @@ public:
     void setDamping(double d) { damping_ = d; }
     void setTolerance(double tol) { tolerance_ = tol; }
     void setPostureGain(double g) { posture_gain_ = g; }
-    void setKpWrist(double kp_w) { kp_wrist_ = kp_w; }
-    void setKdWrist(double kd_w) { kd_wrist_ = kd_w; }
     double getTolerance() const { return tolerance_; }
 
     void setTorqueMode(bool enable) { torque_mode_ = enable; }
@@ -165,19 +126,8 @@ public:
                                      const Eigen::VectorXd& dq);
 
 private:
-    /// Legacy core implementation shared by compute() and computePose().
-    ControlResult computeImpl(const Eigen::Vector3d& target_pos,
-                              const Eigen::Quaterniond* target_ori,
-                              const Eigen::VectorXd& current_q,
-                              const Eigen::VectorXd& current_dq,
-                              double dt,
-                              const Eigen::Vector3d* external_error,
-                              const Eigen::Matrix<double, 3, Eigen::Dynamic>* external_jacobian_3d,
-                              const Eigen::Matrix<double, 6, Eigen::Dynamic>* external_jacobian_6d);
-
-    /// Null-space joint-limit avoidance (arm-only for computeArm, all-joints for legacy).
+    /// Null-space joint-limit avoidance (arm joints only).
     Eigen::VectorXd jointLimitAvoidanceArm(double margin = 0.1) const;
-    Eigen::VectorXd jointLimitAvoidance(double margin = 0.1) const;
 
     /// Fill tau_g with external (MuJoCo) gravity if set, else Pinocchio RNEA.
     void resolveGravityTorque(Eigen::VectorXd& tau_g) const;
@@ -190,10 +140,7 @@ private:
     double damping_, tolerance_, posture_gain_;
     Eigen::VectorXd posture_target_;
 
-    // Wrist orientation gains
-    double kp_wrist_ = 1.0, kd_wrist_ = 0.02;
-
-    // Torque mode (disabled — kept for future re-evaluation)
+    // Torque mode
     bool torque_mode_ = false, gravity_comp_ = true;
     double inner_servo_kp_ = 5.0, inner_servo_kv_ = 5.0;
 
@@ -204,11 +151,6 @@ private:
     Eigen::Vector3d prev_error_pos_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d error_integral_{Eigen::Vector3d::Zero()};
     bool first_call_{true};
-
-    // Wrist PID state
-    Eigen::Vector3d prev_error_ori_{Eigen::Vector3d::Zero()};
-    Eigen::Vector3d ori_integral_{Eigen::Vector3d::Zero()};
-    bool first_call_wrist_{true};
 };
 
 }  // namespace g1_right_arm_reach

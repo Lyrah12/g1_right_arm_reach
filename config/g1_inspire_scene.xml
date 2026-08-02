@@ -23,11 +23,14 @@
 
   <!-- ===================================================================== -->
   <!-- G1 + Inspire（注入版，由 setup_inspire_hand.sh 生成到 G1 MJCF 目录）      -->
+  <!-- 占位符 @G1_INSPIRE_MJCF@ 由 setup_inspire_hand.sh 末尾替换为实际路径。    -->
+  <!-- 若直接 launch 未跑 setup，请先运行:                                     -->
+  <!--   bash scripts/setup_inspire_hand.sh                                   -->
   <!-- ===================================================================== -->
-  <include file="/home/lyrah/deps/unitree_ros_models/g1_description/g1_29dof_inspire.xml"/>
+  <include file="@G1_INSPIRE_MJCF@"/>
 
-  <!-- Inspire RH56 hand — mesh assets（相对路径，随包部署） -->
-  <include file="/home/lyrah/g1_ws/src/g1_right_arm_reach/config/inspire_hand_right_assets.xml"/>
+  <!-- Inspire RH56 hand — mesh assets（与本文件同目录的相对路径，随包部署） -->
+  <include file="inspire_hand_right_assets.xml"/>
 
   <!-- ===================================================================== -->
   <!-- 仿真选项: implicitfast + 2 ms（微小惯性手部关节必需）                    -->

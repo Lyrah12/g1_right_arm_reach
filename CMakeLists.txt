@@ -8,7 +8,7 @@
 #
 # Nodes:
 #   reach_node          — Arm IK (50 Hz, 4-DOF → 3-DOF position)
-#   hand_controller_node — Hand control (50 Hz, 23-DOF wrist+fingers)
+#   hand_controller_node — Hand control (50 Hz, 9-DOF: wrist×3 + fingers×6)
 #   action_sequencer_node — State machine coordinator (50 Hz)
 #   target_publisher    — Test utility
 #
@@ -132,13 +132,15 @@ rosidl_target_interfaces(reach_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 add_executable(target_publisher_node src/target_publisher_node.cpp)
 ament_target_dependencies(target_publisher_node rclcpp geometry_msgs)
 
-# hand_controller_node: Hand module (50 Hz, Plan C). 23-DOF (wrist×3 + fingers×20).
-# Wrist: orientation PID + MuJoCo 3×3 Jacobian. Fingers: impedance control + smoothstep.
+# hand_controller_node: Hand module (50 Hz, Plan C). 9-DOF (wrist×3 + fingers×6 active).
+# Wrist: orientation PID + 3×3 Jacobian. Fingers: impedance control.
 add_executable(hand_controller_node src/hand_controller_node.cpp)
 target_include_directories(hand_controller_node PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(hand_controller_node grasp_library Eigen3::Eigen)
+# Links g1_right_arm_core + Pinocchio for the hardware-path wrist feedback
+# (RobotModel/Kinematics FK, Jacobian, gravity).
+target_link_libraries(hand_controller_node grasp_library g1_right_arm_core Eigen3::Eigen)
 ament_target_dependencies(hand_controller_node rclcpp std_msgs sensor_msgs geometry_msgs)
 rosidl_target_interfaces(hand_controller_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 

@@ -76,7 +76,8 @@ def launch_setup(context, *args, **kwargs):
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='hand_controller_node',
-             parameters=[os.path.join(pkg_share, 'config', 'params.yaml')],
+             parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
+                         {'robot_model.urdf_path': urdf_path}],
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='action_sequencer_node',

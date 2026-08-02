@@ -50,8 +50,16 @@ RobotModel::RobotModel(
     ee_frame_id_full_ = findEndEffectorFrame(full_model_);
     ee_frame_id_      = findEndEffectorFrame(reduced_model_);
 
-    // 5b. Locate hand frame (rubber_hand, for orientation observation)
+    // 5b. Locate hand frame (for orientation observation).
+    // Candidates in priority order. In the patched URDF the Inspire hand mass is
+    // lumped into right_wrist_yaw_link and the residual rubber_hand frame is
+    // named "right_rubber_hand" (NOT the stock "right_wrist_roll_rubber_hand"),
+    // so a wrong name silently falls back to the last frame → wrong palm ori.
     hand_frame_id_ = findFrameByName(reduced_model_, "right_wrist_roll_rubber_hand");
+    if (hand_frame_id_ == reduced_model_.nframes - 1)
+        hand_frame_id_ = findFrameByName(reduced_model_, "right_rubber_hand");
+    if (hand_frame_id_ == reduced_model_.nframes - 1)
+        hand_frame_id_ = findFrameByName(reduced_model_, "right_wrist_yaw_link");
 
     // 6. Extract joint limits & init config
     extractJointLimits();

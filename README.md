@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python" alt="Python">
   <img src="https://img.shields.io/badge/MuJoCo-3.1+-00A98F" alt="MuJoCo">
   <img src="https://img.shields.io/badge/License-BSD--3--Clause-blue.svg" alt="License">
-  <img src="https://img.shields.io/badge/DOF-27-important" alt="27-DOF">
+  <img src="https://img.shields.io/badge/DOF-13-important" alt="13-DOF">
 </p>
 
 ---
@@ -250,7 +250,7 @@ ros2 param set /hand_controller kp_finger 250.0
 
 - **原点**：`right_shoulder_pitch_joint`
 - **单臂臂展**：约 45 cm
-- **骨盆偏移**：`[0, 0, 0.823]`（URDF 骨盆原点 → MuJoCo 世界坐标对齐）
+- **骨盆偏移**：`[0, 0, 0.793]`（URDF 骨盆原点 → MuJoCo 世界坐标对齐；基座固定后骨盆位于 body_pos z=0.793）
 
 
 | 目标 `(x, y, z)` | 距离 | 说明 |
@@ -332,24 +332,28 @@ $$q_{cmd} = q_{des} + \frac{\tau_{des}}{k_p^{inner}} \quad \text{(位置编码�
 
 | 参数 | 默认值 | 说明 |
 |-----------|---------|-------------|
-| `pid.kp` | 2.0 | IK 比例增益 |
-| `pid.ki` | 0.4 | IK 积分增益（抗饱和上限 0.10） |
-| `pid.kd` | 0.05 | IK 微分增益 |
+| `pid.kp` | 200.0 | 任务空间刚度 (N/m) — 积分带限修复后 P 主导 |
+| `pid.ki` | 1.0 | IK 积分增益（仅微调，带限 0.15，误差增长即清零） |
+| `pid.kd` | 0.3 | IK 微分增益 |
 | `pid.damping` | 2e−4 | 阻尼伪逆 λ（自适应） |
 | `pid.tolerance` | 0.005 | 位置收敛容差 (m) |
 | `pid.posture_gain` | 0.2 | 零空间姿态吸引强度 |
+| `pid.torque_mode` | true | 力矩输出（MIT 模式，实物 LowCmd 接口一致） |
+| `reach_node.pelvis_offset` | [0,0,0.793] | URDF 骨盆原点 → MuJoCo 世界对齐 |
 
 ### 手部控制器
 
 | 参数 | 默认值 | 说明 |
 |-----------|---------|-------------|
-| `kp_wrist` | 2.0 | 腕部朝向 P 增益 |
+| `kp_wrist` | 3.5 | 腕部朝向 P 增益 |
 | `ki_wrist` | 0.05 | 腕部朝向 I 增益 |
-| `kd_wrist` | 0.12 | 腕部朝向 D 增益 |
+| `kd_wrist` | 0.8 | 腕部朝向 D 增益 |
+| `wrist_joint_damping` | 0.6 | 关节空间速度阻尼 (N·m·s/rad) |
 | `wrist_offset_limit` | 2.0 | 腕部偏移上限（相对就绪姿态，rad） |
-| `kp_finger` | 50.0 | 手指阻抗刚度 (N·m/rad) |
-| `kd_finger` | 0.5 | 手指阻抗阻尼 (N·m·s/rad) |
-| `inner_servo_kp` | 5.0 | MuJoCo 内环 kp（必须匹配 MJCF 手指 kp） |
+| `kp_finger` | 5.0 | 手指阻抗刚度 (N·m/rad) |
+| `kd_finger` | 0.3 | 手指阻抗阻尼 (N·m·s/rad) |
+| `tau_max_finger` | 1.5 | 手指电机力矩上限 (N·m) |
+| `tau_max_wrist` | 13.4 | 5010 腕部力矩上限 (N·m) |
 
 ### MuJoCo 桥接
 
@@ -368,7 +372,7 @@ $$q_{cmd} = q_{des} + \frac{\tau_{des}}{k_p^{inner}} \quad \text{(位置编码�
 | `/hand_command` | `HandCommand` | sequencer → hand_controller | 朝向四元数 + 抓取类型 |
 | `/joint_commands` | `JointState` | reach_node → bridge | 4-DOF 手臂 |
 | `/hand_commands` | `JointState` | hand_controller → bridge | 9-DOF hand（腕部×3 + 手指×20） |
-| `/joint_states` | `JointState` | bridge → 各节点 | 全 27-DOF 反馈 |
+| `/joint_states` | `JointState` | bridge → 各节点 | 全 13-DOF 反馈（臂4 + 腕3 + 手指6） |
 | `/actual_ee_pose` | `PointStamped` | bridge → reach_node | 腕部位置（世界坐标系） |
 | `/actual_hand_orientation` | `QuaternionStamped` | bridge → hand_controller | 手掌朝向（世界坐标系） |
 | `/mujoco_wrist_jacobian` | `Float64MultiArray` | bridge → hand_controller | 3×3 腕部 Jacobian（行主序） |
@@ -397,8 +401,10 @@ g1_right_arm_reach/
 │   └── target_publisher_node.cpp # 测试工具
 ├── scripts/
 │   ├── mujoco_bridge_node.py     # MuJoCo 物理桥接 (200 Hz)
-│   ├── inject_wuji_hand.py       # Inspire RH56 MJCF 注入器
-│   ├── setup_inspire_hand.sh        # Inspire RH56 一键配置
+│   ├── inject_inspire_hand.py    # Inspire RH56 MJCF 注入器
+│   ├── inspire_urdf_to_mjcf.py   # DFQ URDF → MJCF 片段转换
+│   ├── patch_inspire_urdf.py     # 补丁 URDF（Pinocchio 重力对齐）
+│   ├── setup_inspire_hand.sh     # Inspire RH56 一键配置
 │   ├── action_cli.py             # 统一命令行工具
 │   └── plot_error.py             # 误差绘图工具
 ├── msg/
@@ -413,10 +419,15 @@ g1_right_arm_reach/
 │   └── GraspObject.action        # 异步抓取 Action 接口（预留）
 ├── config/
 │   ├── params.yaml               # 全部运行时参数
-│   ├── g1_grasp_scene.xml        # MJCF: G1 + 简易夹爪
-│   └── g1_inspire_scene.xml         # MJCF: G1 + Inspire RH56
+│   ├── g1_29dof_inspire.urdf     # 补丁 URDF（5010 腕 + Inspire 手并入，Pinocchio 重力对齐）
+│   ├── g1_inspire_scene.xml      # MJCF: G1 + Inspire RH56（scene_path）
+│   ├── inspire_hand_right_body.xml   # 手 body 树片段（setup 生成）
+│   ├── inspire_hand_right_assets.xml # 手 mesh 资产（setup 生成）
+│   └── inspire_hand/             # DFQ_right_hand.urdf + 13 个 STL mesh
 ├── launch/
-│   └── mujoco_demo.launch.py     # 启动全部节点
+│   ├── mujoco_demo.launch.py     # 启动全部节点
+│   ├── mujoco_armonly.launch.py  # 仅 bridge + reach_node（隔离调试）
+│   └── rviz_demo.launch.py       # 无物理 RViz 演示
 ├── test/
 │   ├── test_kinematics.cpp       # FK/Jacobian 单元测试
 │   └── test_controllers.cpp      # PID 收敛测试

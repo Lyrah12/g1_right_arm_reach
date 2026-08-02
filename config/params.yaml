@@ -91,6 +91,21 @@ hand_controller:
   ros__parameters:
 
     # -------------------------------------------------------------------------
+    # Robot model (hardware path) — Pinocchio wrist feedback
+    # -------------------------------------------------------------------------
+    # Wrist orientation / Jacobian / gravity are computed locally from this URDF
+    # when the MuJoCo-only topics (/actual_hand_orientation, /mujoco_wrist_jacobian,
+    # /mujoco_gravity) are absent — i.e. on real hardware. In sim the MuJoCo topics
+    # take priority (exact-sim override). urdf_path set via launch argument.
+    robot_model:
+      urdf_path: ""            # Set via launch argument
+      arm_joints:              # Right-arm joints (for /joint_states sync + gravity)
+        - "right_shoulder_pitch_joint"
+        - "right_shoulder_roll_joint"
+        - "right_shoulder_yaw_joint"
+        - "right_elbow_joint"
+
+    # -------------------------------------------------------------------------
     # Joint names — wrist (3) + Inspire active fingers (6) = 9 DOF
     # -------------------------------------------------------------------------
     wrist_joint_names:
@@ -137,8 +152,10 @@ hand_controller:
     # -------------------------------------------------------------------------
     hand_command_topic: "/hand_command"
     joint_state_topic: "/joint_states"
-    hand_orientation_topic: "/actual_hand_orientation"
-    wrist_jacobian_topic: "/mujoco_wrist_jacobian"
+    hand_orientation_topic: "/actual_hand_orientation"   # sim-only; Pinocchio fallback on hardware
+    wrist_jacobian_topic: "/mujoco_wrist_jacobian"       # sim-only; Pinocchio fallback on hardware
+    gravity_topic: "/mujoco_gravity"                     # sim-only; Pinocchio fallback on hardware
+    ee_pose_topic: "/actual_ee_pose"                     # sim-only; diagnostic EE position
 
 # =============================================================================
 # MuJoCo bridge — physics simulation (200 Hz)

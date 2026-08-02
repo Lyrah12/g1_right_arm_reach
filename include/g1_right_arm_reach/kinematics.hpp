@@ -32,16 +32,11 @@ public:
     void computeArmPositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_arm);
 
     /// 3×N orientation Jacobian: hand frame angular velocity w.r.t. wrist joints only.
-    /// N = wrist_joint_indices_.size() (1 in 23-DOF, 3 in 29-DOF).
+    /// N = wrist_joint_indices_.size() (3 for the 5010 wrist).
     void computeWristOrientationJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_wrist);
-
-    // --- Full Jacobians (legacy / diagnostic) ---
 
     /// 3×N position Jacobian (all active joints).
     void computePositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_pos);
-
-    /// 6×N full Jacobian (top 3 rows = position, bottom 3 = world-frame angular velocity).
-    void computeFullJacobian(Eigen::Matrix<double, 6, Eigen::Dynamic>& J_full);
 
     // --- Utilities ---
 
@@ -59,11 +54,6 @@ public:
     void dampedPseudoInverse(
         const Eigen::Matrix<double, 3, Eigen::Dynamic>& J_pos, double damping,
         Eigen::Matrix<double, Eigen::Dynamic, 3>& J_pinv) const;
-
-    /// Damped pseudoinverse (6×N).
-    void dampedPseudoInverse6D(
-        const Eigen::Matrix<double, 6, Eigen::Dynamic>& J_full, double damping,
-        Eigen::Matrix<double, Eigen::Dynamic, 6>& J_pinv) const;
 
     Eigen::Quaterniond getEEOrientation() const;
     Eigen::Vector3d getRightShoulderPosition() const;

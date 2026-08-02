@@ -7,13 +7,18 @@
  *   - Hand (this node): 9-DOF → orientation + grasp
  *
  * Control:
- *   Wrist:   orientation PID + MuJoCo numerical Jacobian (3×3) → joint positions
- *   Fingers: impedance τ = Kp·e + Kd·ė → position-encoded torque, smoothstep trajectory
+ *   Wrist:   orientation PID + 3×3 Jacobian → joint torques
+ *   Fingers: impedance τ = Kp·e + Kd·ė (direct torque output)
+ *
+ * Wrist feedback sources (hardware-fidelity, Pinocchio-primary):
+ *   /actual_hand_orientation  QuaternionStamped (world-frame palm ori)  — sim only
+ *   /mujoco_wrist_jacobian    Float64MultiArray 3×3 (row-major)         — sim only
+ *   /mujoco_gravity           Float64MultiArray 7 (wrist indices 4-6)   — sim only
+ *   On real hardware these topics do not exist; the node falls back to
+ *   Pinocchio FK / numerical Jacobian / RNEA gravity (see controlLoop).
  *
  * @subscribed /hand_command             HandCommand (quat + grasp)
  * @subscribed /joint_states             actual wrist + finger positions
- * @subscribed /actual_hand_orientation  QuaternionStamped (world-frame palm orientation)
- * @subscribed /mujoco_wrist_jacobian    Float64MultiArray 3×3 (row-major)
  *
  * @published  /hand_commands            JointState, 9-DOF (wrist×3 + fingers×6)
  * @published  /debug/orientation_error  Float64 (rad)
@@ -31,10 +36,13 @@
 
 #include "g1_right_arm_reach/msg/hand_command.hpp"
 #include "g1_right_arm_reach/grasp_library.hpp"
+#include "g1_right_arm_reach/robot_model.hpp"
+#include "g1_right_arm_reach/kinematics.hpp"
 
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
@@ -85,6 +93,17 @@ private:
                                             const Eigen::Quaterniond& current);
 
     // ========================================================================
+    // Pinocchio fallback (hardware path)
+    // ========================================================================
+
+    /// Compute wrist ori / 3×3 Jacobian / gravity from Pinocchio, using the
+    /// latest /joint_states. Used when the MuJoCo-only topics
+    /// (/actual_hand_orientation, /mujoco_wrist_jacobian, /mujoco_gravity)
+    /// are absent — i.e. on real hardware. Pinocchio is the PRIMARY source:
+    /// the MuJoCo topics are treated as an exact-sim override when present.
+    void refreshPinocchio();
+
+    // ========================================================================
     // Finger impedance control
     // ========================================================================
 
@@ -97,14 +116,22 @@ private:
 
     GraspLibrary grasp_library_;
 
+    // --- Pinocchio model (hardware path) ---
+    std::unique_ptr<RobotModel> robot_;
+    std::unique_ptr<Kinematics> kin_;
+    bool pinocchio_ready_{false};    ///< URDF loaded (model available)
+    bool pin_fb_ready_{false};       ///< first Pinocchio FK done (feedback available)
+    int pin_arm_count_{0};           ///< number of arm joints in the Pinocchio model
+    std::vector<std::string> pin_arm_names_;  ///< arm joint names (for /joint_states sync)
+
     // --- Joint names ---
     std::vector<std::string> wrist_names_;     // 3 joints
-    std::vector<std::string> finger_names_;    // 20 joints
-    std::vector<std::string> all_names_;       // 23 joints (wrist + fingers)
+    std::vector<std::string> finger_names_;    // 6 active joints
+    std::vector<std::string> all_names_;       // 9 joints (wrist + fingers)
 
     int n_wrist_{0};    // 3
-    int n_fingers_{0};  // 20
-    int n_total_{0};    // 23
+    int n_fingers_{0};  // 6
+    int n_total_{0};    // 9
 
     // --- Actual state (from /joint_states) ---
     Eigen::VectorXd actual_q_;     // 9-DOF: wrist(3) + fingers(6)

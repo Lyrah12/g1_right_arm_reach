@@ -34,26 +34,37 @@ do
     if [ -f "${cand}" ]; then G1_MJCF="${cand}"; break; fi
 done
 if [ -z "${G1_MJCF:-}" ]; then
-    echo "[1/4] ERROR: base G1 MJCF not found."
+    echo "[1/5] ERROR: base G1 MJCF not found."
     echo "    Put g1_29dof.xml at one of:"
     echo "      ${DEPS_DIR}/unitree_mujoco/unitree_robots/g1/g1_29dof.xml"
     echo "      ${DEPS_DIR}/unitree_ros_models/g1_description/g1_29dof.xml"
     exit 1
 fi
-echo "[1/4] Base G1 MJCF: ${G1_MJCF}"
+echo "[1/5] Base G1 MJCF: ${G1_MJCF}"
 
 # --- Step 2: regenerate MJCF fragments from the DFQ URDF ---
-echo "[2/4] Converting DFQ URDF -> MJCF fragments..."
+echo "[2/5] Converting DFQ URDF -> MJCF fragments..."
 python3 "${PKG_DIR}/scripts/inspire_urdf_to_mjcf.py" "${INSPIRE_URDF}" "${CONFIG_DIR}"
 
 # --- Step 3: inject into the G1 base (5010 wrist patch + equality + hand) ---
 G1_DIR="$(dirname "${G1_MJCF}")"
 G1_PATCHED="${G1_DIR}/g1_29dof_inspire.xml"
-echo "[3/4] Injecting Inspire hand + 5010 wrist into G1 MJCF..."
+echo "[3/5] Injecting Inspire hand + 5010 wrist into G1 MJCF..."
 python3 "${PKG_DIR}/scripts/inject_inspire_hand.py" \
     "${G1_MJCF}" \
     "${CONFIG_DIR}/inspire_hand_right_body.xml" \
     "${G1_PATCHED}"
+
+# --- Step 4a: resolve the @G1_INSPIRE_MJCF@ placeholder in the scene XML ---
+# MUST run before Step 4: patch_inspire_urdf.py loads the scene (mjModel.
+# from_xml_path) to measure the hand COM, and a dangling placeholder would fail.
+SCENE="${CONFIG_DIR}/g1_inspire_scene.xml"
+if [ -f "${SCENE}" ]; then
+    echo "[4/5] Resolving scene placeholder -> ${G1_PATCHED}"
+    sed -i "s|@G1_INSPIRE_MJCF@|${G1_PATCHED}|g" "${SCENE}"
+else
+    echo "[4/5] WARNING: scene file not found: ${SCENE}"
+fi
 
 # --- Step 4: patch the G1 URDF so Pinocchio gravity == MuJoCo (5010 + Inspire hand) ---
 URDF_CAND=""
@@ -64,13 +75,13 @@ do
     if [ -f "${cand}" ]; then URDF_CAND="${cand}"; break; fi
 done
 if [ -n "${URDF_CAND}" ]; then
-    echo "[4/4] Patching G1 URDF for Pinocchio gravity (5010 wrist + Inspire hand)..."
+    echo "[5/5] Patching G1 URDF for Pinocchio gravity (5010 wrist + Inspire hand)..."
     python3 "${PKG_DIR}/scripts/patch_inspire_urdf.py" \
         "${URDF_CAND}" \
         "${CONFIG_DIR}/g1_29dof_inspire.urdf" \
         "${CONFIG_DIR}/g1_inspire_scene.xml"
 else
-    echo "[4/4] WARNING: stock G1 URDF not found; g1_29dof_inspire.urdf NOT generated."
+    echo "[5/5] WARNING: stock G1 URDF not found; g1_29dof_inspire.urdf NOT generated."
 fi
 
 echo ""
@@ -79,6 +90,7 @@ echo " Done."
 echo "   Body tree:      ${CONFIG_DIR}/inspire_hand_right_body.xml"
 echo "   Assets:         ${CONFIG_DIR}/inspire_hand_right_assets.xml"
 echo "   Injected MJCF:  ${G1_PATCHED}"
+echo "   Scene resolved: ${CONFIG_DIR}/g1_inspire_scene.xml (placeholder -> ${G1_PATCHED})"
 echo "   Pinocchio URDF: ${CONFIG_DIR}/g1_29dof_inspire.urdf (5010 + Inspire hand)"
 echo "   Active joints:  6 (thumb_yaw, thumb_pitch, index/middle/ring/pinky prox)"
 echo "   Slave joints:   6 (equality-coupled: int=ratio x master, solref=0.001 1)"
