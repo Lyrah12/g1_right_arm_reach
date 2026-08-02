@@ -41,19 +41,28 @@ reach_node:
     # Arm IK — 4-DOF → 3-DOF position (damped pseudoinverse + null-space)
     # -------------------------------------------------------------------------
     pid:
-      kp: 3.0                    # Proportional gain (task-space velocity per meter error)
-      ki: 0.4                    # Integral gain (anti-windup limit 0.10)
-      kd: 0.05                   # Derivative gain
+      kp: 200.0                  # Task stiffness (N/m). kp=8/40 were far too weak: 40 N/m
+                                 # gives only 0.8 N at 2 cm on a ~1.5 kg arm → ~30 s creep.
+                                 # 200 N/m → 4 N at 2 cm; with kv=5 joint damping the arm is
+                                 # overdamped (ζ≈1.3), so no oscillation. Integral fix
+                                 # (2026-08-02) removed the saturated-integral drift driver.
+      ki: 1.0                    # Integral trim only (max force ki·√3·0.15 ≈ 0.26 N, well
+                                 # below P at kp=200) — cancels steady-state gravity residual
+                                 # without ever dominating the P term.
+      kd: 0.3                    # Task-space derivative (was 0.05) — damps the faster
+                                 # approach so the arm settles instead of overshooting.
       damping: 2.0e-4            # Damped pseudoinverse λ (adaptive)
       tolerance: 0.005           # Position tolerance (5 mm)
       posture_gain: 0.2          # Null-space attraction toward posture_target
-      posture_target: [-0.3, 0.0, 0.0, 0.3]  # arm(4): slight forward lean + elbow bend
+      # 全零 = 上臂自然下垂 + 前臂水平向前（与桥接 ready pose 及左臂镜像一致）。
+      # 旧值 [-0.3,0,0,0.3] 会让重力保持/零空间把手臂拉回前倾姿态（"超前"）。
+      posture_target: [0.0, 0.0, 0.0, 0.0]  # arm(4): natural hang + forearm forward
 
       # -----------------------------------------------------------------------
-      # Torque mode — DISABLED
+      # Torque mode — PID output τ = JᵀF + g − Kd·dq (MIT mode on real hardware)
       # -----------------------------------------------------------------------
-      torque_mode: false
-      gravity_compensation: false
+      torque_mode: true
+      gravity_compensation: true
       inner_servo_kp: 5.0
       inner_servo_kv: 5.0
 
@@ -65,19 +74,24 @@ reach_node:
 
     reach_node:
       origin_frame: "right_shoulder"
-      pelvis_offset: [0.0, 0.0, 0.823]     # URDF pelvis → MuJoCo world Z alignment
+      # URDF pelvis → MuJoCo world Z alignment. The base is now FIXED in the MJCF
+      # (free joint removed), so the pelvis sits at its body_pos z = 0.793, NOT the
+      # old free-base hard-clamp height 0.823. A 0.03 m error here misplaces the
+      # reach target and the arm converges to the wrong point.
+      pelvis_offset: [0.0, 0.0, 0.793]
       target_point_topic: "/target_point"   # Point, 3-DOF (shoulder-relative XYZ)
       joint_state_topic: "/joint_states"
       default_target: [0.18, -0.05, -0.10]  # Shoulder-relative, ~21 cm reachable
 
 # =============================================================================
-# Dexterous Hand — Wuji Hand 2 (Plan C: wrist×3 + fingers×20 = 23-DOF)
+# Dexterous Hand — Inspire RH56 (Plan C: wrist×3 + fingers×6 active = 9-DOF)
+#   6 slaves equality-coupled (thumb_int=1.6×tp, thumb_dist=2.4×tp, fingers 1:1)
 # =============================================================================
 hand_controller:
   ros__parameters:
 
     # -------------------------------------------------------------------------
-    # Joint names — wrist (3) + fingers (5 × 4 = 20) = 23 DOF
+    # Joint names — wrist (3) + Inspire active fingers (6) = 9 DOF
     # -------------------------------------------------------------------------
     wrist_joint_names:
       - "right_wrist_roll_joint"
@@ -85,51 +99,38 @@ hand_controller:
       - "right_wrist_yaw_joint"
 
     finger_joint_names:
-      - "right_finger1_joint1"     # Thumb: base (CMC)
-      - "right_finger1_joint2"     # Thumb: abduction
-      - "right_finger1_joint3"     # Thumb: proximal (MCP)
-      - "right_finger1_joint4"     # Thumb: distal (IP)
-      - "right_finger2_joint1"     # Index: base
-      - "right_finger2_joint2"     # Index: abduction (splay)
-      - "right_finger2_joint3"     # Index: proximal (PIP)
-      - "right_finger2_joint4"     # Index: distal (DIP)
-      - "right_finger3_joint1"     # Middle: base
-      - "right_finger3_joint2"     # Middle: abduction (splay)
-      - "right_finger3_joint3"     # Middle: proximal (PIP)
-      - "right_finger3_joint4"     # Middle: distal (DIP)
-      - "right_finger4_joint1"     # Ring: base
-      - "right_finger4_joint2"     # Ring: abduction (splay)
-      - "right_finger4_joint3"     # Ring: proximal (PIP)
-      - "right_finger4_joint4"     # Ring: distal (DIP)
-      - "right_finger5_joint1"     # Pinky: base
-      - "right_finger5_joint2"     # Pinky: abduction (splay)
-      - "right_finger5_joint3"     # Pinky: proximal (PIP)
-      - "right_finger5_joint4"     # Pinky: distal (DIP)
+      - "R_thumb_proximal_yaw_joint"      # Thumb: abduction/opposition
+      - "R_thumb_proximal_pitch_joint"    # Thumb: flexion
+      - "R_index_proximal_joint"          # Index: flexion
+      - "R_middle_proximal_joint"         # Middle: flexion
+      - "R_ring_proximal_joint"           # Ring: flexion
+      - "R_pinky_proximal_joint"          # Pinky: flexion
 
     # -------------------------------------------------------------------------
     # Wrist orientation PID
     # -------------------------------------------------------------------------
     # Jacobian provided by /mujoco_wrist_jacobian (MuJoCo numerical, avoids FK mismatch).
-    kp_wrist: 2.0                # Orientation P gain
+    # Gravity FF from /mujoco_gravity (MuJoCo pure gravity incl. hand mass) — without it
+    # the wrist droops ~1.4 rad under the hand and oscillates ~1 Hz (kd too low, ζ≈0.19).
+    kp_wrist: 3.5                # Orientation P gain (raised: must also hold hand vs gravity)
     ki_wrist: 0.05               # Orientation I gain (minimal — deadband handles static error)
-    kd_wrist: 0.12               # Orientation D gain (damping to suppress jitter)
+    kd_wrist: 0.8                # Orientation D gain (raised from 0.12 → overdamped, kills 1 Hz)
+    wrist_joint_damping: 0.6     # Joint-space velocity damping τ += −kd·dq (N·m·s/rad)
     wrist_vel_limit: 3.0         # Max wrist joint velocity (rad/s)
     wrist_delta_limit: 0.12      # Max per-cycle wrist joint delta (rad)
     wrist_offset_limit: 2.0      # ±max wrist offset from ready pose (rad)
 
     # -------------------------------------------------------------------------
-    # Finger impedance control
+    # Finger impedance control (TORQUE OUTPUT)
     # -------------------------------------------------------------------------
-    # τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act)
-    # Encoded as: q_cmd = q_des + τ / inner_servo_kp (position-encoded torque)
-    kp_finger: 50.0               # Finger stiffness (N·m/rad) — effective = 5+50 = 55
-    kd_finger: 0.5               # Finger damping (N·m·s/rad)
-    tau_max_finger: 200.0         # Max finger torque (N·m)
+    # τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act), published as effort=τ.
+    kp_finger: 5.0                # Finger stiffness (N·m/rad)
+    kd_finger: 0.3               # Finger damping (N·m·s/rad)
+    tau_max_finger: 1.5           # Max finger torque (N·m) — matches scene motor forcerange
+    tau_max_wrist: 13.4           # Max wrist torque (N·m) — 5010 pitch/yaw
     finger_delta_limit: 1.5      # Max per-cycle finger joint delta (rad)
 
-    # Finger position-servo: original MJCF kp=5 kv=0.5 (no runtime scaling needed).
-    # Kp_inner MUST match actual MuJoCo position-servo kp in scene XML.
-    inner_servo_kp: 5.0
+    inner_servo_kp: 5.0           # legacy (unused in torque mode)
 
     # -------------------------------------------------------------------------
     # Topics
@@ -153,7 +154,7 @@ mujoco_bridge:
     base_frame: "pelvis"
 
     # Active joints: arm 4 + wrist 3 (Jacobian extraction only).
-    # Arm 4 commanded from reach_node, wrist 3 + fingers 20 from hand_controller.
+    # Arm 4 commanded from reach_node, wrist 3 + fingers 6 from hand_controller.
     active_joints:
       - "right_shoulder_pitch_joint"
       - "right_shoulder_roll_joint"
@@ -163,10 +164,35 @@ mujoco_bridge:
       - "right_wrist_pitch_joint"
       - "right_wrist_yaw_joint"
 
+    # Torque mode: controllers publish effort=τ, bridge writes motor ctrl=τ.
+    torque_mode: true
+
+    # Inspire hand joints (12) — excluded from hard-clamp; published in /joint_states.
+    hand_joint_names:
+      - "R_thumb_proximal_yaw_joint"
+      - "R_thumb_proximal_pitch_joint"
+      - "R_thumb_intermediate_joint"
+      - "R_thumb_distal_joint"
+      - "R_index_proximal_joint"
+      - "R_index_intermediate_joint"
+      - "R_middle_proximal_joint"
+      - "R_middle_intermediate_joint"
+      - "R_ring_proximal_joint"
+      - "R_ring_intermediate_joint"
+      - "R_pinky_proximal_joint"
+      - "R_pinky_intermediate_joint"
+
     finger_ema_alpha: 1.0      # EMA smoothing (1.0 = no smoothing)
     wrist_ema_alpha: 1.0       # Wrist EMA (1.0 = no smoothing)
 
     # Hard clamping
-    hard_clamp_pelvis: true
-    hard_clamp_joints: true
+    # Base is now FIXED in the MJCF (free joint → fixed, inject_inspire_hand.py).
+    # hard_clamp_pelvis must be OFF: the old qpos-teleport froze the arm in the
+    # implicitfast solver, and with no free joint it would wrongly clamp the legs.
+    hard_clamp_pelvis: false
+    # hard_clamp_joints MUST be OFF: every-step qpos+qvel teleport of the legs/waist/
+    # left-arm injects impulses through the torso into the right arm. The gravity hold
+    # is pure feedforward (no restoring force), so the arm accumulates steady backward
+    # drift (~0.05 rad/s). Legs/waist are already held by strong position servos.
+    hard_clamp_joints: false
     clamp_arm_joints: false

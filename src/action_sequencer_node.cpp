@@ -212,11 +212,13 @@ void ActionSequencerNode::startReaching()
         cmd.grasp_duration = 0.0;
         hand_cmd_pub_->publish(cmd);
     } else {
-        // No orientation → RESET to injection quat [0.5,0.5,0.5,0.5].
-        // This prevents stale target_ori_ from a previous 6-DOF command (e.g. RPY(0,0,0))
-        // from causing 100°+ wrist rotation → saturation → oscillation.
+        // No orientation → HOLD the current wrist orientation (identity = no change).
+        // Previously this sent the injection quat [0.5,0.5,0.5,0.5] as an ABSOLUTE
+        // world palm orientation. That was designed for the Ruka mount; on the Inspire
+        // mount it demands a large wrist swing during arm reaching → arm+wrist fight
+        // → oscillation. Holding avoids the disturbance entirely.
         auto cmd = msg::HandCommand();
-        cmd.ori_x = 0.5; cmd.ori_y = 0.5; cmd.ori_z = 0.5; cmd.ori_w = 0.5;
+        cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;  // identity = hold
         cmd.grasp_type = "";
         cmd.grasp_duration = 0.0;
         hand_cmd_pub_->publish(cmd);
@@ -287,8 +289,8 @@ void ActionSequencerNode::controlLoop()
                 cmd.ori_z = ori_z_;
                 cmd.ori_w = ori_w_;
             } else {
-                // No orientation specified → reset to injection quat
-                cmd.ori_x = 0.5; cmd.ori_y = 0.5; cmd.ori_z = 0.5; cmd.ori_w = 0.5;
+                // No orientation specified → hold current (identity), no swing demand
+                cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;
             }
             cmd.grasp_type = "";       // orientation only, no finger movement
             cmd.grasp_duration = 0.0;

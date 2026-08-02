@@ -52,6 +52,23 @@ def err(msg):
     sys.exit(1)
 
 
+def wait_for_match(node, pub, timeout=3.0):
+    """Wait until the publisher has a matched subscriber before publishing.
+
+    CLI publishes a SINGLE message then shuts down; if the /action_command
+    subscriber (sequencer) hasn't matched the publisher via DDS discovery yet,
+    the message is silently dropped (intermittent: reach sometimes lost, open
+    sometimes works). Spin + poll get_subscription_count() so discovery completes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        if pub.get_subscription_count() > 0:
+            return True
+    warn(f"no subscriber matched in {timeout:.0f}s — message may be lost")
+    return False
+
+
 # ===========================================================================
 # Command implementations
 # ===========================================================================
@@ -73,7 +90,7 @@ def cmd_reach(args):
     cmd.convergence_timeout = args.timeout
     cmd.settle_time = args.settle
 
-    time.sleep(0.2)  # Let ROS discovery complete
+    wait_for_match(node, pub)
     pub.publish(cmd)
     time.sleep(0.1)
 
@@ -95,7 +112,7 @@ def cmd_grasp(args):
     cmd.grasp_type = args.pattern
     cmd.grasp_duration = args.duration
 
-    time.sleep(0.2)
+    wait_for_match(node, pub)
     pub.publish(cmd)
     time.sleep(0.1)
 
@@ -125,7 +142,7 @@ def cmd_reach_and_grasp(args):
     cmd.convergence_timeout = args.timeout
     cmd.settle_time = args.settle
 
-    time.sleep(0.2)
+    wait_for_match(node, pub)
     pub.publish(cmd)
     time.sleep(0.1)
 
@@ -145,7 +162,7 @@ def cmd_home(args):
     cmd = ActionCommand()
     cmd.action_type = 'home'
 
-    time.sleep(0.2)
+    wait_for_match(node, pub)
     pub.publish(cmd)
     time.sleep(0.1)
 
@@ -166,7 +183,7 @@ def cmd_open(args):
     cmd.grasp_type = 'open'
     cmd.grasp_duration = 0.3
 
-    time.sleep(0.2)
+    wait_for_match(node, pub)
     pub.publish(cmd)
     time.sleep(0.1)
 

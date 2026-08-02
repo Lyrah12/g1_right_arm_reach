@@ -4,7 +4,7 @@
  *
  * Plan C: Arm-Hand fully decoupled.
  *   - reach_node: 4-DOF arm → wrist position
- *   - This node:  23-DOF hand → orientation + grasp
+ *   - This node:  9-DOF hand → orientation + grasp
  *
  * Control:
  *   Wrist:   orientation PID → J⁻¹(3×3) → offset-based position targets
@@ -15,7 +15,7 @@
  * @subscribed /actual_hand_orientation  QuaternionStamped (world-frame palm ori)
  * @subscribed /mujoco_wrist_jacobian    Float64MultiArray 3×3 (row-major)
  *
- * @published  /hand_commands            JointState, 23-DOF (wrist×3 + fingers×20)
+ * @published  /hand_commands            JointState, 9-DOF (wrist×3 + fingers×6)
  * @published  /debug/orientation_error  Float64 (rad)
  */
 
@@ -46,16 +46,13 @@ HandController::HandController()
 
     this->declare_parameter("finger_joint_names",
         std::vector<std::string>{
-            "right_finger1_joint1", "right_finger1_joint2",
-            "right_finger1_joint3", "right_finger1_joint4",
-            "right_finger2_joint1", "right_finger2_joint2",
-            "right_finger2_joint3", "right_finger2_joint4",
-            "right_finger3_joint1", "right_finger3_joint2",
-            "right_finger3_joint3", "right_finger3_joint4",
-            "right_finger4_joint1", "right_finger4_joint2",
-            "right_finger4_joint3", "right_finger4_joint4",
-            "right_finger5_joint1", "right_finger5_joint2",
-            "right_finger5_joint3", "right_finger5_joint4",
+            // Inspire RH56 — 6 active joints (6 slaves equality-coupled, not commanded)
+            "R_thumb_proximal_yaw_joint",
+            "R_thumb_proximal_pitch_joint",
+            "R_index_proximal_joint",
+            "R_middle_proximal_joint",
+            "R_ring_proximal_joint",
+            "R_pinky_proximal_joint",
         });
 
     wrist_names_ = this->get_parameter("wrist_joint_names").as_string_array();
@@ -70,22 +67,25 @@ HandController::HandController()
     for (const auto& n : finger_names_) all_names_.push_back(n);
 
     // --- Parameters: control gains ---
-    this->declare_parameter("kp_wrist", 2.0);
+    this->declare_parameter("kp_wrist", 3.5);
     this->declare_parameter("ki_wrist", 0.05);
-    this->declare_parameter("kd_wrist", 0.12);
+    this->declare_parameter("kd_wrist", 0.8);
+    this->declare_parameter("wrist_joint_damping", 0.6);
     this->declare_parameter("wrist_vel_limit", 3.0);
     this->declare_parameter("wrist_delta_limit", 0.12);
     this->declare_parameter("wrist_offset_limit", 2.0);
 
     this->declare_parameter("kp_finger", 50.0);
     this->declare_parameter("kd_finger", 0.5);
-    this->declare_parameter("tau_max_finger", 200.0);
+    this->declare_parameter("tau_max_finger", 1.5);   // hand motor torque limit (N·m)
+    this->declare_parameter("tau_max_wrist", 13.4);   // 5010 wrist torque limit (N·m)
     this->declare_parameter("finger_delta_limit", 1.5);
     this->declare_parameter("inner_servo_kp", 5.0);
 
     kp_wrist_ = this->get_parameter("kp_wrist").as_double();
     ki_wrist_ = this->get_parameter("ki_wrist").as_double();
     kd_wrist_ = this->get_parameter("kd_wrist").as_double();
+    wrist_joint_damping_ = this->get_parameter("wrist_joint_damping").as_double();
     wrist_vel_limit_ = this->get_parameter("wrist_vel_limit").as_double();
     wrist_delta_limit_ = this->get_parameter("wrist_delta_limit").as_double();
     wrist_offset_limit_ = this->get_parameter("wrist_offset_limit").as_double();
@@ -93,6 +93,7 @@ HandController::HandController()
     kp_finger_ = this->get_parameter("kp_finger").as_double();
     kd_finger_ = this->get_parameter("kd_finger").as_double();
     tau_max_finger_ = this->get_parameter("tau_max_finger").as_double();
+    tau_max_wrist_ = this->get_parameter("tau_max_wrist").as_double();
     finger_delta_limit_ = this->get_parameter("finger_delta_limit").as_double();
     inner_servo_kp_ = this->get_parameter("inner_servo_kp").as_double();
 
@@ -103,6 +104,7 @@ HandController::HandController()
     finger_des_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_cmd_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_effort_ = Eigen::VectorXd::Zero(n_fingers_);
+    finger_cmd_tau_ = Eigen::VectorXd::Zero(n_fingers_);
 
     // --- ROS2 communication ---
     hand_cmd_sub_ = this->create_subscription<msg::HandCommand>(
@@ -124,6 +126,12 @@ HandController::HandController()
         this->declare_parameter("wrist_jacobian_topic", "/mujoco_wrist_jacobian"),
         10,
         std::bind(&HandController::wristJacobianCallback, this, std::placeholders::_1));
+
+    // MuJoCo pure-gravity (7 arm+wrist joints). Wrist part = indices 4..6.
+    gravity_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+        this->declare_parameter("gravity_topic", "/mujoco_gravity"),
+        10,
+        std::bind(&HandController::gravityCallback, this, std::placeholders::_1));
 
     ee_pose_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
         this->declare_parameter("ee_pose_topic", "/actual_ee_pose"),
@@ -150,11 +158,14 @@ HandController::HandController()
                 if (p.get_name() == "kp_wrist") kp_wrist_ = p.as_double();
                 else if (p.get_name() == "ki_wrist") ki_wrist_ = p.as_double();
                 else if (p.get_name() == "kd_wrist") kd_wrist_ = p.as_double();
+                else if (p.get_name() == "wrist_joint_damping") wrist_joint_damping_ = p.as_double();
                 else if (p.get_name() == "wrist_offset_limit" && p.as_double() > 0.0)
                     wrist_offset_limit_ = p.as_double();
                 else if (p.get_name() == "kp_finger") kp_finger_ = p.as_double();
                 else if (p.get_name() == "kd_finger") kd_finger_ = p.as_double();
                 else if (p.get_name() == "tau_max_finger") tau_max_finger_ = p.as_double();
+                else if (p.get_name() == "tau_max_wrist" && p.as_double() > 0.0)
+                    tau_max_wrist_ = p.as_double();
                 else if (p.get_name() == "inner_servo_kp" && p.as_double() > 0.0)
                     inner_servo_kp_ = p.as_double();
             }
@@ -383,15 +394,26 @@ void HandController::handOrientationCallback(
                 target_ori_.w(), target_ori_.x(), target_ori_.y(), target_ori_.z(),
                 current_hand_ori_.w(), current_hand_ori_.x(), current_hand_ori_.y(), current_hand_ori_.z());
         } else {
-            // No prior HandCommand → default target = injection quat (already set in ctor).
-            // We do NOT overwrite target_ori_ with current_ori — this would lock in
-            // any gravity-induced droop that happened before the first callback.
-            has_ori_target_ = true;
-            RCLCPP_INFO(get_logger(),
-                "First hand orientation received. Target=[%.3f,%.3f,%.3f,%.3f] "
-                "Current=[%.3f,%.3f,%.3f,%.3f]. PID activated.",
-                target_ori_.w(), target_ori_.x(), target_ori_.y(), target_ori_.z(),
-                current_hand_ori_.w(), current_hand_ori_.x(), current_hand_ori_.y(), current_hand_ori_.z());
+            bool was_target_set = has_ori_target_;
+            if (!was_target_set) {
+                // No prior HandCommand → do NOT activate the orientation PID and do
+                // NOT chase an absolute world-orientation target.
+                // A world-orientation target captured here goes stale the moment the
+                // arm moves (the palm rotates with the arm), leaving the wrist with a
+                // 2-rad unreachable error → it slams against its joint limits and
+                // saturates. Instead the wrist stays in gravity-hold (joint angles
+                // held). Only an EXPLICIT user quat activates the orientation PID.
+                RCLCPP_INFO(get_logger(),
+                    "First hand ori, no command → wrist joint-angle hold "
+                    "(no orientation target). Gravity hold active.");
+            } else {
+                // A prior HandCommand set target_ori_ — keep it and activate.
+                RCLCPP_INFO(get_logger(),
+                    "First hand orientation received. Target=[%.3f,%.3f,%.3f,%.3f] "
+                    "Current=[%.3f,%.3f,%.3f,%.3f]. PID activated.",
+                    target_ori_.w(), target_ori_.x(), target_ori_.y(), target_ori_.z(),
+                    current_hand_ori_.w(), current_hand_ori_.x(), current_hand_ori_.y(), current_hand_ori_.z());
+            }
         }
     }
 }
@@ -416,6 +438,25 @@ void HandController::wristJacobianCallback(
     }
 }
 
+void HandController::gravityCallback(
+    const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+{
+    // 7 values: [sp, sr, sy, elbow, wrist_roll, wrist_pitch, wrist_yaw].
+    // Wrist joints are indices 4,5,6.
+    if (msg->data.size() < 7) return;
+    for (int j = 0; j < 3; ++j) {
+        double g = msg->data[4 + j];
+        if (std::isnan(g) || std::abs(g) > 20.0) return;  // sanity guard
+        wrist_gravity_(j) = g;
+    }
+    if (!gravity_received_) {
+        gravity_received_ = true;
+        RCLCPP_INFO(get_logger(),
+            "Wrist gravity FF (incl. hand): roll=%.2f pitch=%.2f yaw=%.2f N·m",
+            wrist_gravity_(0), wrist_gravity_(1), wrist_gravity_(2));
+    }
+}
+
 // ============================================================================
 // Control loop (50 Hz)
 // ============================================================================
@@ -427,8 +468,16 @@ void HandController::controlLoop()
     // Wrist orientation control — gated on FRESH feedback (~20 Hz).
     // Without this gate, 50 Hz control with 20 Hz feedback causes stale-Jacobian divergence.
     // Effective dt (dt_ × cycles) corrects integral starvation and derivative over-amplification.
+
+    // Gravity-hold wrist torque FIRST, then stepWristControl overrides with the full PID
+    // torque when fresh feedback is available. Prevents the wrist from free-falling under
+    // the hand mass when the orientation PID is frozen/absent — root cause of the
+    // ~1 Hz wrist droop/oscillation.
+    applyWristHold();
+
     wrist_cycles_since_step_++;
-    if (hand_ori_received_ && wrist_jac_received_ && hand_ori_fresh_ && wrist_jac_fresh_) {
+    if (has_ori_target_ && hand_ori_received_ && wrist_jac_received_
+        && hand_ori_fresh_ && wrist_jac_fresh_) {
         double effective_dt = dt_ * wrist_cycles_since_step_;
         stepWristControl(effective_dt);
         wrist_cycles_since_step_ = 0;
@@ -445,27 +494,24 @@ void HandController::controlLoop()
     // Finger impedance control (runs every cycle at 50 Hz)
     stepFingerControl();
 
-    // Publish 23-DOF command
+    // Publish torque command (TORQUE MODE): effort = τ, position = current (diagnostic)
     auto msg = sensor_msgs::msg::JointState();
     msg.header.stamp = this->now();
 
-    // Wrist joints (3) — publish fixed_ref + clamped_PID_offset
-    //   cmd = wrist_ref_(0,0,0) + wrist_offset_  (NOT wrist_act + offset!)
-    //   If we use act + offset, a drifted act drags the command with it.
-    //   Fixed reference ensures the servo always pulls toward the ready pose.
+    // Wrist joints (3) — torque τ_wrist = Jᵀ·(Kp·e + Ki·∫e + Kd·ė)
     for (int j = 0; j < n_wrist_; ++j) {
         msg.name.push_back(wrist_names_[j]);
-        msg.position.push_back(wrist_ref_(j) + wrist_offset_(j));
+        msg.position.push_back(actual_q_(j));
         msg.velocity.push_back(0.0);
-        msg.effort.push_back(0.0);
+        msg.effort.push_back(wrist_cmd_tau_(j));
     }
 
-    // Finger joints (20) — publish impedance-encoded position command
+    // Finger joints (6 active) — impedance torque τ = Kp·e + Kd·(0 − dq)
     for (int j = 0; j < n_fingers_; ++j) {
         msg.name.push_back(finger_names_[j]);
-        msg.position.push_back(finger_cmd_q_(j));
+        msg.position.push_back(actual_q_(n_wrist_ + j));
         msg.velocity.push_back(0.0);
-        msg.effort.push_back(0.0);
+        msg.effort.push_back(finger_cmd_tau_(j));
     }
 
     hand_cmd_pub_->publish(msg);
@@ -486,16 +532,26 @@ void HandController::controlLoop()
         const char* ori_mark = (ori_err >= 0 && ori_err < 0.04) ? "+" : "";
 
         // Finger positions (base joint per finger)
-        double f1 = actual_q_(n_wrist_ + 0);
-        double f2 = actual_q_(n_wrist_ + 4);
-        double f3 = actual_q_(n_wrist_ + 8);
-        double f4 = actual_q_(n_wrist_ + 12);
-        double f5 = actual_q_(n_wrist_ + 16);
+        // Inspire 6 active joints: thumb_yaw, thumb_pitch, index, middle, ring, pinky
+        double ty = actual_q_(n_wrist_ + 0);
+        double tp = actual_q_(n_wrist_ + 1);
+        double ix = actual_q_(n_wrist_ + 2);
+        double md = actual_q_(n_wrist_ + 3);
+        double rg = actual_q_(n_wrist_ + 4);
+        double pk = actual_q_(n_wrist_ + 5);
+        // DIAGNOSTIC: finger des targets (finger_des_q_)
+        double dty = finger_des_q_(0);
+        double dtp = finger_des_q_(1);
+        double dix = finger_des_q_(2);
 
-        printf("[Wrist] x=%.3f y=%.3f z=%.3f dR=%.2f dP=%.2f dY=%.2f err=%.3f%s | F1:%.2f F2:%.2f F3:%.2f F4:%.2f F5:%.2f\n",
+        printf("[Wrist] x=%.3f y=%.3f z=%.3f dR=%.2f dP=%.2f dY=%.2f err=%.3f%s "
+               "tauW=[%.2f %.2f %.2f] grav=[%.2f %.2f %.2f] "
+               "| Ty:%.2f(d%.2f) Tp:%.2f(d%.2f) Ix:%.2f(d%.2f) Md:%.2f Rg:%.2f Pk:%.2f\n",
             actual_ee_x_, actual_ee_y_, actual_ee_z_,
             rpy_rel(0), rpy_rel(1), rpy_rel(2), ori_err, ori_mark,
-            f1, f2, f3, f4, f5);
+            wrist_cmd_tau_(0), wrist_cmd_tau_(1), wrist_cmd_tau_(2),
+            wrist_gravity_(0), wrist_gravity_(1), wrist_gravity_(2),
+            ty, dty, tp, dtp, ix, dix, md, rg, pk);
         fflush(stdout);
     }
 }
@@ -516,6 +572,17 @@ Eigen::Vector3d HandController::orientationError(
     double w = q_err.w();
     double scale = (w >= 0.0) ? 2.0 : -2.0;
     return Eigen::Vector3d(scale * q_err.x(), scale * q_err.y(), scale * q_err.z());
+}
+
+void HandController::applyWristHold()
+{
+    // τ = g_wrist − kd_joint·dq — holds the wrist against gravity every cycle.
+    // stepWristControl (when it runs) overwrites this with the full PID torque.
+    Eigen::Vector3d tau = wrist_gravity_ - wrist_joint_damping_ * actual_dq_.head<3>();
+    for (int j = 0; j < n_wrist_; ++j) {
+        tau(j) = std::max(-tau_max_wrist_, std::min(tau_max_wrist_, tau(j)));
+    }
+    wrist_cmd_tau_ = tau;
 }
 
 void HandController::stepWristControl(double dt)
@@ -568,40 +635,18 @@ void HandController::stepWristControl(double dt)
     wrist_prev_error_ = error_ori;
     wrist_first_ = false;
 
-    // Clamp task velocity
-    double speed = task_vel.norm();
-    if (speed > wrist_vel_limit_) task_vel *= wrist_vel_limit_ / speed;
-
-    // 3. Solve: dq_wrist = J⁻¹ * task_vel
-    Eigen::Vector3d dq_wrist;
-    double det = wrist_jacobian_.determinant();
-    if (std::abs(det) > 1e-4) {
-        dq_wrist = wrist_jacobian_.colPivHouseholderQr().solve(task_vel);
-    } else {
-        // Singular fallback: damped pseudoinverse
-        Eigen::Matrix3d JJt = wrist_jacobian_ * wrist_jacobian_.transpose();
-        JJt.diagonal().array() += 1e-2;
-        dq_wrist = wrist_jacobian_.transpose() * JJt.ldlt().solve(task_vel);
-    }
-
-    // 4. Velocity and delta clamping
-    double dq_norm = dq_wrist.lpNorm<Eigen::Infinity>();
-    if (dq_norm > wrist_vel_limit_) dq_wrist *= wrist_vel_limit_ / dq_norm;
+    // 3. TORQUE OUTPUT:
+    //    tau_wrist = J^T·(task torque) + g_wrist − kd_joint·dq
+    //    The gravity term holds the hand mass (otherwise the wrist droops ~1.4 rad);
+    //    the joint-space damping kills the ~1 Hz underdamped oscillation.
+    Eigen::Vector3d tau_wrist =
+        wrist_jacobian_.transpose() * task_vel
+        + wrist_gravity_
+        - wrist_joint_damping_ * actual_dq_.head<3>();
     for (int j = 0; j < n_wrist_; ++j) {
-        dq_wrist(j) = std::max(-wrist_vel_limit_, std::min(wrist_vel_limit_, dq_wrist(j)));
-        // Per-cycle delta limit
-        double delta = dq_wrist(j) * dt;
-        if (delta > wrist_delta_limit_)       dq_wrist(j) = wrist_delta_limit_ / dt;
-        else if (delta < -wrist_delta_limit_)  dq_wrist(j) = -wrist_delta_limit_ / dt;
+        tau_wrist(j) = std::max(-tau_max_wrist_, std::min(tau_max_wrist_, tau_wrist(j)));
     }
-
-    // 5. Integrate into wrist_offset_ (clamped, anti-windup).
-    //    Offset-based: wrist_cmd = wrist_ref_ + wrist_offset_ (NOT wrist_act + offset).
-    for (int j = 0; j < n_wrist_; ++j) {
-        wrist_offset_(j) += dq_wrist(j) * dt;
-        wrist_offset_(j) = std::max(-wrist_offset_limit_,
-                            std::min(wrist_offset_limit_, wrist_offset_(j)));
-    }
+    wrist_cmd_tau_ = tau_wrist;
 
 }
 
@@ -615,27 +660,13 @@ void HandController::stepFingerControl()
         int idx = n_wrist_ + j;
         double e = finger_des_q_(j) - actual_q_(idx);
 
-        // Impedance torque: τ = Kp·e + Kd·(0 − dq)
+        // Impedance torque: τ = Kp·e + Kd·(0 − dq) — direct torque output
         double tau = kp_finger_ * e + kd_finger_ * (-actual_dq_(idx));
         if (tau > tau_max_finger_)       tau = tau_max_finger_;
         else if (tau < -tau_max_finger_)  tau = -tau_max_finger_;
 
-        // Encode as position offset: q_cmd = des_q + τ / Kp_inner
-        double q_cmd = finger_des_q_(j) + tau / inner_servo_kp_;
-
-        // Per-cycle delta limit (safety)
-        double delta = q_cmd - actual_q_(idx);
-        if (delta > finger_delta_limit_)       q_cmd = actual_q_(idx) + finger_delta_limit_;
-        else if (delta < -finger_delta_limit_)   q_cmd = actual_q_(idx) - finger_delta_limit_;
-
-        // Anti-penetration: cap closing-direction command to actual + lead
-        bool closing = (finger_des_q_(j) > actual_q_(idx));
-        if (closing) {
-            double max_cmd = actual_q_(idx) + 1.0;  // lead=1.0 rad
-            if (q_cmd > max_cmd) q_cmd = max_cmd;
-        }
-
-        finger_cmd_q_(j) = q_cmd;
+        finger_cmd_tau_(j) = tau;
+        finger_cmd_q_(j) = actual_q_(idx);  // diagnostic: current position
     }
 }
 

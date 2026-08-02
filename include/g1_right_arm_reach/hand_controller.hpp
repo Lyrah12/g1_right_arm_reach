@@ -4,7 +4,7 @@
  *
  * Plan C: Arm-Hand fully decoupled.
  *   - Arm (reach_node): 4-DOF → wrist position
- *   - Hand (this node): 23-DOF → orientation + grasp
+ *   - Hand (this node): 9-DOF → orientation + grasp
  *
  * Control:
  *   Wrist:   orientation PID + MuJoCo numerical Jacobian (3×3) → joint positions
@@ -15,7 +15,7 @@
  * @subscribed /actual_hand_orientation  QuaternionStamped (world-frame palm orientation)
  * @subscribed /mujoco_wrist_jacobian    Float64MultiArray 3×3 (row-major)
  *
- * @published  /hand_commands            JointState, 23-DOF (wrist×3 + fingers×20)
+ * @published  /hand_commands            JointState, 9-DOF (wrist×3 + fingers×6)
  * @published  /debug/orientation_error  Float64 (rad)
  */
 
@@ -55,6 +55,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr ee_pose_sub_;
     rclcpp::Subscription<geometry_msgs::msg::QuaternionStamped>::SharedPtr hand_ori_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr wrist_jac_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr gravity_sub_;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr hand_cmd_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr ori_error_pub_;
@@ -64,6 +65,7 @@ private:
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
     void handOrientationCallback(const geometry_msgs::msg::QuaternionStamped::SharedPtr msg);
     void wristJacobianCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+    void gravityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void eePoseCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
     void controlLoop();
 
@@ -73,6 +75,10 @@ private:
 
     /// Orientation PID: error → task angular velocity → J⁻¹ → wrist_offset_ increment.
     void stepWristControl(double dt);
+
+    /// Gravity-hold wrist torque (every cycle): τ = g_wrist − kd_joint·dq.
+    /// Runs even when the orientation PID is frozen/absent so the wrist never free-falls.
+    void applyWristHold();
 
     /// Quaternion orientation error as axis-angle vector (3-DOF).
     static Eigen::Vector3d orientationError(const Eigen::Quaterniond& desired,
@@ -101,8 +107,8 @@ private:
     int n_total_{0};    // 23
 
     // --- Actual state (from /joint_states) ---
-    Eigen::VectorXd actual_q_;     // 23-DOF: wrist(3) + fingers(20)
-    Eigen::VectorXd actual_dq_;    // 23-DOF
+    Eigen::VectorXd actual_q_;     // 9-DOF: wrist(3) + fingers(6)
+    Eigen::VectorXd actual_dq_;    // 9-DOF
 
     // --- Wrist state ---
     Eigen::Vector3d target_ori_quat_vec_;  // [x, y, z, w] from HandCommand (unused w/ default)
@@ -138,6 +144,10 @@ private:
     bool wrist_first_{true};
     bool wrist_frozen_{false};  ///< hysteresis: true once error drops below 0.03, resets at >0.07
 
+    /// MuJoCo pure-gravity torque for the 3 wrist joints (incl. hand mass).
+    Eigen::Vector3d wrist_gravity_{0.0, 0.0, 0.0};
+    bool gravity_received_{false};
+
     /// Cache of last user quat (before composing with current palm).
     /// Used to detect repeated publishes from sequencer (avoid recomposition).
     Eigen::Quaterniond last_user_ori_{0.0, 0.0, 0.0, 0.0};
@@ -145,10 +155,15 @@ private:
     int wrist_cycles_since_step_{0};  ///< cycles since last wrist step → effective dt = dt_ * count
 
     // --- Finger state ---
-    Eigen::VectorXd finger_target_q_;   // 20-DOF target (from grasp pattern)
-    Eigen::VectorXd finger_des_q_;      // 20-DOF desired (set to target on grasp cmd, held for impedance)
-    Eigen::VectorXd finger_cmd_q_;      // 20-DOF actual command (des_q + impedance offset)
-    Eigen::VectorXd finger_effort_;     // 20-DOF joint torque from /joint_states effort (N·m)
+    Eigen::VectorXd finger_target_q_;   // n_fingers target (from grasp pattern)
+    Eigen::VectorXd finger_des_q_;      // n_fingers desired (set to target on grasp cmd, held for impedance)
+    Eigen::VectorXd finger_cmd_q_;      // n_fingers actual position (diagnostic)
+    Eigen::VectorXd finger_effort_;     // n_fingers joint torque from /joint_states effort (N·m)
+
+    // --- Torque output (torque mode) ---
+    Eigen::Vector3d wrist_cmd_tau_{0.0, 0.0, 0.0};   // wrist joint torque command (N·m)
+    Eigen::VectorXd finger_cmd_tau_;                 // finger joint torque command (N·m)
+    double tau_max_wrist_{13.4};                     // ±max wrist torque (5010: 13.4 N·m)
 
     std::string current_grasp_type_;
 
@@ -156,9 +171,10 @@ private:
     double dt_{0.02};
 
     // --- Control gains (overridden by params.yaml) ---
-    double kp_wrist_{2.0};
+    double kp_wrist_{3.5};
     double ki_wrist_{0.05};
-    double kd_wrist_{0.12};
+    double kd_wrist_{0.8};
+    double wrist_joint_damping_{0.6};   // joint-space velocity damping (N·m·s/rad)
     double wrist_vel_limit_{3.0};
     double wrist_delta_limit_{0.12};
 

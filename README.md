@@ -1,4 +1,4 @@
-# Unitree G1 右臂 + Wuji 灵巧手 控制
+# Unitree G1 右臂 + Inspire RH56 灵巧手 控制
 
 <p align="center">
   <img src="https://img.shields.io/badge/ROS2-Jazzy-22314E?logo=ros" alt="ROS 2">
@@ -11,7 +11,7 @@
 
 ---
 
-**`g1_right_arm_reach`** 是一个 ROS2 软件包，用于在 MuJoCo 仿真中控制 Unitree G1 人形机器人的右臂和五指灵巧手（Wuji Hand 2）。实现了完全解耦的**臂手架构**：手臂通过阻尼伪逆 IK 负责 4 自由度腕部定位，手部模块独立管理 3 自由度腕部朝向和 20 自由度手指抓取——共计 **27 个自由度**。
+**`g1_right_arm_reach`** 是一个 ROS2 软件包，用于在 MuJoCo 仿真中控制 Unitree G1 人形机器人的右臂和因时 Inspire RH56 灵巧手。实现了**力矩级**、完全解耦的**臂手架构**：手臂通过阻尼伪逆 IK 负责 4 自由度腕部定位，手部模块独立管理 3 自由度腕部朝向（5010 手腕）和 6 自由度手指抓取（RH56 欠驱动：6 主动 + 6 equality 耦合从动）。**PID 输出力矩 τ**（MIT 模式），与实物 G1 底层 `LowCmd` 接口一致。
 
 ## 架构
 
@@ -35,7 +35,7 @@
 │   │  → 腕部位置              │   │  手指阻抗控制 (20-DOF)       │   │
 │   │                         │   │  GraspLibrary (15 种模式)    │   │
 │   │     /joint_commands     │   │     /hand_commands          │   │
-│   │     (4-DOF 手臂)        │   │     (23-DOF: 腕部+手指)      │   │
+│   │     (4-DOF 手臂)        │   │     (9-DOF hand: 腕部+手指)      │   │
 │   └────────────┬────────────┘   └──────────────┬──────────────┘   │
 └───────────────┼────────────────────────────────┼──────────────────┘
                 └────────────────┬───────────────┘
@@ -73,7 +73,7 @@
                          finger4×4 ─── 无名指 (4 关节)
                          finger5×4 ─── 小指 (4 关节)
 
-  /joint_commands (4-DOF)            │  /hand_commands (23-DOF)
+  /joint_commands (4-DOF)            │  /hand_commands (9-DOF hand)
 ```
 
 **核心思想：** 手臂模块只管腕部在三维空间中的*位置*，手部模块接管腕部以下的所有内容——朝向、手指姿态和抓取执行。这使得系统**不依赖特定手部模型**。
@@ -82,16 +82,16 @@
 
 | 属性 | 值 |
 |-----------|-------|
-| 型号 | Wuji Hand 2（5 根独立驱动手指） |
-| 手指自由度 | 5 × 4 = **20-DOF** |
-| 腕部自由度 | roll + pitch + yaw = **3-DOF** |
-| 手部合计 | **23-DOF** |
-| 手臂自由度 | 肩部×3 + 肘部 = **4-DOF** |
-| **系统总计** | **27-DOF** |
+| 型号 | 因时 Inspire RH56（5 指欠驱动） |
+| 主动手指自由度 | **6-DOF**（拇指 yaw/pitch + 四指 proximal） |
+| 从动耦合自由度 | **6-DOF**（equality 刚性耦合：拇指 1.6×/2.4×，四指 1:1） |
+| 腕部自由度 | roll + pitch + yaw = **3-DOF**（5010，pitch/yaw ±13.4 N·m） |
+| 手部控制 | **9-DOF**（腕 3 + 主动手指 6），力矩输出 |
+| 手臂自由度 | 肩部×3 + 肘部 = **4-DOF**（力矩） |
 
 ## 特性
 
-- **臂手解耦架构** —— 4-DOF 手臂 IK + 23-DOF 手部控制，模块完全独立
+- **臂手解耦架构** —— 4-DOF 手臂 IK + 9-DOF hand 手部控制，模块完全独立
 - **阻尼伪逆 IK** —— 4-DOF → 3-DOF，自适应阻尼 + 零空间姿态吸引
 - **腕部朝向 PID** —— MuJoCo 3×3 数值 Jacobian（避免 URDF FK 模型不匹配）
 - **手指阻抗控制** —— 位置编码力矩，直接跳变 + 阻抗控制器过渡
@@ -136,15 +136,14 @@ mkdir -p ~/deps && cd ~/deps
 git clone https://github.com/unitreerobotics/unitree_ros.git
 git clone https://github.com/unitreerobotics/unitree_mujoco.git
 
-# Wuji Hand 2 模型
-git clone https://github.com/wuji-technology/wuji-hand-description.git
+# Inspire RH56 手模型已随包提交（config/inspire_hand/，无需克隆）
 ```
 
-### 3. 配置 Wuji Hand 场景
+### 3. 配置 Inspire RH56 场景
 
 ```bash
-# 复制并修补 MJCF 文件，将 Wuji Hand 注入 G1 场景
-bash ~/g1_ws/src/g1_right_arm_reach/scripts/setup_wuji_hand.sh
+# 复制并修补 MJCF 文件，将 Inspire RH56 注入 G1 场景
+bash ~/g1_ws/src/g1_right_arm_reach/scripts/setup_inspire_hand.sh
 ```
 
 ### 4. 编译
@@ -162,7 +161,7 @@ source install/setup.bash
 # 终端 1：启动 MuJoCo 仿真及可视化窗口
 ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
   urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf \
-  scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_wuji_scene.xml \
+  scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_inspire_scene.xml \
   viewer:=true
 ```
 
@@ -368,7 +367,7 @@ $$q_{cmd} = q_{des} + \frac{\tau_{des}}{k_p^{inner}} \quad \text{(位置编码�
 | `/target_point` | `Point` | sequencer → reach_node | 3-DOF 肩部相对位置 |
 | `/hand_command` | `HandCommand` | sequencer → hand_controller | 朝向四元数 + 抓取类型 |
 | `/joint_commands` | `JointState` | reach_node → bridge | 4-DOF 手臂 |
-| `/hand_commands` | `JointState` | hand_controller → bridge | 23-DOF（腕部×3 + 手指×20） |
+| `/hand_commands` | `JointState` | hand_controller → bridge | 9-DOF hand（腕部×3 + 手指×20） |
 | `/joint_states` | `JointState` | bridge → 各节点 | 全 27-DOF 反馈 |
 | `/actual_ee_pose` | `PointStamped` | bridge → reach_node | 腕部位置（世界坐标系） |
 | `/actual_hand_orientation` | `QuaternionStamped` | bridge → hand_controller | 手掌朝向（世界坐标系） |
@@ -393,13 +392,13 @@ g1_right_arm_reach/
 │   ├── pid_controller.cpp
 │   ├── reach_node.cpp            # 手臂 IK 节点 (50 Hz, 4-DOF → 3-DOF)
 │   ├── grasp_library.cpp         # 抓取模式定义
-│   ├── hand_controller_node.cpp  # 手部控制节点 (50 Hz, 23-DOF)
+│   ├── hand_controller_node.cpp  # 手部控制节点 (50 Hz, 9-DOF hand)
 │   ├── action_sequencer_node.cpp # 动作编排节点 (50 Hz)
 │   └── target_publisher_node.cpp # 测试工具
 ├── scripts/
 │   ├── mujoco_bridge_node.py     # MuJoCo 物理桥接 (200 Hz)
-│   ├── inject_wuji_hand.py       # Wuji Hand MJCF 注入器
-│   ├── setup_wuji_hand.sh        # Wuji Hand 一键配置
+│   ├── inject_wuji_hand.py       # Inspire RH56 MJCF 注入器
+│   ├── setup_inspire_hand.sh        # Inspire RH56 一键配置
 │   ├── action_cli.py             # 统一命令行工具
 │   └── plot_error.py             # 误差绘图工具
 ├── msg/
@@ -415,7 +414,7 @@ g1_right_arm_reach/
 ├── config/
 │   ├── params.yaml               # 全部运行时参数
 │   ├── g1_grasp_scene.xml        # MJCF: G1 + 简易夹爪
-│   └── g1_wuji_scene.xml         # MJCF: G1 + Wuji Hand 2
+│   └── g1_inspire_scene.xml         # MJCF: G1 + Inspire RH56
 ├── launch/
 │   └── mujoco_demo.launch.py     # 启动全部节点
 ├── test/
@@ -433,6 +432,6 @@ g1_right_arm_reach/
 | 运动学 | ✅ | Pinocchio FK/IK、阻尼伪逆 |
 | 物理仿真 | ✅ | MuJoCo 重力/接触/数值 Jacobian |
 | 位置控制 | ✅ | 4+23 DOF 臂手解耦 (Plan C) |
-| 灵巧手 | ✅ | Wuji Hand 2、15 种抓取模式、CLI |
+| 灵巧手 | ✅ | Inspire RH56、15 种抓取模式、CLI |
 | 视觉集成 | 📋 | 检测 → 目标 → 自主抓取闭环 |
 | 实物部署 | 🔮 | G1 真实机器人 + Unitree SDK |

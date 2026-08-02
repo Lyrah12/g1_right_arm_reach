@@ -1,0 +1,18 @@
+<!-- Inspire RH56 right hand — mesh assets (auto-generated). Paths relative to this file's dir. -->
+<mujoco>
+  <asset>
+    <mesh name="Link11_R" content_type="model/stl" file="inspire_hand/meshes/Link11_R.STL"/>
+    <mesh name="Link12_R" content_type="model/stl" file="inspire_hand/meshes/Link12_R.STL"/>
+    <mesh name="Link13_R" content_type="model/stl" file="inspire_hand/meshes/Link13_R.STL"/>
+    <mesh name="Link14_R" content_type="model/stl" file="inspire_hand/meshes/Link14_R.STL"/>
+    <mesh name="Link15_R" content_type="model/stl" file="inspire_hand/meshes/Link15_R.STL"/>
+    <mesh name="Link16_R" content_type="model/stl" file="inspire_hand/meshes/Link16_R.STL"/>
+    <mesh name="Link17_R" content_type="model/stl" file="inspire_hand/meshes/Link17_R.STL"/>
+    <mesh name="Link18_R" content_type="model/stl" file="inspire_hand/meshes/Link18_R.STL"/>
+    <mesh name="Link19_R" content_type="model/stl" file="inspire_hand/meshes/Link19_R.STL"/>
+    <mesh name="Link20_R" content_type="model/stl" file="inspire_hand/meshes/Link20_R.STL"/>
+    <mesh name="Link21_R" content_type="model/stl" file="inspire_hand/meshes/Link21_R.STL"/>
+    <mesh name="Link22_R" content_type="model/stl" file="inspire_hand/meshes/Link22_R.STL"/>
+    <mesh name="R_hand_base_link" content_type="model/stl" file="inspire_hand/meshes/R_hand_base_link.STL"/>
+  </asset>
+</mujoco>

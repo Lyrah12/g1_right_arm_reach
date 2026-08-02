@@ -1,25 +1,21 @@
 /**
  * @file grasp_library.cpp
- * @brief 15 pre-defined grasp patterns for Wuji Hand 2 (20-DOF).
+ * @brief 15 pre-defined grasp patterns for Inspire RH56 hand (6 active joints).
  *
- * Joint naming: right_fingerN_jointM (N=1..5, M=1..4)
+ * RH56 underactuation: 6 active motors -> 12 joints.
+ *   Active (commanded):  thumb_yaw, thumb_pitch, index/middle/ring/pinky proximal
+ *   Slave (equality-coupled, follow automatically):
+ *     thumb_intermediate = 1.6×thumb_pitch, thumb_distal = 2.4×thumb_pitch
+ *     index/middle/ring/pinky intermediate = 1.0×proximal
  *
- *   Joint ranges (Wuji Hand right.xml):
- *     Thumb (finger1): j1 [ 0.05, 1.60]  j2 [−0.14, 0.93]  j3 [−0.46, 1.56]  j4 [−0.47, 1.56]
- *     Fingers 2–5:    j1 [−0.16, 1.56]  j2 [−0.37, 0.37]  j3 [−0.48, 1.55]  j4 [−0.47, 1.57]
+ *   Joint ranges (DFQ right hand URDF):
+ *     thumb_yaw   [-0.10, 1.30]  (abduction/opposition)
+ *     thumb_pitch [-0.10, 0.60]  (flexion)
+ *     fingers     [ 0.00, 1.70]  (flexion; 0 = extended)
  *
- *   ALL joints rotate around local Y axis (axis="0 1 0").
- *   Positive = flex (curl toward palm).  Negative = extend (straighten / hyperextend).
- *
- *   Thumb key insight:
- *     j2 > 0 → abducts thumb across palm toward other fingers.
- *     j2 > 0.5 → thumb penetrates THROUGH index finger (no contact sensing in sim).
- *     j3/j4 > 0 → curls thumb tip (wraps around object / over fingers).
- *     j3/j4 < 0 → keeps thumb straight (useful for open/pinch, NOT for fist).
- *     For a fist: moderate j2=0.45 + slight curl j3/j4≈0.3/0.2 → thumb wraps OVER index.
- *
- * Adding a new pattern: add a function makePattern_<name>() and
- * register it in initBuiltinPatterns().
+ * A "curl" on a finger only needs its proximal joint set — the intermediate
+ * phalanx follows at 1:1 (the real hand's linkage). Grasp targets here are
+ * POSITIONS for the finger impedance controller (τ = Kp·(q_des − q)).
  */
 
 #include "g1_right_arm_reach/grasp_library.hpp"
@@ -27,37 +23,32 @@
 namespace g1_right_arm_reach {
 
 // ============================================================================
-// Helpers
+// Joint name helpers (6 active Inspire joints)
 // ============================================================================
 
 namespace {
 
-std::string fingerJoint(int finger, int joint) {
-    return "right_finger" + std::to_string(finger) + "_joint" + std::to_string(joint);
+constexpr const char* J_TY = "R_thumb_proximal_yaw_joint";
+constexpr const char* J_TP = "R_thumb_proximal_pitch_joint";
+constexpr const char* J_IX = "R_index_proximal_joint";
+constexpr const char* J_MD = "R_middle_proximal_joint";
+constexpr const char* J_RG = "R_ring_proximal_joint";
+constexpr const char* J_PK = "R_pinky_proximal_joint";
+
+/// All 6 joints default to 0 (extended), then override the named ones.
+std::map<std::string, double> pose(
+    double ty, double tp, double ix, double md, double rg, double pk)
+{
+    return {
+        {J_TY, ty}, {J_TP, tp},
+        {J_IX, ix}, {J_MD, md}, {J_RG, rg}, {J_PK, pk},
+    };
 }
 
-/// Set all 20 finger joints to uniform values.
-std::map<std::string, double> uniformGrasp(
-    double mcp, double abd, double pip, double dip)
+/// Four fingers curled to the same value, thumb explicit.
+std::map<std::string, double> curl(double fingers, double ty, double tp)
 {
-    std::map<std::string, double> j;
-    for (int f = 1; f <= 5; ++f) {
-        j[fingerJoint(f, 1)] = mcp;
-        j[fingerJoint(f, 2)] = abd;
-        j[fingerJoint(f, 3)] = pip;
-        j[fingerJoint(f, 4)] = dip;
-    }
-    return j;
-}
-
-/// Set a single finger's 4 joints.
-void setFinger(std::map<std::string, double>& j,
-    int finger, double j1, double j2, double j3, double j4)
-{
-    j[fingerJoint(finger, 1)] = j1;
-    j[fingerJoint(finger, 2)] = j2;
-    j[fingerJoint(finger, 3)] = j3;
-    j[fingerJoint(finger, 4)] = j4;
+    return pose(ty, tp, fingers, fingers, fingers, fingers);
 }
 
 }  // namespace
@@ -67,202 +58,141 @@ void setFinger(std::map<std::string, double>& j,
 // ============================================================================
 
 static GraspPattern makePattern_open() {
-    auto j = uniformGrasp(0.0, 0.0, 0.0, 0.0);
-    j["right_finger1_joint1"] = 0.05;  // thumb j1 min range
-    return {"open", "All fingers fully extended", j};
+    return {"open", "All fingers extended (rest)", pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)};
 }
 
 static GraspPattern makePattern_close() {
-    std::map<std::string, double> j;
-    // Thumb curls over index finger (self-collision disabled in sim, visual only)
-    setFinger(j, 1, 0.6, 0.25, 0.7, 0.6);
-    // Fingers 2–5 — full fist
-    for (int f = 2; f <= 5; ++f)
-        setFinger(j, f, 1.5, 0.0, 1.5, 1.5);
-    return {"close", "Full fist — thumb curled over index finger", j};
+    // Full fist — 4 fingers fully curled, thumb abducted + flexed over them
+    return {"close", "Full fist — thumb over curled fingers",
+            curl(1.5, 0.35, 0.5)};
 }
 
 static GraspPattern makePattern_home() {
-    // Fingers 2–5: semi-grasp
-    auto j = uniformGrasp(0.8, 0.0, 0.7, 0.6);
-    // Thumb: slightly abducted (j2=0.3), relaxed curl
-    setFinger(j, 1, 0.6, 0.3, 0.5, 0.4);
-    return {"home", "Neutral semi-grasp (default rest pose)", j};
+    // Natural semi-grasp (default rest)
+    // thumb_pitch 0.35→0.25: 抬高拇指避免碰食指（与桥接 hand_ready_pose 一致）
+    return {"home", "Neutral semi-grasp", curl(0.8, 0.25, 0.25)};
 }
 
 static GraspPattern makePattern_pinch() {
-    // ALL fingers start OPEN; only thumb + index move
-    auto j = uniformGrasp(0.0, 0.0, 0.0, 0.0);
-    j["right_finger1_joint1"] = 0.05;
-    // Thumb — abduct (j2=0.6) toward index, flex to meet tip
-    setFinger(j, 1, 0.7, 0.6, 1.1, 0.9);
-    // Index — curl to meet thumb tip
-    setFinger(j, 2, 0.9, 0.0, 1.1, 0.9);
-    // Middle, ring, pinky — remain at 0 (open) from uniformGrasp
-    return {"pinch", "Precision pinch — thumb + index tip-to-tip (others open)", j};
+    // Precision pinch — thumb + index tip-to-tip (others open)
+    return {"pinch", "Precision pinch — thumb + index (others open)",
+            pose(0.55, 0.5, 1.0, 0.0, 0.0, 0.0)};
 }
 
 static GraspPattern makePattern_tripod() {
-    auto j = uniformGrasp(0.0, 0.0, 0.0, 0.0);
-    j["right_finger1_joint1"] = 0.05;
-    setFinger(j, 1, 0.7, 0.5, 1.1, 0.9);   // thumb
-    setFinger(j, 2, 0.9, 0.0, 1.1, 0.9);   // index
-    setFinger(j, 3, 0.9, 0.0, 1.1, 0.9);   // middle
-    // Ring + pinky — open
-    return {"tripod", "Tripod — thumb + index + middle (others open)", j};
+    // Thumb + index + middle
+    return {"tripod", "Tripod — thumb + index + middle (others open)",
+            pose(0.5, 0.5, 0.95, 0.95, 0.0, 0.0)};
 }
 
 static GraspPattern makePattern_three_finger() {
-    auto j = uniformGrasp(0.0, 0.0, 0.0, 0.0);
-    j["right_finger1_joint1"] = 0.05;
-    setFinger(j, 1, 0.7, 0.5, 1.0, 0.8);   // thumb
-    setFinger(j, 2, 0.9, 0.0, 1.0, 0.8);   // index
-    setFinger(j, 3, 0.9, 0.0, 1.0, 0.8);   // middle
-    // Ring + pinky — open
-    return {"three_finger", "Three-finger — thumb + index + middle (others open)", j};
+    return {"three_finger", "Three-finger — thumb + index + middle (others open)",
+            pose(0.5, 0.45, 0.9, 0.9, 0.0, 0.0)};
 }
 
 static GraspPattern makePattern_power_grasp() {
-    std::map<std::string, double> j;
-    // Thumb — minimal abduction + deep curl to wrap over fingers
-    setFinger(j, 1, 0.6, 0.25, 0.7, 0.6);
-    // Fingers 2–5 — full wrap
-    for (int f = 2; f <= 5; ++f)
-        setFinger(j, f, 1.4, 0.0, 1.4, 1.4);
-    return {"power_grasp", "Power grasp — thumb curled over wrapped fingers", j};
+    // Power wrap — all fingers curled, thumb wraps over
+    return {"power_grasp", "Power grasp — thumb over wrapped fingers",
+            curl(1.5, 0.4, 0.55)};
 }
 
 static GraspPattern makePattern_hook_grasp() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 0.8, 0.0, 1.2, 1.2);
-    // Fingers 2–5 — MCP extended, PIP+DIP flexed (hook)
-    for (int f = 2; f <= 5; ++f)
-        setFinger(j, f, 0.0, 0.0, 1.5, 1.5);
-    return {"hook_grasp", "Hook grip — PIP+DIP flexed for pulling/carrying", j};
+    // Hook — moderate proximal curl (carry/hook); thumb slightly flexed
+    return {"hook_grasp", "Hook grip — fingers curled for carrying",
+            curl(1.0, 0.2, 0.4)};
 }
 
 static GraspPattern makePattern_spherical_grasp() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 1.0, 0.3, 1.0, 1.0);
-    setFinger(j, 2, 1.2,  0.3, 1.2, 1.0);
-    setFinger(j, 3, 1.2,  0.1, 1.2, 1.0);
-    setFinger(j, 4, 1.2, -0.1, 1.2, 1.0);
-    setFinger(j, 5, 1.2, -0.3, 1.2, 1.0);
-    return {"spherical_grasp", "Spherical grasp — fingers spread for round objects", j};
+    // Spherical — fingers spread via thumb opposition + uniform curl
+    return {"spherical_grasp", "Spherical grasp — spread for round objects",
+            curl(1.2, 0.5, 0.5)};
 }
 
 static GraspPattern makePattern_cylindrical_grasp() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 0.8, 0.5, 1.2, 1.0);
-    for (int f = 2; f <= 5; ++f)
-        setFinger(j, f, 1.2, 0.0, 1.2, 1.0);
-    return {"cylindrical_grasp", "Cylindrical grasp — uniform curl for bottles/cups", j};
+    // Cylindrical — uniform curl
+    return {"cylindrical_grasp", "Cylindrical grasp — uniform curl",
+            curl(1.2, 0.35, 0.5)};
 }
 
 static GraspPattern makePattern_lateral_pinch() {
-    auto j = uniformGrasp(0.0, 0.0, 0.0, 0.0);
-    j["right_finger1_joint1"] = 0.05;
-    setFinger(j, 1, 0.9, 0.8, 1.0, 0.8);   // thumb — adducted against index side
-    setFinger(j, 2, 0.6, 0.0, 1.0, 1.0);   // index
-    // Others — open
-    return {"lateral_pinch", "Lateral (key) pinch — thumb against index side", j};
+    // Key pinch — thumb adducts to index side, index curled
+    return {"lateral_pinch", "Lateral (key) pinch — thumb against index side",
+            pose(0.9, 0.4, 0.8, 0.0, 0.0, 0.0)};
 }
 
 static GraspPattern makePattern_point() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 1.5, 0.0, 1.5, 1.5);
-    setFinger(j, 2, 0.0, 0.0, 0.0, 0.0);   // index — extended
-    for (int f = 3; f <= 5; ++f)
-        setFinger(j, f, 1.5, 0.0, 1.5, 1.5);
-    return {"point", "Pointing — index extended, others closed", j};
+    // Pointing — index extended (0), others curled
+    return {"point", "Pointing — index extended, others closed",
+            pose(0.3, 0.5, 0.0, 1.4, 1.4, 1.4)};
 }
 
 static GraspPattern makePattern_thumbs_up() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 0.3, 0.9, 0.0, 0.0);   // thumb — extended upward
-    for (int f = 2; f <= 5; ++f)
-        setFinger(j, f, 1.5, 0.0, 1.5, 1.5);
-    return {"thumbs_up", "Thumbs up — thumb extended, fingers closed", j};
+    // Thumb extended up, fingers closed
+    return {"thumbs_up", "Thumbs up — thumb extended, fingers closed",
+            pose(0.5, 0.0, 1.4, 1.4, 1.4, 1.4)};
 }
 
 static GraspPattern makePattern_peace_sign() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 1.2, 0.0, 1.2, 1.2);
-    setFinger(j, 2, 0.0, 0.2,  0.0, 0.0);   // index — extended + splayed
-    setFinger(j, 3, 0.0, -0.2, 0.0, 0.0);   // middle — extended + splayed
-    for (int f = 4; f <= 5; ++f)
-        setFinger(j, f, 1.5, 0.0, 1.5, 1.5);
-    return {"peace_sign", "Peace / V sign — index+middle extended", j};
+    // Index + middle extended, ring + pinky curled
+    return {"peace_sign", "Peace / V sign — index+middle extended",
+            pose(0.3, 0.4, 0.0, 0.0, 1.4, 1.4)};
 }
 
 static GraspPattern makePattern_trigger() {
-    std::map<std::string, double> j;
-    setFinger(j, 1, 1.2, 0.0, 1.2, 1.2);
-    setFinger(j, 2, 0.0, 0.0, 0.0, 1.2);   // index — extended, only DIP flexed
-    for (int f = 3; f <= 5; ++f)
-        setFinger(j, f, 1.5, 0.0, 1.5, 1.5);
-    return {"trigger", "Trigger finger — index DIP flexed for pressing", j};
+    // Index slightly curled (trigger), others closed
+    return {"trigger", "Trigger finger — index slightly flexed",
+            pose(0.3, 0.5, 0.5, 1.3, 1.3, 1.3)};
 }
 
 // ============================================================================
-// Constructor — register all built-in patterns
+// GraspLibrary core methods
 // ============================================================================
 
-GraspLibrary::GraspLibrary()
-{
+GraspLibrary::GraspLibrary() {
     initBuiltinPatterns();
 }
 
-void GraspLibrary::initBuiltinPatterns()
-{
+void GraspLibrary::registerPattern(const GraspPattern& pattern) {
+    patterns_[pattern.name] = pattern;
+}
+
+GraspPattern GraspLibrary::getPattern(const std::string& name) const {
+    auto it = patterns_.find(name);
+    if (it != patterns_.end()) return it->second;
+    return GraspPattern{};  // empty name → "not found"
+}
+
+std::vector<std::string> GraspLibrary::listPatterns() const {
+    std::vector<std::string> names;
+    names.reserve(patterns_.size());
+    for (const auto& kv : patterns_) names.push_back(kv.first);
+    return names;
+}
+
+bool GraspLibrary::hasPattern(const std::string& name) const {
+    return patterns_.count(name) > 0;
+}
+
+// ============================================================================
+// Registry
+// ============================================================================
+
+void GraspLibrary::initBuiltinPatterns() {
     registerPattern(makePattern_open());
     registerPattern(makePattern_close());
     registerPattern(makePattern_home());
     registerPattern(makePattern_pinch());
     registerPattern(makePattern_tripod());
+    registerPattern(makePattern_three_finger());
     registerPattern(makePattern_power_grasp());
     registerPattern(makePattern_hook_grasp());
     registerPattern(makePattern_spherical_grasp());
     registerPattern(makePattern_cylindrical_grasp());
     registerPattern(makePattern_lateral_pinch());
-    registerPattern(makePattern_three_finger());
     registerPattern(makePattern_point());
     registerPattern(makePattern_thumbs_up());
     registerPattern(makePattern_peace_sign());
     registerPattern(makePattern_trigger());
-}
-
-// ============================================================================
-// Public API
-// ============================================================================
-
-GraspPattern GraspLibrary::getPattern(const std::string& name) const
-{
-    auto it = patterns_.find(name);
-    if (it != patterns_.end()) {
-        return it->second;
-    }
-    return GraspPattern{};
-}
-
-std::vector<std::string> GraspLibrary::listPatterns() const
-{
-    std::vector<std::string> names;
-    names.reserve(patterns_.size());
-    for (const auto& [name, _] : patterns_) {
-        names.push_back(name);
-    }
-    return names;
-}
-
-bool GraspLibrary::hasPattern(const std::string& name) const
-{
-    return patterns_.find(name) != patterns_.end();
-}
-
-void GraspLibrary::registerPattern(const GraspPattern& pattern)
-{
-    patterns_[pattern.name] = pattern;
 }
 
 }  // namespace g1_right_arm_reach

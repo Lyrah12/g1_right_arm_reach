@@ -1,0 +1,160 @@
+<!--
+  g1_inspire_scene.xml — G1 + 5010 wrist + Inspire RH56 hand 复合仿真场景
+  =====================================================================
+  前置条件 (WSL2):
+    bash scripts/setup_inspire_hand.sh
+
+  架构:
+    - G1 29-DOF 基础 MJCF（右臂腕 pitch/yaw 补丁为 5010 ±13.4 N·m）
+    - Inspire RH56 手注入到 right_wrist_yaw_link（6 主动 + 6 equality 耦合从动）
+    - 控制: 力矩模式（<motor> ctrl=τ），MIT 内环由关节 damping 近似
+    - 积分器: implicitfast（微小惯性手部关节必需）
+  =====================================================================
+-->
+<mujoco model="g1_inspire_scene">
+
+  <!-- ===================================================================== -->
+  <!-- 可视化选项                                                             -->
+  <!-- ===================================================================== -->
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <!-- ===================================================================== -->
+  <!-- G1 + Inspire（注入版，由 setup_inspire_hand.sh 生成到 G1 MJCF 目录）      -->
+  <!-- ===================================================================== -->
+  <include file="/home/lyrah/deps/unitree_ros_models/g1_description/g1_29dof_inspire.xml"/>
+
+  <!-- Inspire RH56 hand — mesh assets（相对路径，随包部署） -->
+  <include file="/home/lyrah/g1_ws/src/g1_right_arm_reach/config/inspire_hand_right_assets.xml"/>
+
+  <!-- ===================================================================== -->
+  <!-- 仿真选项: implicitfast + 2 ms（微小惯性手部关节必需）                    -->
+  <!-- ===================================================================== -->
+  <option integrator="implicitfast" timestep="0.002" gravity="0 0 -9.81"/>
+
+  <!-- ===================================================================== -->
+  <!-- 全局关节阻尼: 小值（手臂类自带 0.05；手部不设全局大阻尼）                  -->
+  <!-- ===================================================================== -->
+  <default>
+    <joint damping="0.05" armature="0.001"/>
+  </default>
+
+  <!-- ===================================================================== -->
+  <!-- 场景几何体                                                             -->
+  <!-- ===================================================================== -->
+  <worldbody>
+
+    <!-- 地面 -->
+    <geom name="scene_floor" type="plane" size="0 0 0.05"
+          friction="1.0 0.5 0.5"
+          rgba="0.8 0.8 0.8 1"/>
+
+    <!-- 光照 -->
+    <light name="sun" directional="true" pos="2 2 3" dir="-0.5 -0.5 -1"
+           diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+
+    <!-- 虚拟相机 -->
+    <camera name="head_cam"
+            pos="0.02 0 0.65"
+            xyaxes="1 0 0 0 0.7 0.7"
+            fovy="60"
+            resolution="640 480"/>
+
+    <!-- ================================================================= -->
+    <!-- 高脚小桌子（工业场景：桌面操作目标）                                 -->
+    <!-- ================================================================= -->
+    <body name="tall_table" pos="0.38 -0.22 0.0">
+      <geom name="table_leg_fl" type="cylinder" size="0.01 0.45"
+            pos="-0.035 -0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_fr" type="cylinder" size="0.01 0.45"
+            pos=" 0.035 -0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_bl" type="cylinder" size="0.01 0.45"
+            pos="-0.035  0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_leg_br" type="cylinder" size="0.01 0.45"
+            pos=" 0.035  0.035 0.45" rgba="0.55 0.35 0.15 1"/>
+      <geom name="table_top" type="box" size="0.05 0.05 0.015"
+            pos="0 0 0.915" rgba="0.65 0.42 0.18 1"
+            friction="0.8 0.5 0.3"
+            solref="0.02 1.0"
+            solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- 小纸箱（搬箱测试目标，密度 ~200 kg/m^3 约 60g，可被抓取） -->
+    <body name="target_box" pos="0.38 -0.22 0.95">
+      <freejoint/>
+      <geom name="box_geom" type="box" size="0.025 0.02 0.02"
+            density="200" friction="1.0 0.8 0.5"
+            solref="0.01 1.0" solimp="0.95 0.99 0.0005"
+            rgba="0.8 0.6 0.2 1"/>
+    </body>
+
+    <!-- 圆柱细长物体（取/插电缆类测试目标，半径 1cm 高 10cm） -->
+    <body name="target_cylinder" pos="0.42 -0.22 0.95">
+      <freejoint/>
+      <geom name="cylinder_geom" type="cylinder" size="0.010 0.05"
+            density="2000" friction="1.0 0.8 0.5"
+            solref="0.01 1.0" solimp="0.95 0.99 0.0005"
+            rgba="0.2 0.5 0.8 1"/>
+    </body>
+
+  </worldbody>
+
+  <!-- ===================================================================== -->
+  <!-- 执行器                                                                 -->
+  <!--   右臂 + 手腕 + 手: <motor> 力矩（bridge 写 ctrl=τ）                     -->
+  <!--   左臂 / 腿 / 腰: <position> 锁定初始位姿                                -->
+  <!-- ===================================================================== -->
+  <actuator>
+
+    <!-- ========== 右臂 7 关节（力矩）================== -->
+    <motor name="act_r_shoulder_pitch" joint="right_shoulder_pitch_joint" forcerange="-25 25"/>
+    <motor name="act_r_shoulder_roll"  joint="right_shoulder_roll_joint"  forcerange="-25 25"/>
+    <motor name="act_r_shoulder_yaw"   joint="right_shoulder_yaw_joint"   forcerange="-25 25"/>
+    <motor name="act_r_elbow"          joint="right_elbow_joint"          forcerange="-25 25"/>
+    <motor name="act_r_wrist_roll"     joint="right_wrist_roll_joint"     forcerange="-25 25"/>
+    <motor name="act_r_wrist_pitch"    joint="right_wrist_pitch_joint"    forcerange="-13.4 13.4"/>
+    <motor name="act_r_wrist_yaw"      joint="right_wrist_yaw_joint"      forcerange="-13.4 13.4"/>
+
+    <!-- ========== 手 6 主动关节（力矩）================== -->
+    <motor name="act_thumb_yaw"   joint="R_thumb_proximal_yaw_joint"   forcerange="-1.5 1.5"/>
+    <motor name="act_thumb_pitch" joint="R_thumb_proximal_pitch_joint" forcerange="-1.5 1.5"/>
+    <motor name="act_index_prox"  joint="R_index_proximal_joint"       forcerange="-1.5 1.5"/>
+    <motor name="act_middle_prox" joint="R_middle_proximal_joint"      forcerange="-1.5 1.5"/>
+    <motor name="act_ring_prox"   joint="R_ring_proximal_joint"        forcerange="-1.5 1.5"/>
+    <motor name="act_pinky_prox"  joint="R_pinky_proximal_joint"       forcerange="-1.5 1.5"/>
+
+    <!-- ========== 左臂 7 关节（锁定初始位姿）=========== -->
+    <position name="act_l_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="100" kv="5"/>
+    <position name="act_l_shoulder_roll"  joint="left_shoulder_roll_joint"  kp="100" kv="5"/>
+    <position name="act_l_shoulder_yaw"   joint="left_shoulder_yaw_joint"   kp="100" kv="5"/>
+    <position name="act_l_elbow"          joint="left_elbow_joint"          kp="100" kv="5"/>
+    <position name="act_l_wrist_roll"     joint="left_wrist_roll_joint"     kp="100" kv="5"/>
+    <position name="act_l_wrist_pitch"    joint="left_wrist_pitch_joint"    kp="30"  kv="2"/>
+    <position name="act_l_wrist_yaw"      joint="left_wrist_yaw_joint"      kp="30"  kv="2"/>
+
+    <!-- ========== 腰 3 关节（锁定）================== -->
+    <position name="act_waist_yaw"   joint="waist_yaw_joint"   kp="300" kv="20"/>
+    <position name="act_waist_roll"  joint="waist_roll_joint"  kp="300" kv="20"/>
+    <position name="act_waist_pitch" joint="waist_pitch_joint" kp="300" kv="20"/>
+
+    <!-- ========== 左腿 6 关节（锁定）================== -->
+    <position name="act_left_hip_pitch"   joint="left_hip_pitch_joint"   kp="600" kv="50"/>
+    <position name="act_left_hip_roll"    joint="left_hip_roll_joint"    kp="600" kv="50"/>
+    <position name="act_left_hip_yaw"     joint="left_hip_yaw_joint"     kp="600" kv="50"/>
+    <position name="act_left_knee"        joint="left_knee_joint"        kp="600" kv="50"/>
+    <position name="act_left_ankle_pitch" joint="left_ankle_pitch_joint" kp="600" kv="50"/>
+    <position name="act_left_ankle_roll"  joint="left_ankle_roll_joint"  kp="600" kv="50"/>
+
+    <!-- ========== 右腿 6 关节（锁定）================== -->
+    <position name="act_right_hip_pitch"   joint="right_hip_pitch_joint"   kp="600" kv="50"/>
+    <position name="act_right_hip_roll"    joint="right_hip_roll_joint"    kp="600" kv="50"/>
+    <position name="act_right_hip_yaw"     joint="right_hip_yaw_joint"     kp="600" kv="50"/>
+    <position name="act_right_knee"        joint="right_knee_joint"        kp="600" kv="50"/>
+    <position name="act_right_ankle_pitch" joint="right_ankle_pitch_joint" kp="600" kv="50"/>
+    <position name="act_right_ankle_roll"  joint="right_ankle_roll_joint"  kp="600" kv="50"/>
+
+  </actuator>
+
+</mujoco>

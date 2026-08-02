@@ -15,9 +15,14 @@ MuJoCo physics simulation launch — Plan C: Arm-Hand fully decoupled.
 
 Usage:
   ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
-    urdf_path:=${HOME}/deps/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf \
-    scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_wuji_scene.xml \
+    urdf_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_29dof_inspire.urdf \
+    scene_path:=${HOME}/g1_ws/src/g1_right_arm_reach/config/g1_inspire_scene.xml \
     viewer:=true
+
+  urdf_path MUST be the patched URDF (config/g1_29dof_inspire.urdf) — the stock
+  G1 URDF has no hand, so Pinocchio gravity FF would be ~0.5 N·m too weak (the
+  sim used to hide this by preferring MuJoCo gravity; reach_node now uses
+  Pinocchio only, so the URDF must carry the 5010 wrist + Inspire hand).
 """
 import os, re
 
@@ -41,7 +46,7 @@ def launch_setup(context, *args, **kwargs):
     if not urdf_path:
         raise RuntimeError("urdf_path:=/path/to/g1_29dof_rev_1_0.urdf required")
     if not scene_path:
-        scene_path = os.path.join(pkg_share, 'config', 'g1_grasp_scene.xml')
+        scene_path = os.path.join(pkg_share, 'config', 'g1_inspire_scene.xml')
 
     # Load URDF, fix relative mesh paths
     with open(urdf_path, 'r') as f:
@@ -65,8 +70,8 @@ def launch_setup(context, *args, **kwargs):
         Node(package='g1_right_arm_reach', executable='reach_node',
              parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
                          {'robot_model.urdf_path': urdf_path},
-                         {'pid.torque_mode': False},
-                         {'pid.gravity_compensation': False},
+                         {'pid.torque_mode': True},
+                         {'pid.gravity_compensation': True},
                          {'manager.control_rate': 50.0}],
              output='screen'),
 

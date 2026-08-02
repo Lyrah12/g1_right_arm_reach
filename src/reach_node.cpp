@@ -21,6 +21,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <memory>
@@ -60,7 +61,7 @@ public:
         this->declare_parameter("pid.tolerance", 0.005);
         this->declare_parameter("pid.posture_gain", 0.2);
         this->declare_parameter("pid.posture_target",
-            std::vector<double>{-0.3, 0.0, 0.0, 0.3});  // arm(4) only
+            std::vector<double>{0.0, 0.0, 0.0, 0.0});  // arm(4) — natural hang + forearm forward
         this->declare_parameter("pid.kp_wrist", 1.0);     // unused, kept for compat
         this->declare_parameter("pid.kd_wrist", 0.02);
         this->declare_parameter("pid.torque_mode", false);
@@ -72,11 +73,12 @@ public:
         this->declare_parameter("manager.control_rate", 50.0);
         this->declare_parameter("reach_node.target_point_topic", "/target_point");
         this->declare_parameter("reach_node.joint_state_topic", "/joint_states");
+        this->declare_parameter("reach_node.gravity_topic", "/mujoco_gravity");
         this->declare_parameter("reach_node.origin_frame", "right_shoulder");
         this->declare_parameter("reach_node.default_target",
             std::vector<double>{0.18, -0.05, -0.10});
         this->declare_parameter("reach_node.pelvis_offset",
-            std::vector<double>{0.0, 0.0, 0.823});
+            std::vector<double>{0.0, 0.0, 0.793});
 
         // --- Pelvis offset ---
         auto po = this->get_parameter("reach_node.pelvis_offset").as_double_array();
@@ -157,6 +159,11 @@ public:
         ee_pose_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
             "/actual_ee_pose", 10,
             std::bind(&ReachNode::eePoseCallback, this, std::placeholders::_1));
+
+        // MuJoCo pure-gravity (7 arm+wrist joints, incl. hand mass) → gravity feedforward
+        gravity_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+            this->get_parameter("reach_node.gravity_topic").as_string(), 10,
+            std::bind(&ReachNode::gravityCallback, this, std::placeholders::_1));
 
         joint_state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
             "/joint_commands", 10);
@@ -247,6 +254,26 @@ private:
         ee_pose_received_ = true;
     }
 
+    void gravityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+    {
+        // 7 values in arm_joint_order = active_joint_names_ order.
+        // Map directly onto the reduced-model nv vector for the PID gravity FF.
+        if (msg->data.size() < static_cast<size_t>(robot_->reduced_model_.nv)) return;
+        Eigen::VectorXd g(robot_->reduced_model_.nv);
+        for (int i = 0; i < robot_->reduced_model_.nv; ++i)
+            g(i) = msg->data[i];
+        // Sanity guard: reject NaN / absurd values (should be ~ ±60 N·m for G1 arm)
+        if (g.array().isNaN().any() || g.array().abs().maxCoeff() > 200.0) return;
+        pid_->setExternalGravity(g);
+        gravity_received_ = true;
+        if (!gravity_logged_) {
+            gravity_logged_ = true;
+            RCLCPP_INFO(get_logger(),
+                "MuJoCo gravity FF (incl. hand): [%.1f, %.1f, %.1f, %.1f, %.1f, %.1f, %.1f]",
+                g(0), g(1), g(2), g(3), g(4), g(5), g(6));
+        }
+    }
+
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
         if (msg->position.size() < static_cast<size_t>(robot_->reduced_model_.nq)) return;
@@ -271,7 +298,18 @@ private:
 
     void controlLoop()
     {
-        if (!joint_state_received_ || !ee_pose_received_ || !has_target_) return;
+        if (!joint_state_received_) return;
+
+        // --- No target yet → gravity hold (arm must not free-fall under gravity) ---
+        // Publishes τ = g − kv·dq for the arm joints, keeping the arm where it is.
+        if (!has_target_ || !ee_pose_received_) {
+            ControlResult hold = pid_->computeGravityHold(robot_->q_, robot_->dq_);
+            if (hold.torque_command.size() == static_cast<int>(robot_->arm_joint_indices_.size())) {
+                last_arm_tau_ = hold.torque_command;
+                publishJointStates();
+            }
+            return;
+        }
 
         Eigen::VectorXd q = robot_->q_;
         Eigen::VectorXd dq = robot_->dq_;
@@ -288,20 +326,25 @@ private:
         double position_error = (target_world - actual_ee_world_).norm();
 
         // --- Convergence lock (position only) ---
+        // TORQUE mode: never early-return on convergence — must keep sending
+        // gravity compensation + damping torque or the arm collapses.
+        bool torque_mode = pid_->isTorqueMode();
         if (locked_) {
             if (position_error > 0.05) {
                 locked_ = false; pid_->reset();
-            } else {
+            } else if (!torque_mode) {
                 robot_->q_ = converged_q_; publishJointStates(); publishTargetMarker(); return;
             }
         }
         if (position_error <= pid_->getTolerance()) {
             locked_ = true; converged_q_ = robot_->q_;
-            printf("[WRIST] Position converged: x=%.3f y=%.3f z=%.3f (err=%.3f m)\n",
-                actual_ee_world_.x(), actual_ee_world_.y(), actual_ee_world_.z(),
-                position_error);
-            fflush(stdout);
-            publishJointStates(); publishTargetMarker(); return;
+            if (!torque_mode) {
+                printf("[WRIST] Position converged: x=%.3f y=%.3f z=%.3f (err=%.3f m)\n",
+                    actual_ee_world_.x(), actual_ee_world_.y(), actual_ee_world_.z(),
+                    position_error);
+                fflush(stdout);
+                publishJointStates(); publishTargetMarker(); return;
+            }
         }
 
         // --- Compute shoulder-relative error ---
@@ -318,9 +361,19 @@ private:
                 robot_->q_(i) = arm_result.command(i);
             }
         }
+        // Torque mode: cache arm torque command for publishing
+        if (arm_result.torque_command.size() == static_cast<int>(robot_->arm_joint_indices_.size())) {
+            last_arm_tau_ = arm_result.torque_command;
+        }
+        last_integral_norm_ = arm_result.integral_norm;
+        last_nullspace_norm_ = arm_result.nullspace_norm;
         robot_->updateKinematics();
 
         // --- Divergence guard ---
+        // Only clear the INTEGRAL — a full pid_->reset() also drops the derivative
+        // state and forces first_call_, momentarily removing the damping term.
+        // During an oscillation that makes the guard fire repeatedly, removing
+        // damping each time adds energy and makes it worse.
         static double prev_position_error = 0.0;
         static int divergence_count = 0;
         if (has_target_ && !locked_ && total_cycles_ > 0) {
@@ -328,9 +381,9 @@ private:
                 divergence_count++;
                 if (divergence_count >= 5) {
                     RCLCPP_WARN(get_logger(),
-                        "[DIVERGE] error rising %.3f→%.3f over %d cycles — resetting PID",
+                        "[DIVERGE] error rising %.3f→%.3f over %d cycles — clearing integral",
                         prev_position_error, position_error, divergence_count);
-                    pid_->reset();
+                    pid_->resetIntegral();
                     divergence_count = 0;
                 }
             } else {
@@ -346,6 +399,35 @@ private:
         err_msg.data = position_error;
         error_pub_->publish(err_msg);
 
+        // --- Periodic status (1 Hz, 50 cycles at 50 Hz) ---
+        static int status_counter = 0;
+        if (++status_counter % 50 == 0 && gravity_received_) {
+            double q0 = robot_->q_(robot_->arm_joint_indices_[0]);
+            double q1 = robot_->q_(robot_->arm_joint_indices_[1]);
+            double q2 = robot_->q_(robot_->arm_joint_indices_[2]);
+            double q3 = robot_->q_(robot_->arm_joint_indices_[3]);
+            double dq0 = robot_->dq_(robot_->arm_joint_indices_[0]);
+            double dq1 = robot_->dq_(robot_->arm_joint_indices_[1]);
+            double dq2 = robot_->dq_(robot_->arm_joint_indices_[2]);
+            double dq3 = robot_->dq_(robot_->arm_joint_indices_[3]);
+            double t0 = last_arm_tau_.size() >= 4 ? last_arm_tau_(0) : 0.0;
+            double t1 = last_arm_tau_.size() >= 4 ? last_arm_tau_(1) : 0.0;
+            double t2 = last_arm_tau_.size() >= 4 ? last_arm_tau_(2) : 0.0;
+            double t3 = last_arm_tau_.size() >= 4 ? last_arm_tau_(3) : 0.0;
+            printf("[ARM] tgt=[%.3f %.3f %.3f] ee=[%.3f %.3f %.3f] err=%.3f m "
+                   "q[sp=%.2f ro=%.2f ya=%.2f elb=%.2f] "
+                   "tau[%.1f %.1f %.1f %.1f] int=%.3f ns=%.2f "
+                   "dq[%.2f %.2f %.2f %.2f] grav=PINOCCHIO gd=%.2f\n",
+                target_pos_.x(), target_pos_.y(), target_pos_.z(),
+                actual_ee_world_.x(), actual_ee_world_.y(), actual_ee_world_.z(),
+                position_error, q0, q1, q2, q3,
+                t0, t1, t2, t3,
+                last_integral_norm_, last_nullspace_norm_,
+                dq0, dq1, dq2, dq3,
+                pid_->hasExternalGravity() ? pid_->gravityDiff() : -1.0);
+            fflush(stdout);
+        }
+
     }
 
     // ========================================================================
@@ -357,12 +439,15 @@ private:
         auto msg = sensor_msgs::msg::JointState();
         msg.header.stamp = this->now();
         // Plan C: publish only arm joints (4-DOF). Wrist joints come from hand_controller.
-        for (int k = 0; k < static_cast<int>(robot_->arm_joint_indices_.size()); ++k) {
+        int n_arm = static_cast<int>(robot_->arm_joint_indices_.size());
+        for (int k = 0; k < n_arm; ++k) {
             int i = robot_->arm_joint_indices_[k];
             msg.name.push_back(robot_->active_joint_names_[i]);
             msg.position.push_back(robot_->q_(i));
             msg.velocity.push_back(0.0);
-            msg.effort.push_back(0.0);
+            // Torque mode: effort = τ_cmd (from computeArm). Position mode: 0.
+            double tau = (last_arm_tau_.size() == n_arm) ? last_arm_tau_(k) : 0.0;
+            msg.effort.push_back(tau);
         }
         joint_state_pub_->publish(msg);
     }
@@ -405,6 +490,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr point_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr ee_pose_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr gravity_sub_;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr error_pub_;
@@ -412,17 +498,22 @@ private:
 
     rclcpp::TimerBase::SharedPtr control_timer_;
 
-    Eigen::Vector3d pelvis_offset_{0.0, 0.0, 0.823};
+    Eigen::Vector3d pelvis_offset_{0.0, 0.0, 0.793};
     Eigen::Vector3d target_pos_{0.18, -0.05, -0.10};
     Eigen::Vector3d actual_ee_world_{0.0, 0.0, 0.0};
 
     bool has_target_{false};
     bool joint_state_received_{false};
     bool ee_pose_received_{false};
+    bool gravity_received_{false};
+    bool gravity_logged_{false};
     bool locked_{false};
     int total_cycles_{0};
 
     Eigen::VectorXd converged_q_;
+    Eigen::VectorXd last_arm_tau_;   // torque-mode: τ_cmd for the 4 arm joints (N·m)
+    double last_integral_norm_{0.0};   // task-space integral |∫e| (diagnostic)
+    double last_nullspace_norm_{0.0};  // null-space dq magnitude (diagnostic)
     double dt_{0.02};
 };
 

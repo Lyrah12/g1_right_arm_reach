@@ -1,0 +1,75 @@
+<!-- Inspire RH56 right hand — body tree (auto-generated). Inject under right_wrist_yaw_link. -->
+<mujoco>
+  <worldbody>
+    <body name="R_hand_base_link" pos="0.041500 0.000000 0.000000" quat="0.000000 0.707107 -0.707107 -0.000000">
+      <inertial pos="-0.002526 -0.066047 0.001960" quat="1.00000 0.00000 0.00000 0.00000" mass="0.1414300" diaginertia="0.0001228100 0.0000838320 0.0000766630"/>
+      <geom type="mesh" mesh="R_hand_base_link" contype="0" conaffinity="0" group="1" density="0" rgba="0.45 0.45 0.48 1"/>
+      <geom type="box" pos="0.0 -0.04 0.0" size="0.035 0.05 0.015" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+      <body name="R_thumb_proximal_base" pos="-0.016960 -0.069100 -0.020450" quat="0.499998 0.500000 -0.500000 0.500002">
+        <inertial pos="-0.004806 0.000938 -0.007570" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0018869" diaginertia="0.0000000582 0.0000000792 0.0000000674"/>
+        <joint name="R_thumb_proximal_yaw_joint" pos="0 0 0" axis="0.000000 0.000000 -1.000000" range="-0.100000 1.300000" armature="0.01"/>
+        <geom type="mesh" mesh="Link11_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.55 0.20 1"/>
+        <body name="R_thumb_proximal" pos="-0.008810 0.010892 -0.009250" quat="0.099684 0.099685 0.700046 0.700044">
+          <inertial pos="0.021932 0.012785 -0.008039" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0066075" diaginertia="0.0000015686 0.0000017353 0.0000027860"/>
+          <joint name="R_thumb_proximal_pitch_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.100000 0.600000" armature="0.01"/>
+          <geom type="mesh" mesh="Link12_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.55 0.20 1"/>
+          <body name="R_thumb_intermediate" pos="0.044070 0.034553 -0.000800" quat="1.000000 0.000000 0.000000 0.000000">
+            <inertial pos="0.009554 -0.001628 -0.007200" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0037847" diaginertia="0.0000003698 0.0000003239 0.0000004653"/>
+            <joint name="R_thumb_intermediate_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+            <geom type="mesh" mesh="Link13_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.55 0.20 1"/>
+            <body name="R_thumb_distal" pos="0.020248 0.010156 -0.001200" quat="1.000000 0.000000 0.000000 0.000000">
+              <inertial pos="0.009289 0.004953 -0.006003" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0033441" diaginertia="0.0000001363 0.0000001405 0.0000002003"/>
+              <joint name="R_thumb_distal_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+              <geom type="mesh" mesh="Link14_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.55 0.20 1"/>
+              <geom type="sphere" pos="0.02 0.02 0.0" size="0.013" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="R_index_proximal" pos="0.000285 -0.136530 -0.032268" quat="-0.017445 0.999848 0.000000 0.000000">
+        <inertial pos="0.001226 0.011942 -0.006000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0042403" diaginertia="0.0000006623 0.0000002115 0.0000006940"/>
+        <joint name="R_index_proximal_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="0.000000 1.700000" armature="0.01"/>
+        <geom type="mesh" mesh="Link15_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.60 0.75 0.90 1"/>
+        <body name="R_index_intermediate" pos="-0.002614 0.032026 -0.001000" quat="1.000000 0.000000 0.000000 0.000000">
+          <inertial pos="0.001970 0.019589 -0.005000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0045683" diaginertia="0.0000007611 0.0000000961 0.0000007818"/>
+          <joint name="R_index_intermediate_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+          <geom type="mesh" mesh="Link16_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.60 0.75 0.90 1"/>
+          <geom type="sphere" pos="0.0 0.042 0.0" size="0.013" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+        </body>
+      </body>
+      <body name="R_middle_proximal" pos="0.000285 -0.137100 -0.012950" quat="0.000004 1.000000 0.000000 0.000000">
+        <inertial pos="0.001297 0.011934 -0.006000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0042403" diaginertia="0.0000006621 0.0000002117 0.0000006940"/>
+        <joint name="R_middle_proximal_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="0.000000 1.700000" armature="0.01"/>
+        <geom type="mesh" mesh="Link17_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.70 0.80 0.70 1"/>
+        <body name="R_middle_intermediate" pos="-0.002423 0.032041 -0.001000" quat="1.000000 0.000000 0.000000 0.000000">
+          <inertial pos="0.001921 0.020796 -0.005000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0050396" diaginertia="0.0000009582 0.0000001065 0.0000009838"/>
+          <joint name="R_middle_intermediate_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+          <geom type="mesh" mesh="Link18_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.70 0.80 0.70 1"/>
+          <geom type="sphere" pos="0.0 0.042 0.0" size="0.013" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+        </body>
+      </body>
+      <body name="R_ring_proximal" pos="0.000285 -0.136910 0.006287" quat="0.026193 0.999657 0.000000 0.000000">
+        <inertial pos="0.001297 0.011934 -0.006000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0042403" diaginertia="0.0000006621 0.0000002117 0.0000006940"/>
+        <joint name="R_ring_proximal_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="0.000000 1.700000" armature="0.01"/>
+        <geom type="mesh" mesh="Link19_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.75 0.70 1"/>
+        <body name="R_ring_intermediate" pos="-0.002423 0.032041 -0.001000" quat="1.000000 0.000000 0.000000 0.000000">
+          <inertial pos="0.002175 0.019567 -0.005000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0045683" diaginertia="0.0000007629 0.0000000943 0.0000007818"/>
+          <joint name="R_ring_intermediate_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+          <geom type="mesh" mesh="Link20_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.85 0.75 0.70 1"/>
+          <geom type="sphere" pos="0.0 0.042 0.0" size="0.013" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+        </body>
+      </body>
+      <body name="R_pinky_proximal" pos="0.000285 -0.135710 0.025488" quat="0.052322 0.998630 0.000000 0.000000">
+        <inertial pos="0.001297 0.011934 -0.006000" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0042403" diaginertia="0.0000006621 0.0000002117 0.0000006940"/>
+        <joint name="R_pinky_proximal_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="0.000000 1.700000" armature="0.01"/>
+        <geom type="mesh" mesh="Link21_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.80 0.70 0.85 1"/>
+        <body name="R_pinky_intermediate" pos="-0.002423 0.032041 -0.001000" quat="1.000000 0.000000 0.000000 0.000000">
+          <inertial pos="0.002475 0.016203 -0.005003" quat="1.00000 0.00000 0.00000 0.00000" mass="0.0035996" diaginertia="0.0000004391 0.0000000702 0.0000004487"/>
+          <joint name="R_pinky_intermediate_joint" pos="0 0 0" axis="0.000000 0.000000 1.000000" range="-0.500000 2.000000" armature="0.01"/>
+          <geom type="mesh" mesh="Link22_R" contype="0" conaffinity="0" group="1" density="0" rgba="0.80 0.70 0.85 1"/>
+          <geom type="sphere" pos="0.0 0.04 0.0" size="0.012" density="0" rgba="0 0 0 0" contype="1" conaffinity="0"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

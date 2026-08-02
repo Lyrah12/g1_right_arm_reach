@@ -171,7 +171,7 @@ install(DIRECTORY include/
 install(PROGRAMS
     scripts/mujoco_bridge_node.py
     scripts/action_cli.py
-    scripts/setup_wuji_hand.sh
+    scripts/setup_inspire_hand.sh
     DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -128,10 +128,14 @@ std::vector<pinocchio::JointIndex> RobotModel::identifyJointsToLock(
 
 pinocchio::FrameIndex RobotModel::findEndEffectorFrame(const pinocchio::Model& model) const
 {
-    // Priority 1: wrist_roll_link (wrist joint origin, controlled by arm IK)
-    for (const auto& hint : {"right_wrist_roll_link", "right_wrist_roll",
-                              "right_wrist_roll_rubber_hand", "right_rubber_hand",
-                              "right_palm", "right_hand", "right_gripper"}) {
+    // Priority 1: right_wrist_yaw_link — 与 MuJoCo /actual_ee_pose 的测量点一致
+    // (mujoco_bridge_node.py 用 right_wrist_yaw_link body 发布末端位置)。
+    // 此前 EE=wrist_roll_link(腕根) 而反馈=wrist_yaw_link(腕末)，两者相差 8.4cm
+    // 且随腕姿态旋转 → 手臂雅可比控制点与反馈点不一致 → 追一个控制不了的点 → 振荡。
+    for (const auto& hint : {"right_wrist_yaw_link", "right_wrist_roll_link",
+                              "right_wrist_roll", "right_wrist_roll_rubber_hand",
+                              "right_rubber_hand", "right_palm", "right_hand",
+                              "right_gripper"}) {
         for (pinocchio::FrameIndex fid = 0; fid < model.nframes; ++fid)
             if (model.frames[fid].name == hint) return fid;
     }

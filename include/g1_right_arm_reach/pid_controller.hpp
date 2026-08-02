@@ -147,6 +147,23 @@ public:
     void setInnerServoKp(double kp) { inner_servo_kp_ = kp; }
     void setInnerServoKv(double kv) { inner_servo_kv_ = kv; }
 
+    /// External gravity feedforward (e.g. MuJoCo pure gravity incl. hand mass).
+    /// Takes priority over Pinocchio computeGeneralizedGravity when size == nv.
+    void setExternalGravity(const Eigen::VectorXd& tau_g) {
+        external_gravity_ = (tau_g.size() == robot_.reduced_model_.nv) ? tau_g : Eigen::VectorXd();
+    }
+    bool hasExternalGravity() const { return external_gravity_.size() == robot_.reduced_model_.nv; }
+    /// Max |Pinocchio − MuJoCo| gravity over all joints (diagnostic; −1 if no external).
+    double gravityDiff() const;
+
+    /// Reset only the integral (keep derivative state) — safe on divergence.
+    void resetIntegral() { error_integral_.setZero(); }
+
+    /// Pure gravity-hold torque for the arm joints: τ = g − kv·dq.
+    /// Used when there is no target yet, so the arm does not free-fall.
+    ControlResult computeGravityHold(const Eigen::VectorXd& q,
+                                     const Eigen::VectorXd& dq);
+
 private:
     /// Legacy core implementation shared by compute() and computePose().
     ControlResult computeImpl(const Eigen::Vector3d& target_pos,
@@ -162,6 +179,9 @@ private:
     Eigen::VectorXd jointLimitAvoidanceArm(double margin = 0.1) const;
     Eigen::VectorXd jointLimitAvoidance(double margin = 0.1) const;
 
+    /// Fill tau_g with external (MuJoCo) gravity if set, else Pinocchio RNEA.
+    void resolveGravityTorque(Eigen::VectorXd& tau_g) const;
+
     RobotModel& robot_;
     Kinematics& kin_;
 
@@ -176,6 +196,9 @@ private:
     // Torque mode (disabled — kept for future re-evaluation)
     bool torque_mode_ = false, gravity_comp_ = true;
     double inner_servo_kp_ = 5.0, inner_servo_kv_ = 5.0;
+
+    // External gravity feedforward (MuJoCo pure gravity, includes hand mass).
+    Eigen::VectorXd external_gravity_;
 
     // Arm PID state
     Eigen::Vector3d prev_error_pos_{Eigen::Vector3d::Zero()};
