@@ -11,7 +11,7 @@ MuJoCo physics simulation launch — Plan C: Arm-Hand fully decoupled.
   mujoco_bridge_node (200Hz) — MuJoCo physics + position servo
        │
   /actual_ee_pose, /actual_hand_orientation,
-  /mujoco_jacobian, /mujoco_wrist_jacobian, /joint_states
+  /mujoco_wrist_jacobian, /mujoco_gravity, /joint_states
 
 Usage:
   ros2 launch g1_right_arm_reach mujoco_demo.launch.py \
@@ -41,6 +41,8 @@ def launch_setup(context, *args, **kwargs):
     use_rviz = LaunchConfiguration('use_rviz').perform(context)
     use_test_target = LaunchConfiguration('use_test_target').perform(context)
     viewer = LaunchConfiguration('viewer').perform(context)
+    hard_clamp_joints = LaunchConfiguration('hard_clamp_joints').perform(context)
+    clamp_arm_joints = LaunchConfiguration('clamp_arm_joints').perform(context)
     pkg_share = FindPackageShare('g1_right_arm_reach').perform(context)
 
     if not urdf_path:
@@ -64,7 +66,9 @@ def launch_setup(context, *args, **kwargs):
              name='mujoco_bridge',
              parameters=[os.path.join(pkg_share, 'config', 'params.yaml'),
                          {'scene_path': scene_path,
-                          'viewer': viewer.lower() == 'true'}],
+                          'viewer': viewer.lower() == 'true',
+                          'hard_clamp_joints': hard_clamp_joints.lower() == 'true',
+                          'clamp_arm_joints': clamp_arm_joints.lower() == 'true'}],
              output='screen'),
 
         Node(package='g1_right_arm_reach', executable='reach_node',
@@ -104,11 +108,9 @@ def generate_launch_description():
         DeclareLaunchArgument('use_test_target', default_value='false'),
         DeclareLaunchArgument('viewer', default_value='false',
             description='Open MuJoCo interactive viewer'),
-        DeclareLaunchArgument('hard_clamp_pelvis', default_value='false',
-            description='Hard-clamp pelvis free joint'),
         DeclareLaunchArgument('hard_clamp_joints', default_value='false',
-            description='Hard-clamp locked joint qpos'),
+            description='Hard-clamp locked joint qpos (forwarded to bridge)'),
         DeclareLaunchArgument('clamp_arm_joints', default_value='false',
-            description='Hard-clamp arm joints'),
+            description='Hard-clamp arm joints (forwarded to bridge)'),
         OpaqueFunction(function=launch_setup),
     ])

@@ -192,6 +192,15 @@ void ActionSequencerNode::startReaching()
     best_ori_error_ = 999.0;
     ori_stuck_time_ = 0.0;
 
+    // Reset convergence telemetry. Without this, stale errors from the previous
+    // action (e.g. a converged 5 mm residual) would make the FIRST REACHING cycle
+    // think position/orientation already converged and jump straight to grasp
+    // before the arm starts moving.
+    position_error_ = 999.0;
+    error_received_ = false;
+    orientation_error_ = 999.0;
+    ori_error_received_ = false;
+
     // Plan C: always publish position to /target_point (Point, 3-DOF)
     auto pt = geometry_msgs::msg::Point();
     pt.x = target_x_;

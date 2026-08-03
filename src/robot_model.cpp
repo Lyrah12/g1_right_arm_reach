@@ -187,7 +187,10 @@ Eigen::Vector3d RobotModel::getEndEffectorPosition() const
 
 Eigen::Vector3d RobotModel::getWristPosition() const
 {
-    // EE frame IS the wrist origin (right_wrist_roll_link)
+    // EE frame = right_wrist_yaw_link (findEndEffectorFrame priority), matching the
+    // MuJoCo /actual_ee_pose measurement point — NOT right_wrist_roll_link. The
+    // arm position controller holds this point fixed while hand_controller rotates
+    // the wrist around it.
     return reduced_data_.oMf[ee_frame_id_].translation();
 }
 

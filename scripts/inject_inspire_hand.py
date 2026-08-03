@@ -104,27 +104,6 @@ def patch_wrist_5010(text):
     return text
 
 
-def add_equality(text):
-    """Insert <equality> joint constraints for the 6 slave joints."""
-    eq = ['  <equality>']
-    for slave, master, ratio in COUPLING:
-        eq.append(f'    <joint joint1="{slave}" joint2="{master}" polycoef="0 {ratio} 0 0"/>')
-    eq.append('  </equality>')
-    eq_block = "\n".join(eq)
-
-    # Append to existing <equality> if present, else insert before </mujoco>
-    m = re.search(r'<equality>', text)
-    if m:
-        # find matching close of <equality>...</equality>
-        _, _, close = find_matching_close(text, 'equality', r'<equality>')
-        text = text[:close] + "\n" + "\n".join(eq[1:-1]) + "\n" + text[close:]
-        print("  appended to existing <equality>")
-    else:
-        text = text.rstrip()[:-len("</mujoco>")].rstrip() + "\n" + eq_block + "\n</mujoco>\n"
-        print("  inserted new <equality>")
-    return text
-
-
 def add_equality_solref(text):
     """Insert <equality> joint constraints for the 6 slave joints.
     REQUIRES solref="0.001 1" (stiff) — the default solref is too soft and the
@@ -157,7 +136,11 @@ def fix_base_to_world(text):
     fixed-base 7-DOF chain and the controller behaves like a normal fixed-base arm.
     (MuJoCo has no 'fixed' joint type — a body with no joint is fixed to parent.)"""
     import re
-    text = re.sub(r'<joint name="floating_base_joint"[^>]*/>\s*', '', text)
+    text, n = re.subn(r'<joint name="floating_base_joint"[^>]*/>\s*', '', text)
+    if n != 1:
+        print(f"  [!] WARNING: expected exactly 1 'floating_base_joint' to remove, "
+              f"found {n}. The base may NOT be fixed — check the base MJCF's free-joint "
+              f"name (must be 'floating_base_joint', self-closing).")
     return text
 
 

@@ -61,7 +61,7 @@
     <!-- 虚拟相机 -->
     <camera name="head_cam"
             pos="0.02 0 0.65"
-            xyaxes="1 0 0 0 0.7 0.7"
+            xyaxes="1 0 0 0 0.7071 0.7071"
             fovy="60"
             resolution="640 480"/>
 

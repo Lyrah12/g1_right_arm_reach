@@ -199,12 +199,14 @@ mujoco_bridge:
 
     # Hard clamping
     # Base is now FIXED in the MJCF (free joint → fixed, inject_inspire_hand.py).
-    # hard_clamp_pelvis must be OFF: the old qpos-teleport froze the arm in the
-    # implicitfast solver, and with no free joint it would wrongly clamp the legs.
-    hard_clamp_pelvis: false
+    # There is NO pelvis free joint, so hard_clamp_pelvis was removed entirely.
     # hard_clamp_joints MUST be OFF: every-step qpos+qvel teleport of the legs/waist/
     # left-arm injects impulses through the torso into the right arm. The gravity hold
     # is pure feedforward (no restoring force), so the arm accumulates steady backward
     # drift (~0.05 rad/s). Legs/waist are already held by strong position servos.
     hard_clamp_joints: false
     clamp_arm_joints: false
+
+    # Watchdog: torque commands older than this (s) are treated as stale (controller
+    # died / stopped publishing) and reverted to the gravity-hold fallback.
+    cmd_timeout: 0.3

@@ -111,8 +111,8 @@ HandController::HandController()
     this->declare_parameter("wrist_joint_damping", 0.6);
     this->declare_parameter("wrist_offset_limit", 2.0);
 
-    this->declare_parameter("kp_finger", 50.0);
-    this->declare_parameter("kd_finger", 0.5);
+    this->declare_parameter("kp_finger", 5.0);
+    this->declare_parameter("kd_finger", 0.3);
     this->declare_parameter("tau_max_finger", 1.5);   // hand motor torque limit (N·m)
     this->declare_parameter("tau_max_wrist", 13.4);   // 5010 wrist torque limit (N·m)
 
@@ -130,7 +130,6 @@ HandController::HandController()
     // --- State vectors ---
     actual_q_ = Eigen::VectorXd::Zero(n_total_);
     actual_dq_ = Eigen::VectorXd::Zero(n_total_);
-    finger_target_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_des_q_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_cmd_tau_ = Eigen::VectorXd::Zero(n_fingers_);
 
@@ -313,7 +312,7 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
             auto pattern = grasp_library_.getPattern("home");
             for (int j = 0; j < n_fingers_; ++j) {
                 auto it = pattern.joints.find(finger_names_[j]);
-                finger_target_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
+                finger_des_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
             }
         } else {
             auto pattern = grasp_library_.getPattern(gtype);
@@ -324,12 +323,14 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
             }
             for (int j = 0; j < n_fingers_; ++j) {
                 auto it = pattern.joints.find(finger_names_[j]);
-                finger_target_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
+                finger_des_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
             }
         }
 
-        // Snap des_q directly to target — impedance controller handles transition.
-        finger_des_q_ = finger_target_q_;
+        // Snap des_q directly to target — the impedance controller (τ=Kp·e+Kd·ė)
+        // handles the transition smoothly. HandCommand.grasp_duration is a sequencer
+        // timing field, not a finger interpolation ramp.
+        finger_cmd_received_ = true;
     }
 }
 
@@ -381,8 +382,10 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
                 if (i < msg->velocity.size())
                     actual_dq_(idx) = msg->velocity[i];
 
-                if (first_time) {
-                    // Initialize finger feedforward target = actual position
+                if (first_time && !finger_cmd_received_) {
+                    // Initialize finger feedforward target = actual position, UNLESS a
+                    // grasp command already set a target before the first joint_state
+                    // arrived (otherwise the grasp target is silently overwritten).
                     finger_des_q_(j) = actual_q_(idx);
                 }
                 break;
@@ -392,13 +395,9 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
 
     if (first_time) {
         joint_state_received_ = true;
-        // Initialize wrist offset = 0 (no correction). wrist_cmd = act + 0 = act.
-        // The bridge's ready pose holds wrist at 0 via position servo (kp=300).
-        // Offset will be modified by stepWristControl when orientation PID activates.
-        wrist_offset_ = Eigen::Vector3d(0.0, 0.0, 0.0);
         RCLCPP_INFO(get_logger(),
             "First joint_state received. Wrist act=[%.3f,%.3f,%.3f]. "
-            "Offset=0. PID activates on first orientation+Jacobian.",
+            "PID activates on first orientation+Jacobian.",
             actual_q_(0), actual_q_(1), actual_q_(2));
     }
 }

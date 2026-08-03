@@ -53,10 +53,11 @@ public:
         this->declare_parameter("robot_model.wrist_joints",
             std::vector<std::string>{});  // Plan C: wrist → hand_controller
 
-        // --- Parameters: PID ---
-        this->declare_parameter("pid.kp", 2.0);
-        this->declare_parameter("pid.ki", 0.4);
-        this->declare_parameter("pid.kd", 0.05);
+        // --- Parameters: PID (defaults = tuned params.yaml values so standalone
+        // `ros2 run` gets the same behavior as the launch file) ---
+        this->declare_parameter("pid.kp", 200.0);
+        this->declare_parameter("pid.ki", 1.0);
+        this->declare_parameter("pid.kd", 0.3);
         this->declare_parameter("pid.damping", 2.0e-4);
         this->declare_parameter("pid.tolerance", 0.005);
         this->declare_parameter("pid.posture_gain", 0.2);

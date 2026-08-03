@@ -81,7 +81,8 @@ private:
     // Wrist orientation control
     // ========================================================================
 
-    /// Orientation PID: error → task angular velocity → J⁻¹ → wrist_offset_ increment.
+    /// Orientation PID: error → task angular velocity → τ = Jᵀ·(Kp·e + Ki·∫e + Kd·ė)
+    /// + g_wrist − kd_joint·dq (direct torque output, no offset integration).
     void stepWristControl(double dt);
 
     /// Gravity-hold wrist torque (every cycle): τ = g_wrist − kd_joint·dq.
@@ -143,9 +144,8 @@ private:
     Eigen::Quaterniond target_ori_{0.5, 0.5, 0.5, 0.5};
     bool has_ori_target_{false};  // true after first HandCommand or orientation capture
 
-    /// Wrist PID offset (anti-windup): wrist_cmd_tau computed by stepWristControl,
-    /// clamped to ±wrist_offset_limit_ (set by params.yaml).
-    Eigen::Vector3d wrist_offset_{0.0, 0.0, 0.0};
+    /// Max wrist offset from ready pose the orientation target may demand (rad).
+    /// Used to warn when a composed target is beyond wrist authority.
     double wrist_offset_limit_{2.0};
 
     Eigen::Quaterniond current_hand_ori_{1.0, 0.0, 0.0, 0.0};  // from /actual_hand_orientation
@@ -174,8 +174,8 @@ private:
     int wrist_cycles_since_step_{0};  ///< cycles since last wrist step → effective dt = dt_ * count
 
     // --- Finger state ---
-    Eigen::VectorXd finger_target_q_;   // n_fingers target (from grasp pattern)
     Eigen::VectorXd finger_des_q_;      // n_fingers desired (set to target on grasp cmd, held for impedance)
+    bool finger_cmd_received_{false};   ///< a grasp command has set finger_des_q_ (guard first joint_state init)
 
     // --- Torque output (torque mode) ---
     Eigen::Vector3d wrist_cmd_tau_{0.0, 0.0, 0.0};   // wrist joint torque command (N·m)
@@ -191,9 +191,9 @@ private:
     double kd_wrist_{0.8};
     double wrist_joint_damping_{0.6};   // joint-space velocity damping (N·m·s/rad)
 
-    double kp_finger_{50.0};
-    double kd_finger_{0.5};
-    double tau_max_finger_{200.0};
+    double kp_finger_{5.0};
+    double kd_finger_{0.3};
+    double tau_max_finger_{1.5};
 };
 
 }  // namespace g1_right_arm_reach

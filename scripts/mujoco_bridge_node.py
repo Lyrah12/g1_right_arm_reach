@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation with position-servo actuation.
+MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation with torque-mode actuation
+(controller effort=τ → motor ctrl=τ, MIT mode — matching the real G1 LowCmd).
 
 Publishes: /joint_states, /actual_ee_pose, /actual_hand_orientation,
-           /mujoco_jacobian, /mujoco_wrist_jacobian (plus /camera/rgb, /camera/depth, /wrist_ft).
+           /mujoco_wrist_jacobian, /mujoco_gravity (plus /camera/rgb, /camera/depth, /wrist_ft).
 Subscribes: /joint_commands (arm 4-DOF), /hand_commands (hand 9-DOF).
 
 Dependencies: pip install mujoco opencv-python "numpy<2"
@@ -12,6 +13,7 @@ Dependencies: pip install mujoco opencv-python "numpy<2"
 import os
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -98,7 +100,9 @@ class MuJoCoBridgeNode(Node):
             'right_wrist_yaw_joint',
         ])  # G1 右臂 7-DOF (arm 4 + wrist 3)，手指关节由 hand_controller 管理
         self.declare_parameter('clamp_arm_joints', False)  # 手臂关节硬夹持（默认关闭，靠位置伺服）
-        self.declare_parameter('hard_clamp_pelvis', True)   # 硬夹持骨盆（固定机器人位置）
+        # NOTE: hard_clamp_pelvis was removed — the base is FIXED in the MJCF
+        # (free joint stripped by inject_inspire_hand.py), so there is no pelvis
+        # free joint to clamp, and qpos[0:3] no longer holds the pelvis pose.
         self.declare_parameter('hard_clamp_joints', True)   # 硬夹持非右臂关节（除右臂外全部锁死）
         self.declare_parameter('publish_locked_joint_hold', False)  # 发布 /locked_joint_hold（实物部署用）
 
@@ -107,6 +111,9 @@ class MuJoCoBridgeNode(Node):
 
         # Torque mode: controllers publish effort=τ; bridge writes motor ctrl=τ.
         self.declare_parameter('torque_mode', True)
+        # Watchdog: torque commands older than this are treated as stale (controller
+        # died / stopped publishing) and reverted to the gravity-hold fallback.
+        self.declare_parameter('cmd_timeout', 0.3)
         # Inspire hand joints (12). Identifies hand joints for hard-clamp skip
         # and /joint_states publishing (6 slaves have NO actuator).
         self.declare_parameter('hand_joint_names', [
@@ -119,7 +126,6 @@ class MuJoCoBridgeNode(Node):
         ])
 
         # 实际读取硬夹持参数值（在 MuJoCo 加载后赋值）
-        self.hard_clamp_pelvis = False
         self.hard_clamp_joints = False
 
         # -----------------------------------------------------------------
@@ -251,9 +257,11 @@ class MuJoCoBridgeNode(Node):
             )
 
         # ─────────────────────────────────────────────────────────────
-        # 记录初始位姿（用于夹持 floating_base + 锁定关节）
+        # 基座已固定（free joint 移除），无骨盆 free joint —— 不再记录/抬高
+        # 骨盆 qpos。锁定关节靠"位置伺服"保持（scene 中 kp 300~600），
+        # 配合可选硬夹持（hard_clamp_joints，默认关）。
         #
-        # 重要：为什么锁定关节必须硬夹持？
+        # 为什么锁定关节不依赖硬夹持？
         #   人形机器人自重 ~35 kg，重力在各关节上产生 10–50 N·m 力矩。
         #   位置伺服 kp=500 下稳态误差 = 50/500 = 0.1 rad ≈ 5.7°/关节。
         #   22 个锁定关节各自累积 5° 误差 → 整体姿态完全塌缩。
@@ -264,15 +272,6 @@ class MuJoCoBridgeNode(Node):
         #   右臂的振荡并非由夹持引起（夹持只影响锁定关节），而是由
         #   kp=1000 + 20Hz 阶跃指令 + 积分突变三者的互动造成。
         # ─────────────────────────────────────────────────────────────
-        self.init_pelvis_pos = np.array(self.data.qpos[0:3].copy(), dtype=np.float64)
-        self.init_pelvis_quat = np.array(self.data.qpos[3:7].copy(), dtype=np.float64)
-        # 骨盆抬高 3cm（z += 0.03），减少脚底穿透地面的深度，避免接触力反弹振荡
-        self.init_pelvis_pos[2] += 0.03
-        self.data.qpos[0:3] = self.init_pelvis_pos
-        self.get_logger().info(
-            f"骨盆初始位置 (MJCF qpos0 + 抬高): [{self.init_pelvis_pos[0]:.3f}, "
-            f"{self.init_pelvis_pos[1]:.3f}, {self.init_pelvis_pos[2]:.3f}]"
-        )
 
         # ─────────────────────────────────────────────────────────────
         # 左臂归零：MJCF 默认 qpos0 可能非零，在锁死前强制归零
@@ -355,11 +354,9 @@ class MuJoCoBridgeNode(Node):
         )
 
         # 读取硬夹持参数（必须在 MuJoCo 加载后）
-        self.hard_clamp_pelvis = self.get_parameter('hard_clamp_pelvis').get_parameter_value().bool_value
         self.hard_clamp_joints = self.get_parameter('hard_clamp_joints').get_parameter_value().bool_value
         self.get_logger().info(
-            f"硬夹持配置: pelvis={'ON' if self.hard_clamp_pelvis else 'OFF'}, "
-            f"joints={'ON' if self.hard_clamp_joints else 'OFF'}"
+            f"硬夹持配置: joints={'ON' if self.hard_clamp_joints else 'OFF'}"
         )
 
         # ─────────────────────────────────────────────────────────────
@@ -452,7 +449,7 @@ class MuJoCoBridgeNode(Node):
                     self.data.qpos[self.model.jnt_qposadr[jid]] = angle
             self.get_logger().info(
                 f"Inspire 手初始姿态: home 半握 "
-                f"(thumb_yaw=0.25, thumb_pitch=0.35, 四指=0.8, "
+                f"(thumb_yaw=0.25, thumb_pitch=0.25, 四指=0.8, "
                 f"从动按耦合比预置 {len(hand_ready_pose)} 关节)"
             )
 
@@ -570,8 +567,10 @@ class MuJoCoBridgeNode(Node):
         self.joint_cmd = {}        # {joint_name: position_rad} — arm+wrist (7-DOF)
         self.joint_cmd_effort = {}  # {joint_name: effort_Nm} (torque diagnostics)
         self.joint_cmd_tau = {}     # {joint_name: torque_Nm} — torque_mode (arm+wrist)
+        self.joint_cmd_tau_stamp = {}  # {joint_name: last update time.monotonic()} — watchdog
         self.hand_cmd = {}          # {joint_name: position_rad} — hand active joints
         self.hand_cmd_tau = {}      # {joint_name: torque_Nm} — torque_mode (hand)
+        self.hand_cmd_tau_stamp = {}  # {joint_name: last update time.monotonic()} — watchdog
         self.lock = threading.Lock()
 
         self.cmd_sub = self.create_subscription(
@@ -661,7 +660,10 @@ class MuJoCoBridgeNode(Node):
             self.hand_ori_pub = None
             self.get_logger().warn("未找到手部body，朝向不发布")
 
-        # --- MuJoCo 数值 Jacobian 发布（供 PID 使用，消除 URDF/MJCF Jacobian 差异）---
+        # --- 右臂 7 关节的 dof 地址（仅用于 /mujoco_gravity 的 qfrc_bias 提取）---
+        # 注意：3×7 位置 Jacobian（/mujoco_jacobian）已移除——它没有订阅者
+        # （reach_node/hand_controller 都用 Pinocchio 本地 Jacobian），发布它
+        # 每 10 步白烧 ~15 次 mj_forward。只保留 wrist 3×3（hand_controller 仿真路径用）。
         arm_joint_order = [
             'right_shoulder_pitch_joint',
             'right_shoulder_roll_joint',
@@ -671,30 +673,15 @@ class MuJoCoBridgeNode(Node):
             'right_wrist_pitch_joint',
             'right_wrist_yaw_joint',
         ]
-        self.arm_joint_qpos_addrs = []  # [qpos_addr, ...] 按 arm_joint_order 顺序
-        self.arm_joint_dof_addrs = []   # [dof_addr, ...] — 用于重力补偿提取（qfrc_bias）
+        self.arm_joint_dof_addrs = []   # [dof_addr, ...] — 重力补偿提取（qfrc_bias）
         for joint_name in arm_joint_order:
             if joint_name in self.actuator_map_primary:
                 act_id = self.actuator_map_primary[joint_name]
                 act_joint_id = self.model.actuator_trnid[act_id][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
                 dof_addr = self.model.jnt_dofadr[act_joint_id]
-                self.arm_joint_qpos_addrs.append(qpos_addr)
                 self.arm_joint_dof_addrs.append(dof_addr)
             else:
-                self.get_logger().warn(f"Jacobian: 关节 '{joint_name}' 不在 actuator_map 中")
-        if self.ee_body_id >= 0 and len(self.arm_joint_qpos_addrs) >= 7:
-            self.jac_pub = self.create_publisher(Float64MultiArray, '/mujoco_jacobian', 10)
-            self.get_logger().info(
-                f"MuJoCo 数值 Jacobian 发布已启用 "
-                f"({len(self.arm_joint_qpos_addrs)} 关节: arm 4 + wrist 3)"
-            )
-        else:
-            self.jac_pub = None
-            self.get_logger().warn(
-                f"Jacobian 发布禁用（EE body={self.ee_body_id}, "
-                f"arm joint qpos_addrs={len(self.arm_joint_qpos_addrs)} 个）"
-            )
+                self.get_logger().warn(f"Gravity: 关节 '{joint_name}' 不在 actuator_map 中")
 
         # ─────────────────────────────────────────────────────────────
         # Wrist orientation Jacobian (3×3) for hand_controller (Plan C)
@@ -795,9 +782,9 @@ class MuJoCoBridgeNode(Node):
     def _cmd_callback(self, msg: JointState):
         """缓存 /joint_commands 中的关节位置和力矩。
 
-        torque_mode: 位置指令已通过 PID 的 τ→q 转换编码力矩前馈
-        （q_cmd = q_ik + (τ_cmd + Kv·dq) / Kp_inner）。
-        桥接节点直接使用位置指令，无需额外处理。
+        torque_mode: effort 字段直接就是力矩指令 τ（reach_node PID 输出），
+        写入 motor ctrl=τ；position 字段仅作诊断（= 当前实际关节角）。
+        同时打时间戳，供看门狗判断指令是否过期。
 
         线程安全：使用 lock 保护 joint_cmd 字典的写入。
 
@@ -815,6 +802,7 @@ class MuJoCoBridgeNode(Node):
                 # 桥会一直施加最后一次非零扭矩 → 手臂持续单方向顶 → 发散。
                 if self.torque_mode:
                     self.joint_cmd_tau[name] = eff
+                    self.joint_cmd_tau_stamp[name] = time.monotonic()
 
     def _hand_cmd_callback(self, msg: JointState):
         """缓存 /hand_commands 中的手指关节位置。
@@ -829,6 +817,7 @@ class MuJoCoBridgeNode(Node):
                 # 同上：torque 模式下无条件信任 effort 字段
                 if self.torque_mode:
                     self.hand_cmd_tau[name] = eff
+                    self.hand_cmd_tau_stamp[name] = time.monotonic()
 
     # =========================================================================
     # MODULE: Physics Loop
@@ -853,10 +842,18 @@ class MuJoCoBridgeNode(Node):
                 # --- Torque mode: apply commanded torque to motor actuators ---
                 # (PID → τ directly; motor ctrl = τ, 1:1 with LowCmd tau_ff on hardware)
                 if self.torque_mode:
+                    # Watchdog: only trust a torque command if it was updated recently.
+                    # If the controller dies, the last torque would otherwise be applied
+                    # forever (a stuck non-zero τ pushes the arm into the joint limits).
+                    # Stale → fall through to gravity-hold / locked-joint hold.
                     tau = None
-                    if joint_name in self.joint_cmd_tau:
+                    now = time.monotonic()
+                    cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
+                    if (joint_name in self.joint_cmd_tau
+                            and now - self.joint_cmd_tau_stamp.get(joint_name, now) <= cmd_timeout):
                         tau = self.joint_cmd_tau[joint_name]
-                    elif joint_name in self.hand_cmd_tau:
+                    elif (joint_name in self.hand_cmd_tau
+                            and now - self.hand_cmd_tau_stamp.get(joint_name, now) <= cmd_timeout):
                         tau = self.hand_cmd_tau[joint_name]
                     if tau is not None:
                         for act_id in act_ids:
@@ -919,13 +916,8 @@ class MuJoCoBridgeNode(Node):
                     # （已在 __init__ 中设好），不需要平滑（目标值不变）
                     pass
 
-        # 1.5 根据参数决定是否硬夹持（默认关闭，完全依赖位置伺服 + 足地接触）
-        if self.hard_clamp_pelvis:
-            self.data.qpos[0:3] = self.init_pelvis_pos
-            self.data.qpos[3:7] = self.init_pelvis_quat
-            self.data.qvel[0:6] = 0.0
-            self.data.qfrc_applied[0:6] = 0.0
-
+        # 1.5 根据参数决定是否硬夹持锁定关节（默认关闭，完全依赖位置伺服 + 足地接触）
+        # 注意：基座已固定（free joint 移除），不存在骨盆 free joint，故无 pelvis 夹持。
         if self.hard_clamp_joints:
             for clamp_entry in self.locked_joint_clamps:
                 qpos_addr = clamp_entry[0]
@@ -938,16 +930,8 @@ class MuJoCoBridgeNode(Node):
         # 2. 步进物理
         mujoco.mj_step(self.model, self.data)
 
-        # 每 10 秒检查基座漂移（仅在硬夹持骨盆时检查，否则漂移是正常的）
+        # 每 10 秒检查锁定关节漂移（仅在硬夹持时检查，无硬夹持时漂移是正常现象）
         if self.step_counter % 2000 == 0:
-            if self.hard_clamp_pelvis:
-                drift = float(np.linalg.norm(self.data.qpos[0:3] - self.init_pelvis_pos))
-                if drift > 5e-3:
-                    self.get_logger().warn(
-                        f"基座漂移: |drift|={drift:.4f} m "
-                        f"(pelvis={self.data.qpos[0]:.4f},{self.data.qpos[1]:.4f},{self.data.qpos[2]:.4f})"
-                    )
-            # 锁定关节漂移诊断（仅在硬夹持时检查，无硬夹持时漂移是正常现象）
             if self.hard_clamp_joints:
                 max_lock_drift = 0.0
                 max_lock_name = ""
@@ -971,12 +955,11 @@ class MuJoCoBridgeNode(Node):
         if self.locked_hold_pub is not None and self.step_counter % 4000 == 0:
             self._publish_locked_joint_hold()
 
-        # 3.5 发布 MuJoCo 真实末端位置 + 手部朝向 + Jacobian + 纯重力 (20Hz，与 PID 同频)
+        # 3.5 发布 MuJoCo 真实末端位置 + 手部朝向 + wrist Jacobian + 纯重力 (20Hz，与 PID 同频)
+        # 3×7 位置 Jacobian 已移除（无订阅者；controllers 用 Pinocchio 本地计算）。
         if self.ee_pub is not None and self.step_counter % 10 == 0:
             self._publish_ee_pose()
             self._publish_hand_orientation()
-            if self.jac_pub is not None:
-                self._publish_jacobian()
             if self.wrist_jac_pub is not None:
                 self._publish_wrist_jacobian()
             if self.grav_pub is not None:
@@ -1098,42 +1081,6 @@ class MuJoCoBridgeNode(Node):
         msg = Float64MultiArray()
         msg.data = J.flatten().tolist()  # row-major: [J00, J01, J02, J10, J11, J12, J20, J21, J22]
         self.wrist_jac_pub.publish(msg)
-
-    def _publish_jacobian(self):
-        """发布 /mujoco_jacobian — MuJoCo 3×7 中心差分数值 Jacobian。
-
-        对 7 个主动关节分别 ±ε 扰动，用 mj_forward() 计算 EE 位移。
-        扰动后恢复原始 qpos，不改变仿真状态。
-        """
-        eps = 0.001  # rad
-        J = np.zeros((3, len(self.arm_joint_qpos_addrs)), dtype=np.float64)
-
-        # 保存并扰动各关节
-        for i, qpos_addr in enumerate(self.arm_joint_qpos_addrs):
-            orig = float(self.data.qpos[qpos_addr])
-
-            # +ε
-            self.data.qpos[qpos_addr] = orig + eps
-            mujoco.mj_forward(self.model, self.data)
-            pos_plus = self.data.xpos[self.ee_body_id].copy()
-
-            # −ε
-            self.data.qpos[qpos_addr] = orig - eps
-            mujoco.mj_forward(self.model, self.data)
-            pos_minus = self.data.xpos[self.ee_body_id].copy()
-
-            # 中心差分
-            J[:, i] = (pos_plus - pos_minus) / (2.0 * eps)
-
-            # 恢复
-            self.data.qpos[qpos_addr] = orig
-
-        # 恢复完整运动学状态
-        mujoco.mj_forward(self.model, self.data)
-
-        msg = Float64MultiArray()
-        msg.data = J.flatten().tolist()  # row-major: [J00..J06, J10..J16, J20..J26]
-        self.jac_pub.publish(msg)
 
     def _refresh_gravity_hold(self):
         """计算当前姿态下所有力矩电机关节的重力保持扭矩（零速 qfrc_bias）。
