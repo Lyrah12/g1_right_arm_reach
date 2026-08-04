@@ -89,6 +89,11 @@ private:
     /// Runs even when the orientation PID is frozen/absent so the wrist never free-falls.
     void applyWristHold();
 
+    /// Recompute per-joint wrist effort limits. Priority: explicit
+    /// wrist_effort_limits param (3 values) → URDF model <limit effort=> × derate
+    /// → legacy uniform tau_max_wrist_. Called at startup and on param change.
+    void recomputeWristEffortLimits();
+
     /// Quaternion orientation error as axis-angle vector (3-DOF).
     static Eigen::Vector3d orientationError(const Eigen::Quaterniond& desired,
                                             const Eigen::Quaterniond& current);
@@ -174,16 +179,36 @@ private:
     int wrist_cycles_since_step_{0};  ///< cycles since last wrist step → effective dt = dt_ * count
 
     // --- Finger state ---
-    Eigen::VectorXd finger_des_q_;      // n_fingers desired (set to target on grasp cmd, held for impedance)
+    Eigen::VectorXd finger_des_q_;      // n_fingers desired (advanced toward target; held for impedance)
+    Eigen::VectorXd finger_target_;     // n_fingers final grasp target (interpolation goal)
+    Eigen::VectorXd finger_step_;       // n_fingers per-cycle interpolation step (P1-7)
+    bool finger_interp_active_{false};  ///< rate-limited ramp to finger_target_ in progress
     bool finger_cmd_received_{false};   ///< a grasp command has set finger_des_q_ (guard first joint_state init)
 
     // --- Torque output (torque mode) ---
     Eigen::Vector3d wrist_cmd_tau_{0.0, 0.0, 0.0};   // wrist joint torque command (N·m)
     Eigen::VectorXd finger_cmd_tau_;                 // finger joint torque command (N·m)
-    double tau_max_wrist_{13.4};                     // ±max wrist torque (5010: 13.4 N·m)
+    double tau_max_wrist_{13.4};                     // legacy uniform fallback (5010: 13.4 N·m)
+
+    /// Per-joint wrist effort clamp (roll, pitch, yaw). P0-3: the URDF effort
+    /// limits differ per joint (stock G1: roll 25, pitch/yaw 5), so a single
+    /// uniform clamp may exceed the pitch/yaw model limit by ~2.7×. Defaults are
+    /// computed by recomputeWristEffortLimits() (model × derate, or param override).
+    Eigen::Vector3d wrist_effort_limits_{13.4, 13.4, 13.4};
+    double wrist_effort_derate_{0.9};                ///< safety derate on model effort limits
+    Eigen::Vector3d wrist_model_limits_{0.0, 0.0, 0.0};  ///< raw URDF <limit effort=> per wrist joint (parsed at startup)
 
     bool joint_state_received_{false};
     double dt_{0.02};
+
+    // --- Command watchdog (P0-2) ---
+    // If /hand_command stops arriving (sequencer died / disconnected), unload:
+    // wrist → gravity hold, fingers → hold current position (zero error). The
+    // sequencer heartbeats every control cycle, so this only fires on real loss.
+    rclcpp::Time last_cmd_time_;      ///< stamp of last /hand_command
+    bool cmd_received_{false};        ///< has any /hand_command been received
+    bool command_lost_{false};        ///< watchdog fired (log-once latch)
+    double command_timeout_{0.5};     ///< s without a command → unload
 
     // --- Control gains (overridden by params.yaml) ---
     double kp_wrist_{3.5};

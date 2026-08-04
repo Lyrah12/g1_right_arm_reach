@@ -140,7 +140,22 @@ hand_controller:
     kp_finger: 5.0                # Finger stiffness (N·m/rad)
     kd_finger: 0.3               # Finger damping (N·m·s/rad)
     tau_max_finger: 1.5           # Max finger torque (N·m) — matches scene motor forcerange
-    tau_max_wrist: 13.4           # Max wrist torque (N·m) — 5010 pitch/yaw
+
+    # P0-3: per-joint wrist effort limits (roll, pitch, yaw) N·m — OPTIONAL.
+    # Omit entirely → auto from URDF model <limit effort=> × wrist_effort_derate
+    #   (stock URDF roll=25, pitch/yaw=5), then tau_max_wrist as fallback.
+    # Set explicitly to override, e.g. to the real 5010 rating:
+    #   wrist_effort_limits: [25.0, 13.4, 13.4]
+    # NOTE: do NOT write `wrist_effort_limits: []` — ROS2 YAML parses an empty
+    # array as "unset" (PARAMETER_NOT_SET); the node treats that as auto anyway,
+    # but as_double_array() on an unset param throws (crashed the node before).
+    wrist_effort_derate: 0.9
+    tau_max_wrist: 13.4           # legacy uniform fallback (5010 pitch/yaw)
+
+    # P0-2: command stream watchdog — if /hand_command stops arriving (sequencer
+    # died), unload after this many seconds (wrist gravity-hold, fingers relax).
+    # The sequencer heartbeats every 20 ms, so 0.5 s only fires on real loss.
+    command_timeout: 0.5
 
     # -------------------------------------------------------------------------
     # Topics

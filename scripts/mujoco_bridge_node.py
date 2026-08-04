@@ -583,6 +583,12 @@ class MuJoCoBridgeNode(Node):
 
         self.js_pub = self.create_publisher(JointState, '/joint_states', 10)
 
+        # P0-2: watchdog status — per commanded joint, seconds since the last FRESH
+        # torque command (or -1 if none received). Lets operators / tests verify
+        # that the bridge reverts to the gravity-hold fallback within cmd_timeout
+        # when a controller stops publishing (verifiable unload / e-stop path).
+        self.watchdog_pub = self.create_publisher(Float64MultiArray, '/debug/bridge_watchdog', 10)
+
         publish_camera = self.get_parameter('publish_camera').get_parameter_value().bool_value
         if publish_camera and self.camera_id >= 0:
             self.rgb_pub = self.create_publisher(Image, '/camera/rgb', 10)
@@ -951,6 +957,10 @@ class MuJoCoBridgeNode(Node):
         # 3. 发布关节状态
         self._publish_joint_states()
 
+        # 3.6 P0-2: 发布看门狗状态（每关节指令年龄，20 Hz）
+        if self.step_counter % 10 == 0:
+            self._publish_watchdog_status()
+
         # 3.25 发布锁定关节保持位置（实物部署用，20 秒一次即可）
         if self.locked_hold_pub is not None and self.step_counter % 4000 == 0:
             self._publish_locked_joint_hold()
@@ -1185,6 +1195,25 @@ class MuJoCoBridgeNode(Node):
             msg.effort.append(0.0)
 
         self.js_pub.publish(msg)
+
+    def _publish_watchdog_status(self):
+        """发布 /debug/bridge_watchdog — 每关节距上次"新鲜"扭矩指令的秒数。
+
+        与 actuator_map 顺序一致；-1 表示从未收到扭矩指令。控制器（reach_node /
+        hand_controller）停止发布后，数值在 cmd_timeout 内增长到超过阈值，即证明
+        桥已退回重力保持兜底（可验证的卸力路径）。
+        """
+        if self.watchdog_pub is None:
+            return
+        now = time.monotonic()
+        ages = []
+        for joint_name in self.actuator_map:
+            last = self.joint_cmd_tau_stamp.get(joint_name) \
+                or self.hand_cmd_tau_stamp.get(joint_name)
+            ages.append(-1.0 if last is None else now - last)
+        msg = Float64MultiArray()
+        msg.data = ages
+        self.watchdog_pub.publish(msg)
 
     def _publish_camera(self):
         """渲染虚拟相机并发布 RGB + Depth 图像。

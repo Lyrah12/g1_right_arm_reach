@@ -75,18 +75,23 @@ ControlResult PIDController::computeGravityHold(
     robot_.updateKinematics();
 
     Eigen::VectorXd tau_g = Eigen::VectorXd::Zero(nv);
-    if (gravity_comp_) resolveGravityTorque(tau_g);
+    if (gravity_comp_) resolveGravityTorque(tau_g);  // Pinocchio, fresh at 50 Hz
 
+    // Idle hold posture spring — deliberately MUCH stiffer than the reach
+    // null-space posture (posture_gain_*8 = 1.6 N·m/rad). The URDF-vs-MuJoCo
+    // gravity residual (~0.1 N·m on the shoulder) would sag the arm ~4° at 1.6;
+    // at 10 N·m/rad it holds within ~0.6° while staying near-critically damped.
+    // DO NOT use /mujoco_gravity here: it is published at 20 Hz, and feeding a
+    // stale gravity forward back during arm motion acts as negative damping that
+    // makes the arm twist/oscillate ("乱扭") — Pinocchio recomputes fresh each
+    // cycle and is inherently stable.
+    constexpr double kIdlePosture = 10.0;  // N·m/rad
     Eigen::VectorXd tau_cmd(n_arm);
     for (int k = 0; k < n_arm; ++k) {
         int i = robot_.arm_joint_indices_[k];
         double dq_i = (k < dq.size()) ? dq(i) : 0.0;
-        // 姿态吸引：无目标时也把手臂拉回就绪姿态（posture_target，与桥接
-        // ready pose 一致）。否则重力保持只是"停在当前位置"——启动瞬间
-        // 若控制器接管前已下垂/被扰动，手臂会停在错误位置不回来。
-        // 强度与 computeArm 扭矩模式的 posture 项一致（posture_gain×8 N·m/rad）。
         double q_err = posture_target_(i) - robot_.q_(i);
-        tau_cmd(k) = tau_g(i) + posture_gain_ * 8.0 * q_err - inner_servo_kv_ * dq_i;
+        tau_cmd(k) = tau_g(i) + kIdlePosture * q_err - inner_servo_kv_ * dq_i;
         tau_cmd(k) = std::max(-25.0, std::min(25.0, tau_cmd(k)));
     }
 

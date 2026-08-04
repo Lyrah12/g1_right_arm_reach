@@ -49,6 +49,7 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/ActionCommand.msg"
     "msg/HandCommand.msg"
+    "msg/ActionResult.msg"
     DEPENDENCIES
         std_msgs
         geometry_msgs

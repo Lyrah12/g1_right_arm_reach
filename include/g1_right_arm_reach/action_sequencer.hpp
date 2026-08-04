@@ -20,6 +20,7 @@
 #include <std_msgs/msg/float64.hpp>
 
 #include "g1_right_arm_reach/msg/action_command.hpp"
+#include "g1_right_arm_reach/msg/action_result.hpp"
 #include "g1_right_arm_reach/msg/hand_command.hpp"
 
 #include <string>
@@ -45,7 +46,21 @@ private:
 
     void startReaching();
     void startGrasping();
-    void finishAction(bool success);
+    void finishAction(bool success, const std::string& reason = "OK");
+    void publishResult(bool success, const std::string& reason);
+
+    /// Feedback watchdog (P0-2): true only if /debug/*_error arrived recently
+    /// (<= feedback_timeout_). Stale feedback from a dead controller/bridge is
+    /// NOT evidence of convergence — without this gate the sequencer could
+    /// "arrive" using an old error and jump to grasp.
+    bool posErrorFresh() const;
+    bool oriErrorFresh() const;
+
+    /// Liveness heartbeat: publish an identity-orientation, empty-grasp
+    /// HandCommand. Kept streaming every control cycle (IDLE/SETTLING/GRASPING)
+    /// so hand_controller's command watchdog can distinguish "action finished,
+    /// hold grasp" (stream alive) from "sequencer died" (stream stops → unload).
+    void publishHoldCommand();
 
     // --- ROS2 communication ---
     rclcpp::Subscription<msg::ActionCommand>::SharedPtr action_sub_;
@@ -55,6 +70,7 @@ private:
     // Plan C: position → /target_point, orientation + grasp → /hand_command
     rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr point_pub_;
     rclcpp::Publisher<msg::HandCommand>::SharedPtr hand_cmd_pub_;
+    rclcpp::Publisher<msg::ActionResult>::SharedPtr result_pub_;  // P0-2: one-shot outcome
 
     rclcpp::TimerBase::SharedPtr control_timer_;
 
@@ -75,6 +91,15 @@ private:
     double state_elapsed_{0.0};
     double position_error_{999.0};
 
+    /// Hard per-action budget (s) across REACHING + SETTLING. Set at action start
+    /// (startReaching); does NOT reset on REACHING↔SETTLING bounces, so an
+    /// oscillating arm is eventually aborted instead of looping forever.
+    double total_elapsed_{0.0};
+    double total_timeout_{10.0};
+
+    /// P0-2: caller-supplied id echoed in /action_result (from ActionCommand).
+    int32_t current_action_id_{-1};
+
     // Control
     double dt_{0.02};
     bool error_received_{false};
@@ -82,6 +107,13 @@ private:
     bool has_orientation_{false};  ///< True when user specifies non-identity orientation
     double orientation_error_{999.0};
     double ori_convergence_tol_{0.08};  ///< ~4.6° for orientation convergence
+
+    // --- Feedback watchdog (P0-2) ---
+    rclcpp::Time last_pos_err_time_;    ///< stamp of last /debug/position_error
+    rclcpp::Time last_ori_err_time_;    ///< stamp of last /debug/orientation_error
+    bool pos_err_time_valid_{false};    ///< false until first error arrives this action
+    bool ori_err_time_valid_{false};
+    double feedback_timeout_{0.5};      ///< s; older feedback = stale, not usable
 
     /// Saturation detection: when wrist offset hits limit, ori_err stops improving.
     /// Track best error and time since last improvement → skip wait if stuck.

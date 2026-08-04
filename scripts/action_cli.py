@@ -15,12 +15,21 @@ All commands publish to /action_command, consumed by ActionSequencerNode.
 """
 
 import argparse
+import itertools
 import sys
 import time
 
 import rclpy
 from rclpy.node import Node
 from g1_right_arm_reach.msg import ActionCommand
+
+# P0-2: per-process action counter. Echoed by the sequencer in /action_result so
+# logs / tests can correlate a failure to the command that caused it.
+_ACTION_SEQ = itertools.count(1)
+
+
+def new_action_id():
+    return next(_ACTION_SEQ)
 
 
 # ===========================================================================
@@ -79,6 +88,7 @@ def cmd_reach(args):
     pub = node.create_publisher(ActionCommand, '/action_command', 10)
 
     cmd = ActionCommand()
+    cmd.action_id = new_action_id()
     cmd.action_type = 'reach'
     cmd.target_x = args.x
     cmd.target_y = args.y
@@ -108,6 +118,7 @@ def cmd_grasp(args):
     pub = node.create_publisher(ActionCommand, '/action_command', 10)
 
     cmd = ActionCommand()
+    cmd.action_id = new_action_id()
     cmd.action_type = 'grasp'
     cmd.grasp_type = args.pattern
     cmd.grasp_duration = args.duration
@@ -129,6 +140,7 @@ def cmd_reach_and_grasp(args):
     pub = node.create_publisher(ActionCommand, '/action_command', 10)
 
     cmd = ActionCommand()
+    cmd.action_id = new_action_id()
     cmd.action_type = 'reach_and_grasp'
     cmd.target_x = args.x
     cmd.target_y = args.y
@@ -160,6 +172,7 @@ def cmd_home(args):
     pub = node.create_publisher(ActionCommand, '/action_command', 10)
 
     cmd = ActionCommand()
+    cmd.action_id = new_action_id()
     cmd.action_type = 'home'
 
     wait_for_match(node, pub)
@@ -179,6 +192,7 @@ def cmd_open(args):
     pub = node.create_publisher(ActionCommand, '/action_command', 10)
 
     cmd = ActionCommand()
+    cmd.action_id = new_action_id()
     cmd.action_type = 'grasp'
     cmd.grasp_type = 'open'
     cmd.grasp_duration = 0.3
@@ -317,6 +331,7 @@ def cmd_interactive(args):
             # ── home ──
             if cmd_first == 'home':
                 cmd = ActionCommand()
+                cmd.action_id = new_action_id()
                 cmd.action_type = 'home'
                 pub.publish(cmd)
                 ok("HOME → ready pose + home grasp [3-DOF]")
@@ -325,6 +340,7 @@ def cmd_interactive(args):
             # ── open ──
             if cmd_first == 'open':
                 cmd = ActionCommand()
+                cmd.action_id = new_action_id()
                 cmd.action_type = 'grasp'
                 cmd.grasp_type = 'open'
                 cmd.grasp_duration = 0.15
@@ -335,6 +351,7 @@ def cmd_interactive(args):
             # ── grasp <pattern> [duration] ──
             if cmd_first == 'grasp' and len(parts) >= 2:
                 cmd = ActionCommand()
+                cmd.action_id = new_action_id()
                 cmd.action_type = 'grasp'
                 cmd.grasp_type = parts[1]
                 cmd.grasp_duration = float(parts[2]) if len(parts) >= 3 else 0.3
@@ -345,6 +362,7 @@ def cmd_interactive(args):
             # ── reach <x> <y> <z> ──
             if cmd_first == 'reach' and len(parts) >= 4:
                 cmd = ActionCommand()
+                cmd.action_id = new_action_id()
                 cmd.action_type = 'reach'
                 cmd.target_x = float(parts[1])
                 cmd.target_y = float(parts[2])
@@ -400,6 +418,7 @@ def cmd_interactive(args):
                     qz = cr*cp*sy - sr*sp*cy
 
                     cmd = ActionCommand()
+                    cmd.action_id = new_action_id()
                     cmd.action_type = 'reach_and_grasp'
                     cmd.target_x = x; cmd.target_y = y; cmd.target_z = z
                     cmd.ori_x = float(qx); cmd.ori_y = float(qy)
@@ -442,6 +461,7 @@ def cmd_interactive(args):
                     qw, qx, qy, qz = cy, 0.0, 0.0, sy
 
                     cmd = ActionCommand()
+                    cmd.action_id = new_action_id()
                     cmd.action_type = 'reach_and_grasp'
                     cmd.target_x = x; cmd.target_y = y; cmd.target_z = z
                     cmd.ori_x = float(qx); cmd.ori_y = float(qy)
@@ -466,6 +486,7 @@ def cmd_interactive(args):
                             pass
 
                     cmd = ActionCommand()
+                    cmd.action_id = new_action_id()
                     cmd.action_type = 'reach_and_grasp'
                     cmd.target_x = x; cmd.target_y = y; cmd.target_z = z
                     cmd.ori_w = 1.0

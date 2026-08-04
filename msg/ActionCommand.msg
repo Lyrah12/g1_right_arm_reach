@@ -4,6 +4,7 @@
 
 # ── Action type ──
 string   action_type         # reach | grasp | reach_and_grasp | home
+int32    action_id -1        # Caller-supplied id, echoed in /action_result (P0-2)
 
 # ── Arm target (reach / reach_and_grasp) ──
 float64  target_x  0.0       # Shoulder-relative X (m, forward)

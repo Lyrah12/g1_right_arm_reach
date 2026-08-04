@@ -24,10 +24,51 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 namespace g1_right_arm_reach {
 
 using namespace std::literals::chrono_literals;
+
+// ============================================================================
+// URDF per-joint effort limit parser (P0-3)
+// ============================================================================
+
+namespace {
+
+/// Read one joint's `<limit effort=>` value directly from the URDF text.
+/// Pinocchio's model.effortLimit is NOT reliably populated from URDF across
+/// versions (observed: roll parsed as 5 instead of 25, yaw as 0 instead of 5),
+/// so we parse the model of record. Returns > 0 on success, -1 if not found.
+double effortLimitFromUrdf(const std::string& urdf_path, const std::string& joint_name)
+{
+    std::ifstream f(urdf_path);
+    if (!f) return -1.0;
+    const std::string content(
+        (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    const std::string tag = "<joint name=\"" + joint_name + "\"";
+    const size_t jpos = content.find(tag);
+    if (jpos == std::string::npos) return -1.0;
+
+    // First <limit ...> within the joint block (limit tag is close after <joint>).
+    const size_t lim = content.find("<limit", jpos);
+    if (lim == std::string::npos || lim - jpos > 600) return -1.0;
+
+    const size_t epos = content.find("effort=\"", lim);
+    if (epos == std::string::npos || epos - lim > 200) return -1.0;
+
+    const size_t beg = epos + 8;  // length of `effort="`
+    const size_t end = content.find('"', beg);
+    if (end == std::string::npos) return -1.0;
+
+    return std::strtod(content.substr(beg, end - beg).c_str(), nullptr);
+}
+
+}  // namespace
 
 // ============================================================================
 // Constructor
@@ -97,6 +138,13 @@ HandController::HandController()
             pin_arm_count_ = static_cast<int>(arm_names.size());
             kin_ = std::make_unique<Kinematics>(*robot_);
             pinocchio_ready_ = true;
+
+            // P0-3: parse each wrist joint's <limit effort=> from the URDF text.
+            // Pinocchio's model.effortLimit is unreliable here, so the URDF is the
+            // source of truth for per-joint effort limits (recomputeWristEffortLimits).
+            for (int j = 0; j < n_wrist_; ++j)
+                wrist_model_limits_(j) = effortLimitFromUrdf(urdf_path, wrist_names_[j]);
+
             RCLCPP_INFO(get_logger(),
                 "Pinocchio model ready: %d arm + %d wrist joints. "
                 "Wrist ori/Jacobian/gravity computed locally (hardware path).",
@@ -115,6 +163,14 @@ HandController::HandController()
     this->declare_parameter("kd_finger", 0.3);
     this->declare_parameter("tau_max_finger", 1.5);   // hand motor torque limit (N·m)
     this->declare_parameter("tau_max_wrist", 13.4);   // 5010 wrist torque limit (N·m)
+    // P0-3: per-joint wrist effort limits. Empty → auto from URDF model × derate;
+    // else explicit [roll, pitch, yaw] N·m (e.g. the 5010 real rating [25, 13.4, 13.4]).
+    this->declare_parameter("wrist_effort_limits", std::vector<double>{});
+    this->declare_parameter("wrist_effort_derate", 0.9);
+    // P0-2: if /hand_command stops arriving (sequencer died), unload after this
+    // many seconds. The sequencer heartbeats every 20 ms, so 0.5 s is 25 missed
+    // cycles — only real stream loss triggers it.
+    this->declare_parameter("command_timeout", 0.5);
 
     kp_wrist_ = this->get_parameter("kp_wrist").as_double();
     ki_wrist_ = this->get_parameter("ki_wrist").as_double();
@@ -126,11 +182,16 @@ HandController::HandController()
     kd_finger_ = this->get_parameter("kd_finger").as_double();
     tau_max_finger_ = this->get_parameter("tau_max_finger").as_double();
     tau_max_wrist_ = this->get_parameter("tau_max_wrist").as_double();
+    wrist_effort_derate_ = this->get_parameter("wrist_effort_derate").as_double();
+    command_timeout_ = this->get_parameter("command_timeout").as_double();
+    recomputeWristEffortLimits();
 
     // --- State vectors ---
     actual_q_ = Eigen::VectorXd::Zero(n_total_);
     actual_dq_ = Eigen::VectorXd::Zero(n_total_);
     finger_des_q_ = Eigen::VectorXd::Zero(n_fingers_);
+    finger_target_ = Eigen::VectorXd::Zero(n_fingers_);
+    finger_step_ = Eigen::VectorXd::Zero(n_fingers_);
     finger_cmd_tau_ = Eigen::VectorXd::Zero(n_fingers_);
 
     // --- ROS2 communication ---
@@ -191,8 +252,20 @@ HandController::HandController()
                 else if (p.get_name() == "kp_finger") kp_finger_ = p.as_double();
                 else if (p.get_name() == "kd_finger") kd_finger_ = p.as_double();
                 else if (p.get_name() == "tau_max_finger") tau_max_finger_ = p.as_double();
-                else if (p.get_name() == "tau_max_wrist" && p.as_double() > 0.0)
+                else if (p.get_name() == "tau_max_wrist" && p.as_double() > 0.0) {
                     tau_max_wrist_ = p.as_double();
+                    recomputeWristEffortLimits();
+                }
+                else if (p.get_name() == "wrist_effort_derate" && p.as_double() > 0.0) {
+                    wrist_effort_derate_ = p.as_double();
+                    recomputeWristEffortLimits();
+                }
+                else if (p.get_name() == "wrist_effort_limits") {
+                    recomputeWristEffortLimits();
+                }
+                else if (p.get_name() == "command_timeout" && p.as_double() > 0.0) {
+                    command_timeout_ = p.as_double();
+                }
             }
             return result;
         });
@@ -210,6 +283,19 @@ HandController::HandController()
 
 void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
 {
+    // P0-5: reject malformed quaternion commands at the entry point.
+    if (!std::isfinite(msg->ori_x) || !std::isfinite(msg->ori_y)
+        || !std::isfinite(msg->ori_z) || !std::isfinite(msg->ori_w)) {
+        RCLCPP_WARN(get_logger(), "Rejected hand command: non-finite quaternion");
+        return;
+    }
+
+    // P0-2: stamp the command stream (watchdog liveness). Only a VALID command
+    // re-arms the watchdog — malformed ones are rejected above and do not.
+    last_cmd_time_ = this->now();
+    cmd_received_ = true;
+    command_lost_ = false;
+
     // --- Wrist orientation target ---
     // Identity quaternion (0,0,0,1) → no orientation change (hold current).
     // Non-identity quaternions are interpreted as rotations RELATIVE to current palm orientation:
@@ -220,6 +306,15 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
                     && std::abs(msg->ori_z) < 1e-9 && std::abs(msg->ori_w - 1.0) < 1e-9;
 
     if (!is_identity) {
+        // P0-5: reject a non-unit quaternion — normalize() would silently mask a
+        // malformed input instead of refusing it.
+        const double n2 = msg->ori_w*msg->ori_w + msg->ori_x*msg->ori_x
+                        + msg->ori_y*msg->ori_y + msg->ori_z*msg->ori_z;
+        if (std::abs(n2 - 1.0) > 1e-3) {
+            RCLCPP_WARN(get_logger(), "Rejected hand command: quaternion norm != 1");
+            return;
+        }
+
         Eigen::Quaterniond new_target(msg->ori_w, msg->ori_x, msg->ori_y, msg->ori_z);
         new_target.normalize();
 
@@ -306,30 +401,44 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr msg)
     // --- Finger grasp target ---
     const std::string& gtype = msg->grasp_type;
     if (!gtype.empty()) {
+        // Resolve the pattern (custom / unknown fall back to home).
+        std::string pattern_name = gtype;
         if (gtype == "custom") {
-            // custom mode not supported in HandCommand yet; fallback to home
             RCLCPP_WARN(get_logger(), "Custom grasp not yet supported in HandCommand. Using 'home'.");
-            auto pattern = grasp_library_.getPattern("home");
-            for (int j = 0; j < n_fingers_; ++j) {
-                auto it = pattern.joints.find(finger_names_[j]);
-                finger_des_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
-            }
-        } else {
-            auto pattern = grasp_library_.getPattern(gtype);
-            if (pattern.name.empty()) {
-                RCLCPP_WARN(get_logger(),
-                    "Unknown grasp type '%s'. Defaulting to 'home'.", gtype.c_str());
-                pattern = grasp_library_.getPattern("home");
-            }
-            for (int j = 0; j < n_fingers_; ++j) {
-                auto it = pattern.joints.find(finger_names_[j]);
-                finger_des_q_(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
+            pattern_name = "home";
+        }
+        auto pattern = grasp_library_.getPattern(pattern_name);
+        if (pattern.name.empty()) {
+            RCLCPP_WARN(get_logger(),
+                "Unknown grasp type '%s'. Defaulting to 'home'.", gtype.c_str());
+            pattern = grasp_library_.getPattern("home");
+        }
+
+        // P1-7: set the TARGET (not a snap). grasp_duration > 0 drives a
+        // rate-limited ramp toward it; <= 0 snaps immediately (legacy behavior).
+        Eigen::VectorXd new_target(n_fingers_);
+        for (int j = 0; j < n_fingers_; ++j) {
+            auto it = pattern.joints.find(finger_names_[j]);
+            new_target(j) = (it != pattern.joints.end()) ? it->second : actual_q_(n_wrist_ + j);
+        }
+
+        // Re-arming interpolation on identical re-publishes (sequencer GRASPING
+        // heartbeat) would restart the ramp every 20 ms — only (re)initialize
+        // when the target actually changed, or on the first grasp command.
+        const bool target_changed = (new_target - finger_target_).norm() > 1e-9;
+        if (target_changed || !finger_cmd_received_) {
+            finger_target_ = new_target;
+            if (msg->grasp_duration <= 0.0) {
+                finger_des_q_ = finger_target_;
+                finger_interp_active_ = false;
+            } else {
+                const double cycles = std::max(1.0, msg->grasp_duration / dt_);
+                for (int j = 0; j < n_fingers_; ++j)
+                    finger_step_(j) = std::abs(finger_target_(j) - finger_des_q_(j)) / cycles;
+                finger_interp_active_ = true;
             }
         }
 
-        // Snap des_q directly to target — the impedance controller (τ=Kp·e+Kd·ė)
-        // handles the transition smoothly. HandCommand.grasp_duration is a sequencer
-        // timing field, not a finger interpolation ramp.
         finger_cmd_received_ = true;
     }
 }
@@ -510,6 +619,29 @@ void HandController::gravityCallback(
 void HandController::controlLoop()
 {
     if (!joint_state_received_) return;
+
+    // P0-2: command stream watchdog — if the sequencer stopped publishing
+    // /hand_command, unload instead of holding a stale goal: wrist → gravity
+    // hold (stop orientation chase), fingers → hold current position (zero
+    // error → zero applied force). The sequencer heartbeats every 20 ms, so
+    // this only fires on real stream loss (death / disconnect).
+    if (cmd_received_) {
+        const double idle = (this->now() - last_cmd_time_).seconds();
+        if (idle > command_timeout_) {
+            if (!command_lost_) {
+                RCLCPP_WARN(get_logger(),
+                    "Hand command stream lost (%.1fs > %.1fs) — unloading: "
+                    "wrist gravity-hold, fingers relax", idle, command_timeout_);
+                command_lost_ = true;
+            }
+            has_ori_target_ = false;
+            finger_interp_active_ = false;
+            for (int j = 0; j < n_fingers_; ++j)
+                finger_des_q_(j) = actual_q_(n_wrist_ + j);
+        } else {
+            command_lost_ = false;
+        }
+    }
 
     // Hardware-fidelity (2026-08-02): Pinocchio is the PRIMARY wrist feedback
     // source — real hardware has no MuJoCo, so ori/Jacobian/gravity are computed
@@ -701,13 +833,62 @@ void HandController::refreshPinocchio()
     }
 }
 
+void HandController::recomputeWristEffortLimits()
+{
+    // P0-3: per-joint wrist effort clamp. Priority:
+    //   1. explicit wrist_effort_limits param [roll, pitch, yaw] N·m
+    //   2. URDF model <limit effort=> per joint (Pinocchio effortLimit) × derate
+    //   3. legacy uniform tau_max_wrist_
+    // Guard the type: an empty-array entry (`wrist_effort_limits: []`) is parsed
+    // by ROS2 as PARAMETER_NOT_SET, and as_double_array() on an unset parameter
+    // throws. Only treat it as an explicit override when it is actually a
+    // double array of >= 3 values; otherwise fall through to model auto.
+    const rclcpp::Parameter p_lim = this->get_parameter("wrist_effort_limits");
+    if (p_lim.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+        const auto explicit_lim = p_lim.as_double_array();
+        if (explicit_lim.size() >= 3) {
+            for (int j = 0; j < n_wrist_; ++j)
+                wrist_effort_limits_(j) = explicit_lim[j];
+            RCLCPP_INFO(get_logger(),
+                "Wrist effort limits: explicit [%.2f %.2f %.2f] N·m",
+                wrist_effort_limits_(0), wrist_effort_limits_(1), wrist_effort_limits_(2));
+            return;
+        }
+    }
+
+    // 2. Model-derived: per-joint URDF <limit effort=> (parsed at startup into
+    //    wrist_model_limits_) × derate. Missing effort (<= 0) falls back per-joint.
+    bool from_model = false;
+    for (int j = 0; j < n_wrist_; ++j) {
+        if (wrist_model_limits_(j) > 0.0) {
+            wrist_effort_limits_(j) = wrist_model_limits_(j) * wrist_effort_derate_;
+            from_model = true;
+        } else {
+            wrist_effort_limits_(j) = tau_max_wrist_;
+        }
+    }
+    if (from_model) {
+        RCLCPP_INFO(get_logger(),
+            "Wrist effort limits: model × derate(%.2f) = [%.2f %.2f %.2f] N·m",
+            wrist_effort_derate_,
+            wrist_effort_limits_(0), wrist_effort_limits_(1), wrist_effort_limits_(2));
+        return;
+    }
+
+    // 3. Fallback: legacy uniform limit.
+    wrist_effort_limits_.setConstant(tau_max_wrist_);
+    RCLCPP_INFO(get_logger(),
+        "Wrist effort limits: uniform %.2f N·m (URDF effort not found)",
+        tau_max_wrist_);
+}
+
 void HandController::applyWristHold()
 {
     // τ = g_wrist − kd_joint·dq — holds the wrist against gravity every cycle.
     // stepWristControl (when it runs) overwrites this with the full PID torque.
     Eigen::Vector3d tau = wrist_gravity_ - wrist_joint_damping_ * actual_dq_.head<3>();
     for (int j = 0; j < n_wrist_; ++j) {
-        tau(j) = std::max(-tau_max_wrist_, std::min(tau_max_wrist_, tau(j)));
+        tau(j) = std::max(-wrist_effort_limits_(j), std::min(wrist_effort_limits_(j), tau(j)));
     }
     wrist_cmd_tau_ = tau;
 }
@@ -771,7 +952,7 @@ void HandController::stepWristControl(double dt)
         + wrist_gravity_
         - wrist_joint_damping_ * actual_dq_.head<3>();
     for (int j = 0; j < n_wrist_; ++j) {
-        tau_wrist(j) = std::max(-tau_max_wrist_, std::min(tau_max_wrist_, tau_wrist(j)));
+        tau_wrist(j) = std::max(-wrist_effort_limits_(j), std::min(wrist_effort_limits_(j), tau_wrist(j)));
     }
     wrist_cmd_tau_ = tau_wrist;
 
@@ -783,6 +964,22 @@ void HandController::stepWristControl(double dt)
 
 void HandController::stepFingerControl()
 {
+    // P1-7: advance finger_des_q_ toward finger_target_ at the rate-limited step
+    // set by grasp_duration (each cycle at 50 Hz).
+    if (finger_interp_active_) {
+        bool all_done = true;
+        for (int j = 0; j < n_fingers_; ++j) {
+            const double diff = finger_target_(j) - finger_des_q_(j);
+            if (std::abs(diff) <= finger_step_(j)) {
+                finger_des_q_(j) = finger_target_(j);
+            } else {
+                all_done = false;
+                finger_des_q_(j) += (diff > 0.0 ? 1.0 : -1.0) * finger_step_(j);
+            }
+        }
+        if (all_done) finger_interp_active_ = false;
+    }
+
     for (int j = 0; j < n_fingers_; ++j) {
         int idx = n_wrist_ + j;
         double e = finger_des_q_(j) - actual_q_(idx);

@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cmath>
 
 namespace g1_right_arm_reach {
 
@@ -214,6 +215,13 @@ private:
 
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
+        // P0-5: entry validation on the legacy path too.
+        if (!std::isfinite(msg->pose.position.x) || !std::isfinite(msg->pose.position.y)
+            || !std::isfinite(msg->pose.position.z)) {
+            RCLCPP_WARN(get_logger(), "Rejected target_pose: non-finite position");
+            return;
+        }
+
         // Legacy: extract position only (orientation → hand_controller in Plan C)
         Eigen::Vector3d new_pos(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
         if (has_target_ && new_pos.isApprox(target_pos_, 1e-3))
@@ -236,6 +244,21 @@ private:
 
     void pointCallback(const geometry_msgs::msg::Point::SharedPtr msg)
     {
+        // P0-5: entry validation on the direct /target_point path — reject
+        // non-finite and clearly out-of-workspace targets (shoulder-relative).
+        if (!std::isfinite(msg->x) || !std::isfinite(msg->y) || !std::isfinite(msg->z)) {
+            RCLCPP_WARN(get_logger(), "Rejected target: non-finite [%.3f %.3f %.3f]",
+                msg->x, msg->y, msg->z);
+            return;
+        }
+        if (msg->x < 0.0 || msg->x > 0.55 ||
+            std::abs(msg->y) > 0.45 ||
+            msg->z < -0.35 || msg->z > 0.45) {
+            RCLCPP_WARN(get_logger(), "Rejected target outside workspace box: [%.3f %.3f %.3f]",
+                msg->x, msg->y, msg->z);
+            return;
+        }
+
         Eigen::Vector3d new_pos(msg->x, msg->y, msg->z);
         if (has_target_ && new_pos.isApprox(target_pos_, 1e-6)) return;
 

@@ -19,11 +19,62 @@
 #include "g1_right_arm_reach/action_sequencer.hpp"
 
 #include <cstdio>
+#include <cmath>
+#include <string>
 #include <Eigen/Geometry>
 
 namespace g1_right_arm_reach {
 
 using namespace std::literals::chrono_literals;
+
+// ============================================================================
+// Input validation (P0-5)
+// ============================================================================
+
+namespace {
+
+/// Reject malformed / out-of-range action commands at the entry point.
+/// A target may only reach the controller if every field is finite, the
+/// quaternion (when a non-identity orientation is requested) is unit-norm,
+/// durations are positive, and the position is inside a generous workspace
+/// sanity box (shoulder-relative). Returns false + a reason on failure.
+bool validateActionCommand(const msg::ActionCommand& m, std::string& why)
+{
+    const double fields[] = {
+        m.target_x, m.target_y, m.target_z,
+        m.ori_x, m.ori_y, m.ori_z, m.ori_w,
+        m.convergence_timeout, m.settle_time, m.grasp_duration,
+    };
+    for (double v : fields) {
+        if (!std::isfinite(v)) { why = "non-finite field"; return false; }
+    }
+
+    if (m.convergence_timeout <= 0.0) { why = "convergence_timeout must be > 0"; return false; }
+    if (m.settle_time < 0.0)          { why = "settle_time must be >= 0"; return false; }
+    if (m.grasp_duration < 0.0)       { why = "grasp_duration must be >= 0"; return false; }
+
+    // Quaternion norm — only when a non-identity orientation is requested.
+    const bool has_ori = std::abs(m.ori_x) > 1e-9 || std::abs(m.ori_y) > 1e-9
+                      || std::abs(m.ori_z) > 1e-9 || std::abs(m.ori_w - 1.0) > 1e-9;
+    if (has_ori) {
+        const double n2 = m.ori_x*m.ori_x + m.ori_y*m.ori_y
+                        + m.ori_z*m.ori_z + m.ori_w*m.ori_w;
+        if (std::abs(n2 - 1.0) > 1e-3) { why = "quaternion norm != 1"; return false; }
+    }
+
+    // Workspace sanity box (shoulder-relative, generous). Precise reachability is
+    // checked downstream by the IK; this only gates clearly-out-of-range targets.
+    if (m.target_x < 0.0 || m.target_x > 0.55 ||
+        std::abs(m.target_y) > 0.45 ||
+        m.target_z < -0.35 || m.target_z > 0.45) {
+        why = "target outside workspace box";
+        return false;
+    }
+
+    return true;
+}
+
+}  // namespace
 
 // ============================================================================
 // Constructor
@@ -54,6 +105,11 @@ ActionSequencerNode::ActionSequencerNode()
     hand_cmd_pub_ = this->create_publisher<msg::HandCommand>(
         "/hand_command", 10);
 
+    // One-shot action outcome (P0-2) — lets callers/tests verify that a timeout
+    // or rejection was acted on, and lets logs correlate failures to action_id.
+    result_pub_ = this->create_publisher<msg::ActionResult>(
+        "/action_result", 10);
+
     // --- Control timer (50 Hz) ---
     dt_ = 0.02;
     control_timer_ = this->create_wall_timer(
@@ -72,6 +128,9 @@ void ActionSequencerNode::actionCallback(const msg::ActionCommand::SharedPtr msg
 {
     const std::string& type = msg->action_type;
 
+    // P0-2: remember the caller's id for /action_result correlation.
+    current_action_id_ = msg->action_id;
+
     // open / home are EMERGENCY RESET commands — always accepted even when busy
     bool is_reset = (type == "home" || msg->grasp_type == "open");
     if (!is_reset && state_ != State::IDLE) {
@@ -80,6 +139,26 @@ void ActionSequencerNode::actionCallback(const msg::ActionCommand::SharedPtr msg
             "Use 'open' or 'home' to reset.",
             static_cast<int>(state_), type.c_str());
         return;
+    }
+
+    // P0-5: entry validation — reject malformed / out-of-range commands. 'home'
+    // uses internal constants (not msg fields), so it skips validation.
+    if (type != "home") {
+        std::string why;
+        if (!validateActionCommand(*msg, why)) {
+            RCLCPP_WARN(get_logger(),
+                "Rejected action '%s': %s (tgt=[%.3f %.3f %.3f] "
+                "q=(%.3f,%.3f,%.3f,%.3f) conv=%.2f settle=%.2f grasp=%.2f)",
+                type.c_str(), why.c_str(),
+                msg->target_x, msg->target_y, msg->target_z,
+                msg->ori_x, msg->ori_y, msg->ori_z, msg->ori_w,
+                msg->convergence_timeout, msg->settle_time, msg->grasp_duration);
+            position_error_ = 0.0;
+            orientation_error_ = 0.0;
+            total_elapsed_ = 0.0;
+            publishResult(false, "VALIDATION_REJECT");
+            return;
+        }
     }
 
     // Detect non-identity orientation
@@ -173,12 +252,19 @@ void ActionSequencerNode::errorCallback(const std_msgs::msg::Float64::SharedPtr 
 {
     position_error_ = msg->data;
     error_received_ = true;
+    // P0-2: stamp every feedback so convergence requires FRESH data. Stale
+    // feedback (bridge/controller dead) must not be treated as evidence of
+    // arrival — otherwise the sequencer "converges" on an old error.
+    last_pos_err_time_ = this->now();
+    pos_err_time_valid_ = true;
 }
 
 void ActionSequencerNode::oriErrorCallback(const std_msgs::msg::Float64::SharedPtr msg)
 {
     orientation_error_ = msg->data;
     ori_error_received_ = true;
+    last_ori_err_time_ = this->now();
+    ori_err_time_valid_ = true;
 }
 
 // ============================================================================
@@ -192,6 +278,13 @@ void ActionSequencerNode::startReaching()
     best_ori_error_ = 999.0;
     ori_stuck_time_ = 0.0;
 
+    // Hard per-action budget across REACHING + SETTLING. The phase-level
+    // convergence_timeout_ resets every time the arm bounces back from SETTLING
+    // (overshoot), so a persistently-oscillating arm could loop forever; the
+    // total budget does not reset, and aborts the whole action if exceeded.
+    total_elapsed_ = 0.0;
+    total_timeout_ = convergence_timeout_ + settle_time_ + 2.0;
+
     // Reset convergence telemetry. Without this, stale errors from the previous
     // action (e.g. a converged 5 mm residual) would make the FIRST REACHING cycle
     // think position/orientation already converged and jump straight to grasp
@@ -200,6 +293,10 @@ void ActionSequencerNode::startReaching()
     error_received_ = false;
     orientation_error_ = 999.0;
     ori_error_received_ = false;
+    // P0-2: feedback freshness must also reset — a timestamp from the previous
+    // action must not make the new action's feedback look "fresh".
+    pos_err_time_valid_ = false;
+    ori_err_time_valid_ = false;
 
     // Plan C: always publish position to /target_point (Point, 3-DOF)
     auto pt = geometry_msgs::msg::Point();
@@ -236,22 +333,60 @@ void ActionSequencerNode::startGrasping()
     state_elapsed_ = 0.0;
 
     // Phase 2: grasp only. Identity quat → hold wrist orientation. grasp_type → close fingers.
-    // grasp_duration=0.0: hand controller uses its own interp_duration (0.02s ≈ 1 cycle).
-    // The sequencer's grasp_duration_ governs its own GRASPING state timeout (line 371).
+    // P1-7: forward grasp_duration_ as the finger interpolation ramp — the hand
+    // now rates-limits the finger target over that time (<=0 = immediate).
     auto cmd = msg::HandCommand();
     cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;  // identity → hold
     cmd.grasp_type = grasp_type_;
-    cmd.grasp_duration = 0.0;
+    cmd.grasp_duration = grasp_duration_;
     hand_cmd_pub_->publish(cmd);
 }
 
-void ActionSequencerNode::finishAction(bool success)
+void ActionSequencerNode::publishResult(bool success, const std::string& reason)
 {
-    const char* status = success ? "OK" : "TIMEOUT";
-    printf("[SEQ] %s pos=%.1f mm ori=%.3f rad elapsed=%.2f s\n",
-        status, position_error_ * 1000.0, orientation_error_, state_elapsed_);
+    auto res = msg::ActionResult();
+    res.action_id = current_action_id_;
+    res.success = success;
+    res.reason = reason;
+    res.position_error_m = position_error_;
+    // No orientation requested → no meaningful orientation error (999 reset
+    // sentinel must not leak into a result).
+    res.orientation_error_rad = has_orientation_ ? orientation_error_ : 0.0;
+    res.duration_s = total_elapsed_;
+    result_pub_->publish(res);
+}
+
+void ActionSequencerNode::finishAction(bool success, const std::string& reason)
+{
+    printf("[SEQ] %s (action_id=%d) pos=%.1f mm ori=%.3f rad elapsed=%.2f s\n",
+        reason.c_str(), current_action_id_,
+        position_error_ * 1000.0,
+        has_orientation_ ? orientation_error_ : 0.0,  // no ori requested → 0, not the 999 sentinel
+        state_elapsed_);
     fflush(stdout);
+    publishResult(success, reason);
     state_ = State::IDLE;
+}
+
+bool ActionSequencerNode::posErrorFresh() const
+{
+    return pos_err_time_valid_
+        && (this->now() - last_pos_err_time_).seconds() <= feedback_timeout_;
+}
+
+bool ActionSequencerNode::oriErrorFresh() const
+{
+    return ori_err_time_valid_
+        && (this->now() - last_ori_err_time_).seconds() <= feedback_timeout_;
+}
+
+void ActionSequencerNode::publishHoldCommand()
+{
+    auto cmd = msg::HandCommand();
+    cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;  // identity → hold
+    cmd.grasp_type = "";
+    cmd.grasp_duration = 0.0;
+    hand_cmd_pub_->publish(cmd);
 }
 
 // ============================================================================
@@ -262,10 +397,14 @@ void ActionSequencerNode::controlLoop()
 {
     switch (state_) {
     case State::IDLE:
+        // P0-2: liveness heartbeat — keeps the hand's command watchdog armed
+        // while idle, so a held grasp persists but a dead sequencer unloads.
+        publishHoldCommand();
         break;
 
     case State::REACHING:
         state_elapsed_ += dt_;
+        total_elapsed_ += dt_;
 
         // Re-publish position target every cycle
         {
@@ -294,14 +433,16 @@ void ActionSequencerNode::controlLoop()
             hand_cmd_pub_->publish(cmd);
         }
 
-        // Phase 1 convergence: BOTH position AND orientation
+        // Phase 1 convergence: BOTH position AND orientation. Convergence
+        // requires FRESH feedback (P0-2) — an old error from a dead feedback
+        // stream is not evidence of arrival.
         {
-            bool pos_ok = error_received_ && position_error_ <= 0.015;
+            bool pos_ok = posErrorFresh() && position_error_ <= 0.015;
 
             // Saturation detection: if wrist offset hits limit, ori_err stops improving.
             // Track best error and time since last improvement → skip wait if stuck.
             bool ori_stuck = false;
-            if (has_orientation_ && ori_error_received_) {
+            if (has_orientation_ && oriErrorFresh()) {
                 if (orientation_error_ < best_ori_error_ - 0.005) {
                     best_ori_error_ = orientation_error_;
                     ori_stuck_time_ = 0.0;
@@ -313,7 +454,7 @@ void ActionSequencerNode::controlLoop()
             }
 
             bool ori_ok = !has_orientation_
-                       || (ori_error_received_ && orientation_error_ < ori_convergence_tol_);
+                       || (oriErrorFresh() && orientation_error_ < ori_convergence_tol_);
 
             if (pos_ok && (ori_ok || ori_stuck)) {
                 if (ori_stuck) {
@@ -322,7 +463,7 @@ void ActionSequencerNode::controlLoop()
                     fflush(stdout);
                 }
                 if (grasp_type_.empty()) {
-                    finishAction(true);  // reach only
+                    finishAction(true, "CONVERGED");  // reach only
                 } else {
                     state_ = State::SETTLING;
                     state_elapsed_ = 0.0;
@@ -330,21 +471,33 @@ void ActionSequencerNode::controlLoop()
             }
         }
 
-        if (state_elapsed_ > convergence_timeout_) {
-            printf("[SEQ] REACHING timeout (%.1fs pos=%.3f m ori=%.3f rad) %s\n",
-                state_elapsed_, position_error_, orientation_error_,
-                grasp_type_.empty() ? "→ abort" : "→ grasp");
+        // Both guards are gated on still being REACHING: the convergence block
+        // above may already have finished the action (reach-only) or moved to
+        // SETTLING, and a double-finish on the boundary cycle would emit a false
+        // abort after a success.
+        if (state_ == State::REACHING && state_elapsed_ > convergence_timeout_) {
+            // P0: timeout MUST abort — never proceed to grasp without a converged
+            // (fresh) position. Closing the fingers at an unreached target is unsafe.
+            printf("[SEQ] REACHING timeout (%.1fs pos=%.3f m ori=%.3f rad) → abort, no grasp\n",
+                state_elapsed_, position_error_, orientation_error_);
             fflush(stdout);
-            if (grasp_type_.empty()) {
-                finishAction(false);
-            } else {
-                startGrasping();
-            }
+            finishAction(false, "REACH_TIMEOUT");
+            break;
+        }
+
+        // Hard per-action budget (across REACHING+SETTLING, see startReaching)
+        if (state_ == State::REACHING && total_elapsed_ > total_timeout_) {
+            printf("[SEQ] ACTION budget exceeded (%.1fs > %.1fs) → abort, no grasp\n",
+                total_elapsed_, total_timeout_);
+            fflush(stdout);
+            finishAction(false, "ACTION_BUDGET");
+            break;
         }
         break;
 
     case State::SETTLING:
         state_elapsed_ += dt_;
+        total_elapsed_ += dt_;
 
         // Keep publishing position target (arm stays locked)
         {
@@ -355,12 +508,27 @@ void ActionSequencerNode::controlLoop()
             point_pub_->publish(pt);
         }
 
+        // P0-2: keep the hand command stream alive (liveness heartbeat).
+        publishHoldCommand();
+
+        // Hard per-action budget: if settle (incl. REACHING↔SETTLING bounces)
+        // drags on, abort the whole action instead of grasping late.
+        if (total_elapsed_ > total_timeout_) {
+            printf("[SEQ] ACTION budget exceeded in SETTLING (%.1fs > %.1fs) → abort\n",
+                total_elapsed_, total_timeout_);
+            fflush(stdout);
+            finishAction(false, "ACTION_BUDGET");
+            break;
+        }
+
         if (state_elapsed_ >= settle_time_) {
             startGrasping();
         }
 
-        // Overshoot check
-        if (error_received_ && position_error_ > 0.03) {
+        // Overshoot check — only while still settling AND feedback is fresh.
+        // Once grasp has started (same-cycle startGrasping above), do NOT revert
+        // to REACHING mid-grasp.
+        if (state_ == State::SETTLING && posErrorFresh() && position_error_ > 0.03) {
             state_ = State::REACHING;
             state_elapsed_ = 0.0;
         }
@@ -369,8 +537,20 @@ void ActionSequencerNode::controlLoop()
     case State::GRASPING:
         state_elapsed_ += dt_;
 
+        // P0-2: re-publish the grasp command every cycle so the hand's command
+        // watchdog sees a live stream. Idempotent: the hand re-arms interpolation
+        // only when the pattern target changes, so re-publishing with the same
+        // grasp_duration_ does not restart the ramp.
+        {
+            auto cmd = msg::HandCommand();
+            cmd.ori_x = 0.0; cmd.ori_y = 0.0; cmd.ori_z = 0.0; cmd.ori_w = 1.0;
+            cmd.grasp_type = grasp_type_;
+            cmd.grasp_duration = grasp_duration_;
+            hand_cmd_pub_->publish(cmd);
+        }
+
         if (state_elapsed_ >= grasp_duration_) {
-            finishAction(true);
+            finishAction(true, "DONE");
         }
         break;
     }
