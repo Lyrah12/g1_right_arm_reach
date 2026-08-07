@@ -1,352 +1,337 @@
-/**
- * @file pid_controller.cpp
- * @brief Arm-Hand decoupled PID + IK: computeArm (4-DOF→3-DOF position).
- *
- * computeArm: 3×4 damped pseudoinverse + null-space posture attraction.
- * Wrist orientation control lives in HandController (hand_controller_node.cpp).
- */
-
 #include "g1_right_arm_reach/pid_controller.hpp"
-#include <pinocchio/algorithm/joint-configuration.hpp>
-#include <pinocchio/algorithm/kinematics.hpp>
+
+#include <algorithm>
 #include <cmath>
 
 namespace g1_right_arm_reach {
 
-// ============================================================================
-// Constructor
-// ============================================================================
-
-PIDController::PIDController(
-    RobotModel& robot, Kinematics& kin,
-    double kp, double ki, double kd,
-    double damping, double tolerance,
-    double posture_gain)
-    : robot_(robot), kin_(kin)
-    , kp_(kp), ki_(ki), kd_(kd)
-    , damping_(damping), tolerance_(tolerance)
-    , posture_gain_(posture_gain)
+PIDController::PIDController(RobotModel& robot, Kinematics& kinematics,
+                             double kp_position, double ki_position,
+                             double kd_position, double damping,
+                             double position_tolerance, double posture_gain)
+    : robot_(robot), kinematics_(kinematics),
+      kp_position_(kp_position), ki_position_(ki_position),
+      kd_position_(kd_position), damping_(damping),
+      position_tolerance_(position_tolerance), posture_gain_(posture_gain)
 {
-    posture_target_ = Eigen::VectorXd::Zero(robot_.reduced_model_.nq);
+    posture_target_ = robot_.q_;
+    last_torque_ = Eigen::VectorXd::Zero(robot_.arm_joint_indices_.size());
 }
 
-// ============================================================================
-// Gravity resolution — external (MuJoCo, incl. hand mass) > Pinocchio (URDF only)
-// ============================================================================
-
-void PIDController::resolveGravityTorque(Eigen::VectorXd& tau_g) const
+void PIDController::setPostureTarget(const Eigen::VectorXd& target)
 {
-    const int nv = robot_.reduced_model_.nv;
-    tau_g.resize(nv);
-    // HARDWARE FIDELITY (2026-08-02): Pinocchio RNEA from the URDF is the ONLY
-    // gravity source. On real hardware there is no MuJoCo, so relying on external
-    // gravity here would tune the sim to a signal that does not exist on the robot.
-    // The URDF is patched to match the MJCF mass distribution (config/
-    // g1_29dof_inspire.urdf — 5010 wrist masses + Inspire hand lumped into the yaw
-    // link, native right_rubber_hand zeroed), so Pinocchio == MuJoCo exactly
-    // (verified: 7/7 joints diff = 0.000). external_gravity_ (MuJoCo) is kept only
-    // for the [ARM] grav-diff diagnostic.
-    kin_.computeGravityTorque(tau_g);
+    if (target.size() == robot_.nq()) posture_target_ = target;
 }
 
-// ============================================================================
-// Gravity diagnostic — max |Pinocchio − MuJoCo| over all joints
-// ============================================================================
+void PIDController::relaxPostureTarget(const Eigen::VectorXd& current,
+                                       double dt,
+                                       double time_constant)
+{
+    if (current.size() != robot_.nq() || !current.allFinite()
+        || !std::isfinite(dt) || dt <= 0.0) {
+        return;
+    }
+    const double alpha = time_constant > 0.0
+        ? -std::expm1(-dt / time_constant) : 1.0;
+    posture_target_ += std::clamp(alpha, 0.0, 1.0)
+        * (current - posture_target_);
+}
+
+void PIDController::setRollGains(double kp, double ki, double kd)
+{
+    kp_roll_ = kp;
+    ki_roll_ = ki;
+    kd_roll_ = kd;
+}
+
+void PIDController::setWrenchLimits(double max_force, double max_roll_moment)
+{
+    max_force_ = std::max(0.0, max_force);
+    max_roll_moment_ = std::max(0.0, max_roll_moment);
+}
+
+void PIDController::setTorqueSafety(double effort_derate, double max_joint_torque,
+                                    double max_torque_slew_rate)
+{
+    effort_derate_ = std::clamp(effort_derate, 0.0, 1.0);
+    max_joint_torque_ = std::max(0.0, max_joint_torque);
+    max_torque_slew_rate_ = std::max(0.0, max_torque_slew_rate);
+}
+
+void PIDController::setExternalGravity(const Eigen::VectorXd& gravity)
+{
+    external_gravity_ = gravity.size() == robot_.nv() ? gravity : Eigen::VectorXd();
+}
+
+bool PIDController::hasExternalGravity() const
+{
+    return external_gravity_.size() == robot_.nv();
+}
+
+void PIDController::resolveGravityTorque(Eigen::VectorXd& gravity) const
+{
+    if (!gravity_compensation_) {
+        gravity = Eigen::VectorXd::Zero(robot_.nv());
+        return;
+    }
+    if (use_external_gravity_ && hasExternalGravity()) {
+        gravity = external_gravity_;
+        return;
+    }
+    // Pinocchio remains the production gravity source. Simulation launch files
+    // opt into MuJoCo's exact bias force so model-conversion differences cannot
+    // destabilize the torque loop.
+    const_cast<Kinematics&>(kinematics_).computeGravityTorque(gravity);
+}
 
 double PIDController::gravityDiff() const
 {
     if (!hasExternalGravity()) return -1.0;
-    Eigen::VectorXd tau_g;
-    kin_.computeGravityTorque(tau_g);
-    return (tau_g - external_gravity_).cwiseAbs().maxCoeff();
+    Eigen::VectorXd gravity;
+    const_cast<Kinematics&>(kinematics_).computeGravityTorque(gravity);
+    return (gravity - external_gravity_).cwiseAbs().maxCoeff();
 }
 
-// ============================================================================
-// Gravity hold — arm torque when there is no target yet (prevents free-fall)
-// ============================================================================
-
-ControlResult PIDController::computeGravityHold(
-    const Eigen::VectorXd& q, const Eigen::VectorXd& dq)
+Eigen::VectorXd PIDController::selectArm(const Eigen::VectorXd& full) const
 {
-    const int n_arm = static_cast<int>(robot_.arm_joint_indices_.size());
-    const int nv = robot_.reduced_model_.nv;
-
-    if (q.size() == nv) robot_.q_ = q;
-    robot_.updateKinematics();
-
-    Eigen::VectorXd tau_g = Eigen::VectorXd::Zero(nv);
-    if (gravity_comp_) resolveGravityTorque(tau_g);  // Pinocchio, fresh at 50 Hz
-
-    // Idle hold posture spring — deliberately MUCH stiffer than the reach
-    // null-space posture (posture_gain_*8 = 1.6 N·m/rad). The URDF-vs-MuJoCo
-    // gravity residual (~0.1 N·m on the shoulder) would sag the arm ~4° at 1.6;
-    // at 10 N·m/rad it holds within ~0.6° while staying near-critically damped.
-    // DO NOT use /mujoco_gravity here: it is published at 20 Hz, and feeding a
-    // stale gravity forward back during arm motion acts as negative damping that
-    // makes the arm twist/oscillate ("乱扭") — Pinocchio recomputes fresh each
-    // cycle and is inherently stable.
-    constexpr double kIdlePosture = 10.0;  // N·m/rad
-    Eigen::VectorXd tau_cmd(n_arm);
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        double dq_i = (k < dq.size()) ? dq(i) : 0.0;
-        double q_err = posture_target_(i) - robot_.q_(i);
-        tau_cmd(k) = tau_g(i) + kIdlePosture * q_err - inner_servo_kv_ * dq_i;
-        tau_cmd(k) = std::max(-25.0, std::min(25.0, tau_cmd(k)));
+    Eigen::VectorXd selected(robot_.arm_joint_indices_.size());
+    for (int k = 0; k < selected.size(); ++k) {
+        selected(k) = full(robot_.arm_joint_indices_[k]);
     }
-
-    auto result = ControlResult::success_result(robot_.q_,
-        robot_.getWristPosition(), 0.0);
-    result.torque_command = tau_cmd;
-    return result;
+    return selected;
 }
 
-// ============================================================================
-// Arm IK — 4-DOF → 3-DOF wrist origin position
-// ============================================================================
-
-ControlResult PIDController::computeArm(
-    const Eigen::Vector3d& target_pos,
-    const Eigen::VectorXd& current_q,
-    const Eigen::VectorXd& current_dq,
-    double dt,
-    const Eigen::Vector3d* external_error)
+Eigen::VectorXd PIDController::jointLimitTorque(double margin) const
 {
-    // Sync robot state
-    if (current_q.size() == robot_.reduced_model_.nq) {
-        robot_.q_ = current_q;
-    }
-
-    const int n_arm = static_cast<int>(robot_.arm_joint_indices_.size());
-    const int nv = robot_.reduced_model_.nv;
-
-    // --- Position error ---
-    Eigen::Vector3d error_pos;
-    if (external_error) {
-        error_pos = *external_error;
-    } else {
-        robot_.updateKinematics();
-        Eigen::Vector3d ee_pos = robot_.getWristPosition();
-        error_pos = target_pos - ee_pos;
-    }
-    double position_error = error_pos.norm();
-
-    // Update FK for EE position reporting
-    robot_.updateKinematics();
-    Eigen::Vector3d ee_pos = robot_.getWristPosition();
-
-    // Already converged
-    if (position_error <= tolerance_) {
-        error_integral_.setZero();
-        if (torque_mode_) {
-            // TORQUE mode: keep sending gravity compensation + damping (no early stop,
-            // otherwise the arm collapses under gravity when the position converges).
-            auto result = ControlResult::success_result(robot_.q_, ee_pos, position_error);
-            Eigen::VectorXd tau_g_full = Eigen::VectorXd::Zero(nv);
-            if (gravity_comp_) resolveGravityTorque(tau_g_full);
-            Eigen::VectorXd tau_cmd(n_arm);
-            for (int k = 0; k < n_arm; ++k) {
-                int i = robot_.arm_joint_indices_[k];
-                double dq_i = (k < current_dq.size()) ? current_dq(i) : 0.0;
-                tau_cmd(k) = tau_g_full(i) - inner_servo_kv_ * dq_i;
-                tau_cmd(k) = std::max(-25.0, std::min(25.0, tau_cmd(k)));
-            }
-            result.torque_command = tau_cmd;
-            return result;
+    Eigen::VectorXd torque = Eigen::VectorXd::Zero(robot_.arm_joint_indices_.size());
+    for (int k = 0; k < torque.size(); ++k) {
+        const int index = robot_.arm_joint_indices_[k];
+        const double range = robot_.q_max_(index) - robot_.q_min_(index);
+        const double zone = std::min(margin, 0.2 * range);
+        if (zone <= 0.0) continue;
+        const double lower_distance = robot_.q_(index) - robot_.q_min_(index);
+        const double upper_distance = robot_.q_max_(index) - robot_.q_(index);
+        if (lower_distance < zone) {
+            const double ratio = (zone - lower_distance) / zone;
+            torque(k) += posture_gain_ * ratio * ratio;
         }
-        return ControlResult::success_result(robot_.q_, ee_pos, position_error);
+        if (upper_distance < zone) {
+            const double ratio = (zone - upper_distance) / zone;
+            torque(k) -= posture_gain_ * ratio * ratio;
+        }
+    }
+    return torque;
+}
+
+Eigen::VectorXd PIDController::applyTorqueLimitsAndSlew(
+    const Eigen::VectorXd& requested, double dt,
+    bool* joint_torque_limited, bool* slew_limited)
+{
+    Eigen::VectorXd output = requested;
+    if (last_torque_.size() != output.size()) last_torque_.setZero(output.size());
+    const double maximum_step = max_torque_slew_rate_ * std::max(0.0, dt);
+    for (int k = 0; k < output.size(); ++k) {
+        const int index = robot_.arm_joint_indices_[k];
+        const double urdf_limit = robot_.tau_max_(index) * effort_derate_;
+        const double limit = std::min(max_joint_torque_, urdf_limit);
+        const double clamped = std::clamp(output(k), -limit, limit);
+        if (joint_torque_limited && std::abs(clamped - output(k)) > 1.0e-12) {
+            *joint_torque_limited = true;
+        }
+        output(k) = clamped;
+        const double slewed = std::clamp(output(k), last_torque_(k) - maximum_step,
+                                         last_torque_(k) + maximum_step);
+        if (slew_limited && std::abs(slewed - output(k)) > 1.0e-12) {
+            *slew_limited = true;
+        }
+        output(k) = slewed;
+    }
+    last_torque_ = output;
+    return output;
+}
+
+ControlResult PIDController::computeTask(
+    const Eigen::Vector3d& target_position, double target_roll,
+    const Eigen::VectorXd& current_q, const Eigen::VectorXd& current_dq,
+    double dt, const Eigen::Quaterniond& roll_zero_orientation,
+    const Eigen::Matrix<double, 4, 1>& target_velocity)
+{
+    if (current_q.size() != robot_.nq() || current_dq.size() != robot_.nv() ||
+        !std::isfinite(dt) || dt <= 0.0 || !target_velocity.allFinite()) {
+        return {};
     }
 
-    // Divergence guard
-    if (!first_call_ && position_error > prev_error_pos_.norm() * 5.0) {
+    robot_.q_ = current_q;
+    robot_.dq_ = current_dq;
+    robot_.updateKinematics();
+    const Eigen::Vector3d achieved_position = robot_.getEndEffectorPosition();
+    const double achieved_roll = Kinematics::toolRoll(
+        roll_zero_orientation, kinematics_.getEEOrientation(),
+        kinematics_.toolAxisLocal());
+
+    Eigen::Matrix<double, 4, 1> error;
+    error.head<3>() = target_position - achieved_position;
+    error(3) = Kinematics::wrapAngle(target_roll - achieved_roll);
+
+    if (!first_call_ && (error.head<3>().norm() > previous_error_.head<3>().norm() * 4.0)) {
         error_integral_.setZero();
     }
-
-    // --- Compute arm position Jacobian (3×4) ---
-    Eigen::Matrix<double, 3, Eigen::Dynamic> J_arm(3, n_arm);
-    kin_.computeArmPositionJacobian(J_arm);
-
-    // --- Variable Kp ---
-    double eff_kp = kp_;
-    if (position_error < 0.05) {
-        double ratio = position_error / 0.05;
-        eff_kp = kp_ * (0.6 + 0.4 * ratio);
-    }
-
-    // --- Integral with anti-windup ---
-    // ROOT-CAUSE FIX (2026-08-02): the old gate (err<0.30) kept accumulating even
-    // after the arm reached ~0.03 m. The integral saturated at i_max=0.5/axis, so
-    // its force (ki·∫e ≈ 1.3 N) dwarfed the P term (kp·e ≈ 0.3 N at 4 cm) and,
-    // leaking through inertia coupling into the null space, drove a slow steady
-    // drift (ro/ya/elb → limits) that the 5%-per-cycle divergence guard never
-    // caught. New rules: integrate ONLY in the near-target band AND while the
-    // error is still shrinking; zero the instant the arm starts moving away.
-    // ±2% jitter tolerance: a genuinely shrinking error still integrates (so the
-    // I term can trim a steady-state gravity residual), while real growth resets.
-    if (position_error < 0.08 && position_error <= prev_error_pos_.norm() * 1.02) {
-        error_integral_ += error_pos * dt;
+    if (error.head<3>().norm() < 0.15 && std::abs(error(3)) < 0.5) {
+        error_integral_ += error * dt;
     } else {
         error_integral_.setZero();
     }
-    double i_max = 0.15;   // max integral force = ki·0.15 — a trim, not a driver
-    for (int i = 0; i < 3; ++i)
-        error_integral_(i) = std::max(-i_max, std::min(i_max, error_integral_(i)));
-
-    // --- Task velocity ---
-    Eigen::Vector3d task_vel = eff_kp * error_pos + ki_ * error_integral_;
-    if (!first_call_)
-        task_vel += kd_ * (error_pos - prev_error_pos_) / dt;
-    double task_speed = task_vel.norm();
-    if (task_speed > 1.0) task_vel *= 1.0 / task_speed;
-
-    // --- Adaptive damping ---
-    Eigen::Matrix3d JJt = J_arm * J_arm.transpose();
-    double adaptive_damp = std::max(damping_, 1e-3 / (1.0 + std::abs(JJt.determinant()) * 1e5));
-
-    // --- Damped pseudoinverse (3×4) ---
-    Eigen::Matrix<double, Eigen::Dynamic, 3> J_pinv(n_arm, 3);
-    JJt.diagonal().array() += adaptive_damp;
-    J_pinv = J_arm.transpose() * JJt.ldlt().solve(Eigen::Matrix3d::Identity());
-
-    // --- Null-space (1 DOF: 4-3=1) ---
-    Eigen::VectorXd dq_null = jointLimitAvoidanceArm(0.1);
-    // Posture attraction: only for arm joints
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        dq_null(k) -= posture_gain_ * (robot_.q_(i) - posture_target_(i));
+    for (int i = 0; i < 3; ++i) {
+        error_integral_(i) = std::clamp(error_integral_(i), -0.05, 0.05);
     }
-    Eigen::MatrixXd N = Eigen::MatrixXd::Identity(n_arm, n_arm) - J_pinv * J_arm;
-    Eigen::VectorXd dq_arm = J_pinv * task_vel + N * dq_null;
+    error_integral_(3) = std::clamp(error_integral_(3), -0.20, 0.20);
 
-    // --- Velocity clamping ---
-    double max_joint_vel = 6.0;
-    for (int k = 0; k < n_arm; ++k)
-        max_joint_vel = std::min(max_joint_vel, robot_.dq_max_(robot_.arm_joint_indices_[k]));
-    double dq_norm = dq_arm.lpNorm<Eigen::Infinity>();
-    double scale = dq_norm / max_joint_vel;
-    if (scale > 1.0) dq_arm /= scale;
-    for (int k = 0; k < n_arm; ++k)
-        dq_arm(k) = std::max(-max_joint_vel, std::min(max_joint_vel, dq_arm(k)));
+    Eigen::Matrix<double, 4, Eigen::Dynamic> jacobian;
+    kinematics_.computeTaskJacobian(jacobian);
+    const Eigen::VectorXd velocity = selectArm(current_dq);
+    const Eigen::Matrix<double, 4, 1> task_velocity = jacobian * velocity;
+    // Differentiate through measured velocity, not sampled pose error. The
+    // moving trajectory reference contributes its velocity, otherwise the D
+    // term incorrectly brakes every commanded motion and produces a long
+    // asymptotic tail. For a stationary target this remains exactly -J*dq.
+    const Eigen::Matrix<double, 4, 1> derivative =
+        target_velocity - task_velocity;
 
-    // --- Back-calculation anti-windup ---
-    if (dq_norm > 1e-6) {
-        double clamped_norm = dq_arm.lpNorm<Eigen::Infinity>();
-        if (clamped_norm < dq_norm * 0.8)
-            error_integral_ *= clamped_norm / dq_norm;
+    Eigen::Matrix<double, 4, 1> wrench;
+    wrench.head<3>() = kp_position_ * error.head<3>()
+        + ki_position_ * error_integral_.head<3>()
+        + kd_position_ * derivative.head<3>();
+    wrench(3) = kp_roll_ * error(3) + ki_roll_ * error_integral_(3)
+        + kd_roll_ * derivative(3);
+    const bool force_saturated = wrench.head<3>().norm() > max_force_;
+    const double force_norm = wrench.head<3>().norm();
+    if (force_norm > max_force_ && force_norm > 0.0) {
+        wrench.head<3>() *= max_force_ / force_norm;
     }
+    const bool roll_saturated = std::abs(wrench(3)) > max_roll_moment_;
+    wrench(3) = std::clamp(wrench(3), -max_roll_moment_, max_roll_moment_);
 
-    // --- Joint-limit direction clamp ---
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        if (robot_.q_(i) <= robot_.q_min_(i) && dq_arm(k) < 0.0) dq_arm(k) = 0.0;
-        if (robot_.q_(i) >= robot_.q_max_(i) && dq_arm(k) > 0.0) dq_arm(k) = 0.0;
+    // Independent control-allocation Jacobian. The TCP sits ~0.09 m off the
+    // wrist roll axis, so the raw transpose-Jacobian lets the position wrench
+    // torque the wrist and the roll wrench torque the arm — the two loops fight
+    // and enter a coupled limit cycle (roll error grows, dq_wrist spins). Drive
+    // position ONLY through the arm joints (shoulder x3 + elbow) and roll ONLY
+    // through the wrist: zero the wrist column of the position rows and the
+    // roll row on the arm columns. Task-space velocity still uses the real
+    // Jacobian, because a wrist roll does move the off-axis TCP and the
+    // position loop must see it so the arm can absorb the swing.
+    const int wrist_column = robot_.armJointColumn("right_wrist_roll_joint");
+    Eigen::Matrix<double, 4, Eigen::Dynamic> allocation_jacobian = jacobian;
+    double allocation_singular = 1.0;
+    if (wrist_column >= 0) {
+        allocation_jacobian.block<3, 1>(0, wrist_column).setZero();
+        allocation_jacobian.row(3).setZero();
+        allocation_jacobian(3, wrist_column) = jacobian(3, wrist_column);
     }
-
-    // --- Integrate arm joints (direct addition — 1-DOF revolute joints) ---
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        robot_.q_(i) = current_q(i) + dq_arm(k) * dt;
-    }
-
-    robot_.clampToLimits();
-
-    // Per-cycle delta clamp
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        double delta = robot_.q_(i) - current_q(i);
-        double max_delta = 0.25;
-        if (delta > max_delta)       robot_.q_(i) = current_q(i) + max_delta;
-        else if (delta < -max_delta) robot_.q_(i) = current_q(i) - max_delta;
-    }
-
-    // --- Torque command (TORQUE mode): τ = Jᵀ·F + τ_g − Kd·dq, per-joint clamped ---
-    Eigen::VectorXd tau_cmd(n_arm);
-    if (torque_mode_) {
-        Eigen::Vector3d task_force = eff_kp * error_pos + ki_ * error_integral_;
-        if (!first_call_)
-            task_force += kd_ * (error_pos - prev_error_pos_) / dt;
-        double f_norm = task_force.norm();
-        if (f_norm > 50.0) task_force *= 50.0 / f_norm;  // max task force (N)
-        Eigen::VectorXd tau_task = J_arm.transpose() * task_force;   // Jᵀ·F
-        Eigen::VectorXd tau_g_full = Eigen::VectorXd::Zero(nv);
-        if (gravity_comp_) resolveGravityTorque(tau_g_full);
-
-        // --- Null-space posture attraction (TORQUE mode) ---
-        // Without it, the arm reaches via whatever null-space solution the
-        // pseudoinverse picks — often contorting the elbow to its negative limit
-        // instead of extending forward naturally. Projected through the null space
-        // so it never fights the task force.
-        Eigen::MatrixXd N_null = Eigen::MatrixXd::Identity(n_arm, n_arm) - J_pinv * J_arm;
-        Eigen::VectorXd tau_posture = Eigen::VectorXd::Zero(n_arm);
-        for (int k = 0; k < n_arm; ++k) {
-            int i = robot_.arm_joint_indices_[k];
-            double q_err = posture_target_(i) - robot_.q_(i);
-            tau_posture(k) = posture_gain_ * 8.0 * q_err;
-        }
-        tau_posture = N_null * tau_posture;
-
-        for (int k = 0; k < n_arm; ++k) {
-            int i = robot_.arm_joint_indices_[k];
-            double dq_i = (k < current_dq.size()) ? current_dq(i) : 0.0;
-            tau_cmd(k) = tau_task(k) + tau_g_full(i) + tau_posture(k) - inner_servo_kv_ * dq_i;
-            tau_cmd(k) = std::max(-25.0, std::min(25.0, tau_cmd(k)));  // shoulder/elbow limit
+    {
+        Eigen::JacobiSVD<Eigen::Matrix<double, 4, Eigen::Dynamic>> svd(
+            allocation_jacobian);
+        if (svd.singularValues().size() > 0) {
+            allocation_singular = svd.singularValues().minCoeff();
         }
     }
+    Eigen::VectorXd task_torque = allocation_jacobian.transpose() * wrench;
 
-    prev_error_pos_ = error_pos;
+    Eigen::Matrix4d normal = allocation_jacobian * allocation_jacobian.transpose();
+    normal.diagonal().array() += damping_;
+    const Eigen::MatrixXd nullspace = Eigen::MatrixXd::Identity(
+        allocation_jacobian.cols(), allocation_jacobian.cols())
+        - allocation_jacobian.transpose() * normal.ldlt().solve(allocation_jacobian);
+
+    Eigen::VectorXd posture_torque(allocation_jacobian.cols());
+    for (int k = 0; k < posture_torque.size(); ++k) {
+        const int index = robot_.arm_joint_indices_[k];
+        posture_torque(k) = posture_gain_ * (posture_target_(index) - robot_.q_(index));
+    }
+    posture_torque += jointLimitTorque(0.20);
+    posture_torque = nullspace * posture_torque;
+    if (wrist_column >= 0) posture_torque(wrist_column) = 0.0;
+
+    // The task-space derivative term already damps motion visible at the TCP.
+    // Applying -D*dq directly to every joint would brake commanded shoulder
+    // and elbow motion a second time. Keep joint damping only in the allocation
+    // null space so it suppresses redundant motion without slowing the task.
+    Eigen::VectorXd nullspace_damping =
+        nullspace * (-joint_damping_ * velocity);
+    if (wrist_column >= 0) nullspace_damping(wrist_column) = 0.0;
+
+    Eigen::VectorXd gravity_full;
+    resolveGravityTorque(gravity_full);
+    const Eigen::VectorXd gravity = selectArm(gravity_full);
+    const Eigen::VectorXd requested =
+        task_torque + gravity + posture_torque + nullspace_damping;
+    bool joint_torque_limited = false;
+    bool slew_limited = false;
+    const Eigen::VectorXd torque = applyTorqueLimitsAndSlew(
+        requested, dt, &joint_torque_limited, &slew_limited);
+
+    previous_error_ = error;
     first_call_ = false;
 
-    auto result = ControlResult::success_result(robot_.q_, ee_pos, position_error);
-    result.effective_kp = eff_kp;
+    ControlResult result;
+    result.success = error.head<3>().norm() <= position_tolerance_
+        && std::abs(error(3)) <= roll_tolerance_;
+    result.torque_limited = !torque.isApprox(requested, 1.0e-8);
+    result.command = current_q;
+    result.torque_command = torque;
+    result.gravity_torque = gravity;
+    result.task_torque = task_torque;
+    result.dq_command = Eigen::VectorXd::Zero(torque.size());
+    result.achieved_position = achieved_position;
+    result.achieved_roll = achieved_roll;
+    result.position_error = error.head<3>().norm();
+    result.orientation_error = std::abs(error(3));
+    result.effective_kp = kp_position_;
     result.integral_norm = error_integral_.norm();
-    result.task_velocity = task_speed;
-    result.adaptive_damping = adaptive_damp;
-    if (torque_mode_) result.torque_command = tau_cmd;
-    result.nullspace_norm = dq_null.norm();
-    result.max_joint_vel = max_joint_vel;
-    result.dq_command = dq_arm;
+    result.task_velocity = task_velocity.norm();
+    result.adaptive_damping = damping_;
+    result.nullspace_norm = posture_torque.norm();
+    result.linear_vel = task_velocity.head<3>().norm();
+    result.roll_vel = task_velocity(3);
+    result.force_saturated = force_saturated;
+    result.roll_saturated = roll_saturated;
+    result.joint_torque_limited = joint_torque_limited;
+    result.slew_limited = slew_limited;
+    result.allocation_min_singular = allocation_singular;
     return result;
 }
 
-// ============================================================================
-// Joint-limit avoidance — arm joints only
-// ============================================================================
-
-Eigen::VectorXd PIDController::jointLimitAvoidanceArm(double margin) const
+ControlResult PIDController::computeGravityHold(const Eigen::VectorXd& q,
+                                                const Eigen::VectorXd& dq)
 {
-    const int n_arm = static_cast<int>(robot_.arm_joint_indices_.size());
-    Eigen::VectorXd dq_repulse = Eigen::VectorXd::Zero(n_arm);
-
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-        double q = robot_.q_(i);
-        double q_min = robot_.q_min_(i);
-        double q_max = robot_.q_max_(i);
-        double range = q_max - q_min;
-        if (range < 2.0 * margin) continue;
-
-        double dist_lower = q - q_min;
-        if (dist_lower < margin) {
-            double s = (margin - dist_lower) / margin;
-            dq_repulse(k) += s * s * 2.0;
-        }
-        double dist_upper = q_max - q;
-        if (dist_upper < margin) {
-            double s = (margin - dist_upper) / margin;
-            dq_repulse(k) -= s * s * 2.0;
-        }
+    if (q.size() != robot_.nq() || dq.size() != robot_.nv()) return {};
+    robot_.q_ = q;
+    robot_.dq_ = dq;
+    robot_.updateKinematics();
+    Eigen::VectorXd gravity_full;
+    resolveGravityTorque(gravity_full);
+    const Eigen::VectorXd gravity = selectArm(gravity_full);
+    Eigen::VectorXd requested = gravity - joint_damping_ * selectArm(dq);
+    for (int k = 0; k < requested.size(); ++k) {
+        const int index = robot_.arm_joint_indices_[k];
+        requested(k) += posture_gain_ * (posture_target_(index) - robot_.q_(index));
     }
-    return dq_repulse;
-}
 
-// ============================================================================
-// Reset
-// ============================================================================
+    ControlResult result;
+    result.success = true;
+    result.command = q;
+    result.torque_command = applyTorqueLimitsAndSlew(requested, 0.02);
+    result.torque_limited = !result.torque_command.isApprox(requested, 1.0e-8);
+    result.gravity_torque = gravity;
+    result.achieved_position = robot_.getEndEffectorPosition();
+    return result;
+}
 
 void PIDController::reset()
 {
-    prev_error_pos_.setZero();
+    previous_error_.setZero();
     error_integral_.setZero();
+    last_torque_.setZero();
     first_call_ = true;
 }
 

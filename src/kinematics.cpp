@@ -1,193 +1,141 @@
-/**
- * @file kinematics.cpp
- * @brief Numerical Jacobians (arm/wrist subsets), damped pseudoinverse, gravity torque.
- *
- * Arm-Hand decoupling: computeArmPositionJacobian (3×4) and
- * computeWristOrientationJacobian (3×N) perturb only the relevant joint subsets,
- * enabling independent position and orientation control.
- */
-
 #include "g1_right_arm_reach/kinematics.hpp"
-#include <pinocchio/algorithm/kinematics.hpp>
-#include <pinocchio/algorithm/frames.hpp>
-#include <pinocchio/algorithm/jacobian.hpp>
+
 #include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
 namespace g1_right_arm_reach {
 
-// ============================================================================
-// Constructor
-// ============================================================================
-
-Kinematics::Kinematics(RobotModel& robot) : robot_(robot) {}
-
-// ============================================================================
-// Position Jacobian (numerical, central differences)
-// ============================================================================
-
-void Kinematics::computePositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_pos)
+namespace {
+Eigen::Vector3d rotationVector(Eigen::Quaterniond delta)
 {
-    const int nv = robot_.reduced_model_.nv;
-    const double eps = 1e-5;
+    delta.normalize();
+    if (delta.w() < 0.0) delta.coeffs() *= -1.0;
+    const Eigen::AngleAxisd angle_axis(delta);
+    return angle_axis.axis() * angle_axis.angle();
+}
+}  // namespace
 
-    Eigen::VectorXd q_save = robot_.q_;
+Kinematics::Kinematics(RobotModel& robot, const Eigen::Vector3d& tool_axis_local)
+    : robot_(robot)
+{
+    if (!tool_axis_local.allFinite() || tool_axis_local.norm() < 1.0e-9) {
+        throw std::invalid_argument("tool_axis_local must be a finite non-zero vector");
+    }
+    tool_axis_local_ = tool_axis_local.normalized();
+}
+
+void Kinematics::computeTaskJacobian(
+    Eigen::Matrix<double, 4, Eigen::Dynamic>& jacobian)
+{
+    const int n = static_cast<int>(robot_.arm_joint_indices_.size());
+    constexpr double epsilon = 1.0e-6;
+    jacobian.resize(4, n);
+
+    const Eigen::VectorXd saved_q = robot_.q_;
     robot_.updateKinematics();
-    Eigen::Vector3d p0 = robot_.getEndEffectorPosition();
+    const Eigen::Vector3d axis_world =
+        (robot_.getHandOrientation() * tool_axis_local_).normalized();
 
-    for (int i = 0; i < nv; ++i) {
-        robot_.q_ = q_save;  robot_.q_(i) += eps;
+    for (int column = 0; column < n; ++column) {
+        const int index = robot_.arm_joint_indices_[column];
+
+        robot_.q_ = saved_q;
+        robot_.q_(index) += epsilon;
         robot_.updateKinematics();
-        Eigen::Vector3d p_plus = robot_.getEndEffectorPosition();
+        const Eigen::Vector3d position_plus = robot_.getEndEffectorPosition();
+        const Eigen::Quaterniond orientation_plus(robot_.getHandOrientation());
 
-        robot_.q_ = q_save;  robot_.q_(i) -= eps;
+        robot_.q_ = saved_q;
+        robot_.q_(index) -= epsilon;
         robot_.updateKinematics();
-        Eigen::Vector3d p_minus = robot_.getEndEffectorPosition();
+        const Eigen::Vector3d position_minus = robot_.getEndEffectorPosition();
+        const Eigen::Quaterniond orientation_minus(robot_.getHandOrientation());
 
-        J_pos.col(i) = (p_plus - p_minus) / (2.0 * eps);
+        jacobian.template block<3, 1>(0, column) =
+            (position_plus - position_minus) / (2.0 * epsilon);
+        const Eigen::Vector3d angular_velocity = rotationVector(
+            orientation_plus * orientation_minus.inverse()) / (2.0 * epsilon);
+        jacobian(3, column) = axis_world.dot(angular_velocity);
     }
 
-    robot_.q_ = q_save;
+    robot_.q_ = saved_q;
     robot_.updateKinematics();
 }
 
-// ============================================================================
-// Arm position Jacobian (3×4): wrist origin position w.r.t arm joints only
-// ============================================================================
-
-void Kinematics::computeArmPositionJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_arm)
+void Kinematics::computePositionJacobian(
+    Eigen::Matrix<double, 3, Eigen::Dynamic>& jacobian)
 {
-    const int n_arm = static_cast<int>(robot_.arm_joint_indices_.size());
-    const double eps = 1e-5;
-
-    J_arm.resize(3, n_arm);
-
-    Eigen::VectorXd q_save = robot_.q_;
-    robot_.updateKinematics();
-
-    for (int k = 0; k < n_arm; ++k) {
-        int i = robot_.arm_joint_indices_[k];
-
-        robot_.q_ = q_save;  robot_.q_(i) += eps;
-        robot_.updateKinematics();
-        Eigen::Vector3d p_plus = robot_.getWristPosition();
-
-        robot_.q_ = q_save;  robot_.q_(i) -= eps;
-        robot_.updateKinematics();
-        Eigen::Vector3d p_minus = robot_.getWristPosition();
-
-        J_arm.col(k) = (p_plus - p_minus) / (2.0 * eps);
-    }
-
-    robot_.q_ = q_save;
-    robot_.updateKinematics();
+    Eigen::Matrix<double, 4, Eigen::Dynamic> task_jacobian;
+    computeTaskJacobian(task_jacobian);
+    jacobian = task_jacobian.topRows<3>();
 }
 
-// ============================================================================
-// Wrist orientation Jacobian (3×3): hand orientation w.r.t. wrist joints
-// ============================================================================
-
-void Kinematics::computeWristOrientationJacobian(Eigen::Matrix<double, 3, Eigen::Dynamic>& J_wrist)
+void Kinematics::computeArmPositionJacobian(
+    Eigen::Matrix<double, 3, Eigen::Dynamic>& jacobian)
 {
-    const int n_wrist = static_cast<int>(robot_.wrist_joint_indices_.size());
-    const double eps = 1e-4;  // slightly larger for orientation stability
-
-    J_wrist.resize(3, n_wrist);
-
-    Eigen::VectorXd q_save = robot_.q_;
-    robot_.updateKinematics();
-
-    for (int k = 0; k < n_wrist; ++k) {
-        int i = robot_.wrist_joint_indices_[k];
-
-        robot_.q_ = q_save;  robot_.q_(i) += eps;
-        robot_.updateKinematics();
-        Eigen::Quaterniond q_plus(robot_.getHandOrientation());
-
-        robot_.q_ = q_save;  robot_.q_(i) -= eps;
-        robot_.updateKinematics();
-        Eigen::Quaterniond q_minus(robot_.getHandOrientation());
-
-        Eigen::Quaterniond dq = q_plus * q_minus.inverse();
-        dq.normalize();
-        Eigen::AngleAxisd aa(dq);
-        J_wrist.col(k) = aa.axis() * aa.angle() / (2.0 * eps);
-    }
-
-    robot_.q_ = q_save;
-    robot_.updateKinematics();
+    computePositionJacobian(jacobian);
 }
-
-// ============================================================================
-// Gravity torque (Pinocchio RNEA: τ_g = g(q) for reduced model)
-// ============================================================================
 
 void Kinematics::computeGravityTorque(Eigen::VectorXd& tau_g)
 {
-    const int nv = robot_.reduced_model_.nv;
-    tau_g.resize(nv);
-
     tau_g = pinocchio::computeGeneralizedGravity(
         robot_.reduced_model_, robot_.reduced_data_, robot_.q_);
 }
 
-// ============================================================================
-// EE Orientation (quaternion, xyzw)
-// ============================================================================
-
 Eigen::Quaterniond Kinematics::getEEOrientation() const
 {
-    const auto& R = robot_.reduced_data_.oMf[robot_.ee_frame_id_].rotation();
-    return Eigen::Quaterniond(R);
+    return Eigen::Quaterniond(robot_.getHandOrientation()).normalized();
 }
-
-// ============================================================================
-// Right shoulder position (world frame)
-// ============================================================================
 
 Eigen::Vector3d Kinematics::getRightShoulderPosition() const
 {
-    pinocchio::JointIndex shoulder_jid = 1;
-    if (shoulder_jid < robot_.reduced_model_.joints.size()) {
-        return robot_.reduced_data_.oMi[shoulder_jid].translation();
-    }
-    return Eigen::Vector3d::Zero();
+    return robot_.getRightShoulderPosition();
 }
 
-// ============================================================================
-// Orientation error (axis-angle, world frame)
-// ============================================================================
-
-Eigen::Vector3d Kinematics::orientationError(const Eigen::Quaterniond& q_des,
-                                              const Eigen::Quaterniond& q_curr)
+double Kinematics::wrapAngle(double angle)
 {
-    Eigen::Quaterniond q_err = q_des * q_curr.inverse();
-    q_err.normalize();
-    Eigen::AngleAxisd aa(q_err);
-    return aa.axis() * aa.angle();
+    constexpr double pi = 3.14159265358979323846;
+    return std::remainder(angle, 2.0 * pi);
 }
 
-// ============================================================================
-// Configuration integration
-// ============================================================================
+double Kinematics::toolRoll(const Eigen::Quaterniond& zero_orientation,
+                            const Eigen::Quaterniond& current_orientation,
+                            const Eigen::Vector3d& tool_axis_local)
+{
+    Eigen::Quaterniond relative =
+        zero_orientation.normalized().inverse() * current_orientation.normalized();
+    relative.normalize();
+    if (relative.w() < 0.0) relative.coeffs() *= -1.0;
+
+    const Eigen::Vector3d axis = tool_axis_local.normalized();
+    const double projected = relative.vec().dot(axis);
+    const double norm = std::hypot(relative.w(), projected);
+    if (norm < 1.0e-12) return 0.0;
+    return wrapAngle(2.0 * std::atan2(projected / norm, relative.w() / norm));
+}
+
+Eigen::Vector3d Kinematics::orientationError(const Eigen::Quaterniond& desired,
+                                             const Eigen::Quaterniond& current)
+{
+    return rotationVector(desired * current.inverse());
+}
 
 void Kinematics::integrate(const Eigen::VectorXd& dq, double dt)
 {
     robot_.q_ = pinocchio::integrate(robot_.reduced_model_, robot_.q_, dq * dt);
 }
 
-// ============================================================================
-// Damped pseudoinverse (3×N)
-// ============================================================================
-
 void Kinematics::dampedPseudoInverse(
-    const Eigen::Matrix<double, 3, Eigen::Dynamic>& J_pos,
-    double damping,
-    Eigen::Matrix<double, Eigen::Dynamic, 3>& J_pinv) const
+    const Eigen::Matrix<double, 3, Eigen::Dynamic>& jacobian, double damping,
+    Eigen::Matrix<double, Eigen::Dynamic, 3>& pseudo_inverse) const
 {
-    Eigen::Matrix3d JJt = J_pos * J_pos.transpose();
-    JJt.diagonal().array() += damping;
-    J_pinv = J_pos.transpose() * JJt.ldlt().solve(Eigen::Matrix3d::Identity());
+    Eigen::Matrix3d normal = jacobian * jacobian.transpose();
+    normal.diagonal().array() += damping;
+    pseudo_inverse = jacobian.transpose() * normal.ldlt().solve(Eigen::Matrix3d::Identity());
 }
 
 }  // namespace g1_right_arm_reach

@@ -1,158 +1,129 @@
-/** @file pid_controller.hpp
- *  @brief Task-space PID with damped pseudoinverse IK (arm position control).
- *
- *  Arm-Hand decoupled control:
- *    computeArm()       — 4-DOF arm → 3-DOF wrist-origin position (3×4 damped pinv + null-space)
- *    computeGravityHold — arm torque when no target yet (prevents free-fall)
- *
- *  Wrist orientation is handled entirely by HandController (see hand_controller.hpp),
- *  so this class no longer exposes a wrist solver.
- */
-
 #ifndef G1_RIGHT_ARM_REACH__PID_CONTROLLER_HPP_
 #define G1_RIGHT_ARM_REACH__PID_CONTROLLER_HPP_
 
-#include "g1_right_arm_reach/robot_model.hpp"
 #include "g1_right_arm_reach/kinematics.hpp"
+#include "g1_right_arm_reach/robot_model.hpp"
+
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
 namespace g1_right_arm_reach {
 
-// ============================================================================
-// ControlResult
-// ============================================================================
-
 struct ControlResult {
-    bool success = false;
-    Eigen::VectorXd command;             ///< Joint position targets (rad)
-    Eigen::Vector3d achieved_position;   ///< Current EE position (m)
-    double position_error = 0.0;         ///< ||target_pos - achieved|| (m)
-    double orientation_error = 0.0;      ///< ||orientation_error_vector|| (rad)
-
-    // --- Torque-mode fields ---
-    Eigen::VectorXd torque_command;      ///< Joint torque τ_cmd (N·m)
-    Eigen::VectorXd gravity_torque;      ///< Gravity feedforward τ_g (N·m)
-    Eigen::VectorXd task_torque;         ///< Task-space control torque Jᵀ×F (N·m)
-
-    // --- Debug / telemetry fields ---
-    double effective_kp = 0.0;
-    double integral_norm = 0.0;
-    double task_velocity = 0.0;
-    double adaptive_damping = 0.0;
-    double nullspace_norm = 0.0;
-    double max_joint_vel = 0.0;
+    bool success{false};
+    bool torque_limited{false};
+    Eigen::VectorXd command;
+    Eigen::VectorXd torque_command;
+    Eigen::VectorXd gravity_torque;
+    Eigen::VectorXd task_torque;
     Eigen::VectorXd dq_command;
-
-    static ControlResult success_result(const Eigen::VectorXd& cmd,
-                                        const Eigen::Vector3d& pos, double error) {
-        ControlResult r;
-        r.success = true;
-        r.command = cmd;
-        r.achieved_position = pos;
-        r.position_error = error;
-        return r;
-    }
+    Eigen::Vector3d achieved_position{Eigen::Vector3d::Zero()};
+    double achieved_roll{0.0};
+    double position_error{0.0};
+    double orientation_error{0.0};
+    double effective_kp{0.0};
+    double integral_norm{0.0};
+    double task_velocity{0.0};
+    double adaptive_damping{0.0};
+    double nullspace_norm{0.0};
+    double max_joint_vel{0.0};
+    // Split diagnostics: velocity components and per-limit saturation source.
+    double linear_vel{0.0};          // |J_lin * dq|, m/s
+    double roll_vel{0.0};            // J_roll * dq, rad/s
+    bool force_saturated{false};     // position wrench hit max_task_force
+    bool roll_saturated{false};      // roll moment hit max_roll_moment
+    bool joint_torque_limited{false}; // a joint hit the derated URDF / max joint clamp
+    bool slew_limited{false};        // torque change hit max_torque_slew_rate
+    double allocation_min_singular{0.0};  // min singular value of allocation Jacobian
 };
 
-// ============================================================================
-// PIDController
-// ============================================================================
-
+/**
+ * Four-dimensional operational-space PID.
+ *
+ * The PID output is a task wrench [Fx,Fy,Fz,Mroll]. Joint torque is
+ * tau = J_task^T*wrench + gravity + N*(tau_posture - D*dq).
+ */
 class PIDController {
 public:
-    PIDController(RobotModel& robot, Kinematics& kin,
-                  double kp = 2.0, double ki = 0.4, double kd = 0.05,
-                  double damping = 2e-4, double tolerance = 0.005,
-                  double posture_gain = 0.2);
+    PIDController(RobotModel& robot, Kinematics& kinematics,
+                  double kp_position = 220.0,
+                  double ki_position = 0.5,
+                  double kd_position = 22.0,
+                  double damping = 1.0e-3,
+                  double position_tolerance = 0.005,
+                  double posture_gain = 2.0);
 
-    /// Set the preferred joint posture for null-space attraction (full reduced model).
-    void setPostureTarget(const Eigen::VectorXd& q_pref) {
-        if (q_pref.size() == posture_target_.size())
-            posture_target_ = q_pref;
-    }
+    ControlResult computeTask(const Eigen::Vector3d& target_position,
+                              double target_roll,
+                              const Eigen::VectorXd& current_q,
+                              const Eigen::VectorXd& current_dq,
+                              double dt,
+                              const Eigen::Quaterniond& roll_zero_orientation,
+                              const Eigen::Matrix<double, 4, 1>& target_velocity =
+                                  Eigen::Matrix<double, 4, 1>::Zero());
 
-    // ======================================================================
-    // Arm IK — 4-DOF position control (primary interface)
-    // ======================================================================
-
-    /// Run one arm control cycle: 4-DOF → 3-DOF wrist origin position.
-    /// Modifies only arm joints (indices 0-3) in robot_.q_.
-    /// @param target_pos  Desired wrist origin position (shoulder-relative)
-    /// @param current_q   Current full reduced-model joint positions
-    /// @param current_dq  Current full reduced-model joint velocities
-    /// @param dt          Control period (s)
-    /// @param external_error Override internal FK error
-    ControlResult computeArm(const Eigen::Vector3d& target_pos,
-                             const Eigen::VectorXd& current_q,
-                             const Eigen::VectorXd& current_dq,
-                             double dt,
-                             const Eigen::Vector3d* external_error = nullptr);
-
-    /// Reset all integral/derivative state.
-    void reset();
-
-    // --- Setters ---
-    void setKp(double kp) { kp_ = kp; }
-    void setKi(double ki) { ki_ = ki; }
-    void setKd(double kd) { kd_ = kd; }
-    void setDamping(double d) { damping_ = d; }
-    void setTolerance(double tol) { tolerance_ = tol; }
-    void setPostureGain(double g) { posture_gain_ = g; }
-    double getTolerance() const { return tolerance_; }
-
-    void setTorqueMode(bool enable) { torque_mode_ = enable; }
-    void setGravityCompensation(bool enable) { gravity_comp_ = enable; }
-    bool isTorqueMode() const { return torque_mode_; }
-
-    void setInnerServoKp(double kp) { inner_servo_kp_ = kp; }
-    void setInnerServoKv(double kv) { inner_servo_kv_ = kv; }
-
-    /// External gravity feedforward (e.g. MuJoCo pure gravity incl. hand mass).
-    /// Takes priority over Pinocchio computeGeneralizedGravity when size == nv.
-    void setExternalGravity(const Eigen::VectorXd& tau_g) {
-        external_gravity_ = (tau_g.size() == robot_.reduced_model_.nv) ? tau_g : Eigen::VectorXd();
-    }
-    bool hasExternalGravity() const { return external_gravity_.size() == robot_.reduced_model_.nv; }
-    /// Max |Pinocchio − MuJoCo| gravity over all joints (diagnostic; −1 if no external).
-    double gravityDiff() const;
-
-    /// Reset only the integral (keep derivative state) — safe on divergence.
-    void resetIntegral() { error_integral_.setZero(); }
-
-    /// Pure gravity-hold torque for the arm joints: τ = g − kv·dq.
-    /// Used when there is no target yet, so the arm does not free-fall.
     ControlResult computeGravityHold(const Eigen::VectorXd& q,
                                      const Eigen::VectorXd& dq);
 
-private:
-    /// Null-space joint-limit avoidance (arm joints only).
-    Eigen::VectorXd jointLimitAvoidanceArm(double margin = 0.1) const;
+    void reset();
+    void setPostureTarget(const Eigen::VectorXd& target);
+    void relaxPostureTarget(const Eigen::VectorXd& current,
+                            double dt,
+                            double time_constant);
+    void setKp(double value) { kp_position_ = value; }
+    void setKi(double value) { ki_position_ = value; }
+    void setKd(double value) { kd_position_ = value; }
+    void setRollGains(double kp, double ki, double kd);
+    void setDamping(double value) { damping_ = value; }
+    void setTolerance(double value) { position_tolerance_ = value; }
+    void setRollTolerance(double value) { roll_tolerance_ = value; }
+    void setPostureGain(double value) { posture_gain_ = value; }
+    void setGravityCompensation(bool enabled) { gravity_compensation_ = enabled; }
+    void setUseExternalGravity(bool enabled) { use_external_gravity_ = enabled; }
+    void setJointDamping(double value) { joint_damping_ = value; }
+    void setWrenchLimits(double max_force, double max_roll_moment);
+    void setTorqueSafety(double effort_derate, double max_joint_torque,
+                         double max_torque_slew_rate);
+    double getTolerance() const { return position_tolerance_; }
 
-    /// Fill tau_g with external (MuJoCo) gravity if set, else Pinocchio RNEA.
-    void resolveGravityTorque(Eigen::VectorXd& tau_g) const;
+    // Kept for source compatibility: this controller always computes torque.
+    void setTorqueMode(bool) {}
+    bool isTorqueMode() const { return true; }
+    void setInnerServoKp(double) {}
+    void setInnerServoKv(double value) { setJointDamping(value); }
+
+    void setExternalGravity(const Eigen::VectorXd& gravity);
+    bool hasExternalGravity() const;
+    double gravityDiff() const;
+    void resetIntegral() { error_integral_.setZero(); }
+
+private:
+    void resolveGravityTorque(Eigen::VectorXd& gravity) const;
+    Eigen::VectorXd jointLimitTorque(double margin) const;
+    Eigen::VectorXd selectArm(const Eigen::VectorXd& full) const;
+    Eigen::VectorXd applyTorqueLimitsAndSlew(const Eigen::VectorXd& requested,
+                                             double dt,
+                                             bool* joint_torque_limited = nullptr,
+                                             bool* slew_limited = nullptr);
 
     RobotModel& robot_;
-    Kinematics& kin_;
+    Kinematics& kinematics_;
+    double kp_position_, ki_position_, kd_position_;
+    double kp_roll_{10.0}, ki_roll_{0.0}, kd_roll_{1.2};
+    double damping_, position_tolerance_, roll_tolerance_{0.035};
+    double posture_gain_, joint_damping_{2.0};
+    double max_force_{40.0}, max_roll_moment_{6.0};
+    double effort_derate_{0.50}, max_joint_torque_{20.0};
+    double max_torque_slew_rate_{80.0};
+    bool gravity_compensation_{true};
+    bool use_external_gravity_{false};
 
-    // Arm position gains
-    double kp_, ki_, kd_;
-    double damping_, tolerance_, posture_gain_;
-    Eigen::VectorXd posture_target_;
-
-    // Torque mode
-    bool torque_mode_ = false, gravity_comp_ = true;
-    double inner_servo_kp_ = 5.0, inner_servo_kv_ = 5.0;
-
-    // External gravity feedforward (MuJoCo pure gravity, includes hand mass).
-    Eigen::VectorXd external_gravity_;
-
-    // Arm PID state
-    Eigen::Vector3d prev_error_pos_{Eigen::Vector3d::Zero()};
-    Eigen::Vector3d error_integral_{Eigen::Vector3d::Zero()};
+    Eigen::VectorXd posture_target_, external_gravity_, last_torque_;
+    Eigen::Matrix<double, 4, 1> previous_error_{Eigen::Matrix<double, 4, 1>::Zero()};
+    Eigen::Matrix<double, 4, 1> error_integral_{Eigen::Matrix<double, 4, 1>::Zero()};
     bool first_call_{true};
 };
 
 }  // namespace g1_right_arm_reach
 
-#endif  // G1_RIGHT_ARM_REACH__PID_CONTROLLER_HPP_
+#endif

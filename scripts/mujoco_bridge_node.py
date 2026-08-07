@@ -1,1379 +1,357 @@
 #!/usr/bin/env python3
-"""
-MuJoCo physics bridge — ROS 2 ↔ MuJoCo simulation with torque-mode actuation
-(controller effort=τ → motor ctrl=τ, MIT mode — matching the real G1 LowCmd).
+"""MuJoCo bridge for the decoupled G1-23DOF + Revo2 controller.
 
-Publishes: /joint_states, /actual_ee_pose, /actual_hand_orientation,
-           /mujoco_wrist_jacobian, /mujoco_gravity (plus /camera/rgb, /camera/depth, /wrist_ft).
-Subscribes: /joint_commands (arm 4-DOF), /hand_commands (hand 9-DOF).
+Runtime control is deliberately mixed by joint group:
+  * five G1 right-arm joints: direct motor torque from /joint_commands.effort;
+  * six Revo2 active joints: position targets from /hand_commands.position;
+  * all other G1 joints: fixed-target position servos generated in the MJCF.
 
-Dependencies: pip install mujoco opencv-python "numpy<2"
+This Python file is simulation-only. Production controllers remain C++.
 """
+
+from __future__ import annotations
 
 import os
-import sys
 import threading
 import time
 
+import mujoco
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# MuJoCo imports（延迟导入，方便 import 错误时给出友好提示）
-# ---------------------------------------------------------------------------
-try:
-    import mujoco
-    HAS_MUJOCO = True
-except ImportError:
-    HAS_MUJOCO = False
-
-try:
-    import cv2 as cv
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-
-# ---------------------------------------------------------------------------
-# ROS2 imports
-# ---------------------------------------------------------------------------
 import rclpy
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Image
-from geometry_msgs.msg import WrenchStamped, PointStamped, QuaternionStamped
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
-from cv_bridge import CvBridge
 
 
-# ===========================================================================
-# MODULE: MuJoCoBridgeNode — ROS2 node that steps MuJoCo and bridges topics
-# ===========================================================================
+DEFAULT_ARM_JOINTS = [
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+]
+
+DEFAULT_HAND_JOINTS = [
+    "right_thumb_proximal_joint",
+    "right_thumb_metacarpal_joint",
+    "right_index_proximal_joint",
+    "right_middle_proximal_joint",
+    "right_ring_proximal_joint",
+    "right_pinky_proximal_joint",
+]
+
+
 class MuJoCoBridgeNode(Node):
-    """MuJoCo physics bridge node.
+    def __init__(self) -> None:
+        super().__init__("mujoco_bridge_node")
+        self.declare_parameter("scene_path", "")
+        self.declare_parameter("physics_rate", 500.0)
+        self.declare_parameter("publish_rate", 100.0)
+        self.declare_parameter("viewer", False)
+        self.declare_parameter("arm_command_timeout", 0.10)
+        self.declare_parameter("diagnostic_period", 1.0)
+        self.declare_parameter("instability_velocity", 30.0)
+        self.declare_parameter(
+            "initial_arm_positions", [0.0, -0.35, 0.0, 0.0, 0.35])
+        self.declare_parameter("arm_joint_names", DEFAULT_ARM_JOINTS)
+        self.declare_parameter("hand_joint_names", DEFAULT_HAND_JOINTS)
+        self.declare_parameter("ee_site", "right_revo2_tcp")
 
-    Responsibilities:
-      1. Load MJCF scene, initialize MuJoCo model and data
-      2. Subscribe /joint_commands and /hand_commands, cache latest commands
-      3. Step MuJoCo at physics_rate (200 Hz)
-      4. Publish /joint_states (positions + velocities)
-      5. Render and publish virtual camera images at camera_rate
-      6. Publish /wrist_ft (force/torque)
-
-    Attributes:
-        model: MuJoCo MjModel.
-        data: MuJoCo MjData.
-        renderer: MuJoCo Renderer (off-screen rendering).
-        bridge: CvBridge (ROS2 ↔ OpenCV image conversion).
-        joint_cmd: Latest arm command dict {name: rad}.
-        hand_cmd: Latest hand command dict {name: rad}.
-        lock: Threading lock protecting command dicts.
-    """
-
-    def __init__(self):
-        super().__init__('mujoco_bridge_node')
-
-        # -----------------------------------------------------------------
-        # SECTION: 检查依赖
-        # -----------------------------------------------------------------
-        if not HAS_MUJOCO:
-            self.get_logger().fatal(
-                "MuJoCo 未安装！请执行: pip install mujoco"
-            )
-            raise ImportError("mujoco not installed")
-
-        # -----------------------------------------------------------------
-        # SECTION: 声明参数
-        # -----------------------------------------------------------------
-        self.declare_parameter('scene_path', '')
-        self.declare_parameter('physics_rate', 200.0)       # Hz
-        self.declare_parameter('camera_rate', 15.0)         # Hz（相机渲染较耗性能）
-        self.declare_parameter('camera_name', 'head_cam')   # MJCF 中相机名称
-        self.declare_parameter('publish_camera', False)     # 默认关闭（params.yaml 覆盖；性能）
-        self.declare_parameter('publish_ft', True)
-        self.declare_parameter('base_frame', 'pelvis')
-        self.declare_parameter('viewer', False)             # 是否打开交互式窗口
-        self.declare_parameter('active_joints', [
-            'right_shoulder_pitch_joint',
-            'right_shoulder_roll_joint',
-            'right_shoulder_yaw_joint',
-            'right_elbow_joint',
-            'right_wrist_roll_joint',
-            'right_wrist_pitch_joint',
-            'right_wrist_yaw_joint',
-        ])  # G1 右臂 7-DOF (arm 4 + wrist 3)，手指关节由 hand_controller 管理
-        self.declare_parameter('clamp_arm_joints', False)  # 手臂关节硬夹持（默认关闭，靠位置伺服）
-        # NOTE: hard_clamp_pelvis was removed — the base is FIXED in the MJCF
-        # (free joint stripped by inject_inspire_hand.py), so there is no pelvis
-        # free joint to clamp, and qpos[0:3] no longer holds the pelvis pose.
-        self.declare_parameter('hard_clamp_joints', True)   # 硬夹持非右臂关节（除右臂外全部锁死）
-        self.declare_parameter('publish_locked_joint_hold', False)  # 发布 /locked_joint_hold（实物部署用）
-
-        self.declare_parameter('finger_ema_alpha', 1.0)   # EMA 平滑系数（手指，1.0=无平滑）
-        self.declare_parameter('wrist_ema_alpha', 1.0)  # EMA 平滑系数（手腕, 1.0=无平滑）
-
-        # Torque mode: controllers publish effort=τ; bridge writes motor ctrl=τ.
-        self.declare_parameter('torque_mode', True)
-        # Watchdog: torque commands older than this are treated as stale (controller
-        # died / stopped publishing) and reverted to the gravity-hold fallback.
-        self.declare_parameter('cmd_timeout', 0.3)
-        # Inspire hand joints (12). Identifies hand joints for hard-clamp skip
-        # and /joint_states publishing (6 slaves have NO actuator).
-        self.declare_parameter('hand_joint_names', [
-            'R_thumb_proximal_yaw_joint', 'R_thumb_proximal_pitch_joint',
-            'R_thumb_intermediate_joint', 'R_thumb_distal_joint',
-            'R_index_proximal_joint', 'R_index_intermediate_joint',
-            'R_middle_proximal_joint', 'R_middle_intermediate_joint',
-            'R_ring_proximal_joint', 'R_ring_intermediate_joint',
-            'R_pinky_proximal_joint', 'R_pinky_intermediate_joint',
-        ])
-
-        # 实际读取硬夹持参数值（在 MuJoCo 加载后赋值）
-        self.hard_clamp_joints = False
-
-        # -----------------------------------------------------------------
-        # SECTION: 加载 MuJoCo 场景
-        # -----------------------------------------------------------------
-        scene_path = self.get_parameter('scene_path').get_parameter_value().string_value
+        scene_path = self.get_parameter("scene_path").value
         if not scene_path:
-            # 默认路径：<package_share>/config/g1_inspire_scene.xml
-            from ament_index_python.packages import get_package_share_directory
-            try:
-                share_dir = get_package_share_directory('g1_right_arm_reach')
-                scene_path = os.path.join(share_dir, 'config', 'g1_inspire_scene.xml')
-            except Exception:
-                self.get_logger().fatal(
-                    "无法解析场景文件路径！请通过 --ros-args -p scene_path:=/path/to/scene.xml 指定"
-                )
-                raise
-
-        if not os.path.exists(scene_path):
-            self.get_logger().fatal(f"场景文件不存在: {scene_path}")
+            scene_path = os.path.join(
+                get_package_share_directory("g1_right_arm_reach"),
+                "config", "models", "g1_23dof_revo2_arm_only.xml")
+        if not os.path.isfile(scene_path):
             raise FileNotFoundError(scene_path)
 
-        self.get_logger().info(f"加载 MuJoCo 场景: {scene_path}")
         self.model = mujoco.MjModel.from_xml_path(scene_path)
         self.data = mujoco.MjData(self.model)
-        self.get_logger().info(
-            f"模型加载完成: nq={self.model.nq}, nv={self.model.nv}, "
-            f"nu={self.model.nu}, nsensordata={self.model.nsensordata}"
-        )
-
-        # ─────────────────────────────────────────────────────────────
-        # 诊断：统计 body 数量（详细列表用 debug 级别）
-        # ─────────────────────────────────────────────────────────────
-        hand_bodies = []
-        for bid in range(self.model.nbody):
-            bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if bname and bname.startswith("R_"):  # Inspire hand bodies
-                hand_bodies.append(bname)
-        self.get_logger().info(f"MJCF: {self.model.nbody} bodies ({len(hand_bodies)} Inspire hand bodies)")
-        self.get_logger().debug(f"Inspire hand bodies: {', '.join(hand_bodies)}")
-
-        # -----------------------------------------------------------------
-        # SECTION: 建立关节名 → 所有执行器 ID 映射
-        # -----------------------------------------------------------------
-        # 每个关节可能被多个执行器驱动（MJCF include 的 <motor> + 我们的 <position>）。
-        # 存储全部执行器 ID，统一设 ctrl 使所有执行器朝向同一目标。
-        self.actuator_map = {}       # {joint_name: [act_id, ...]} — 所有执行器
-        self.actuator_map_primary = {}  # {joint_name: act_id} — 主执行器（诊断用）
-        for act_id in range(self.model.nu):
-            act_joint_id = self.model.actuator_trnid[act_id][0]  # 传动目标关节
-            if act_joint_id >= 0 and act_joint_id < self.model.njnt:
-                joint_name = mujoco.mj_id2name(
-                    self.model, mujoco.mjtObj.mjOBJ_JOINT, act_joint_id
-                )
-                if joint_name:
-                    if joint_name not in self.actuator_map:
-                        self.actuator_map[joint_name] = []
-                    self.actuator_map[joint_name].append(act_id)
-                    self.actuator_map_primary[joint_name] = act_id  # 最后一个 = position 执行器
-                    self.get_logger().debug(
-                        f"  执行器映射: '{joint_name}' ← act[{act_id}]"
-                    )
-
-        # ─────────────────────────────────────────────────────────────
-        # 关键区分：motor（力矩控制）vs position servo（位置伺服）
-        #
-        # MuJoCo 中 <motor> 和 <position> 的 gaintype 都是 0 (mjGAIN_FIXED)！
-        # 区别在于 biastype：
-        #   biastype=0 (mjBIAS_NONE)  → <motor>:    force = gainprm[0] × ctrl
-        #                                            ctrl 是力矩指令，应设为 0（禁用）
-        #   biastype=1 (mjBIAS_AFFINE) → <position>: force = kp×(ctrl−q) − kv×qvel
-        #                                            ctrl 是目标位置
-        #
-        # <position> 的实现原理：gainprm[0]=kp, biasprm[1]=-kp, biasprm[2]=-kv
-        #   → force = kp*ctrl + 0 + (-kp)*q + (-kv)*qvel = kp*(ctrl-q) - kv*qvel
-        # ─────────────────────────────────────────────────────────────
-        self.actuator_motor_ids = set()      # 力矩电机（ctrl→力矩，恒为 0）
-        self.actuator_position_ids = set()   # 位置伺服（ctrl→目标位置）
-        for act_id in range(self.model.nu):
-            bt = self.model.actuator_biastype[act_id]
-            if bt == 0:  # mjBIAS_NONE → pure motor
-                self.actuator_motor_ids.add(act_id)
-            else:        # mjBIAS_AFFINE → position servo
-                self.actuator_position_ids.add(act_id)
-        self.get_logger().debug(
-            f"执行器分类: {len(self.actuator_motor_ids)} motor + "
-            f"{len(self.actuator_position_ids)} position servo"
-        )
-        self.get_logger().info(
-            f"执行器类型: {len(self.actuator_motor_ids)} 个 motor (力矩控制, ctrl→0), "
-            f"{len(self.actuator_position_ids)} 个 position servo (位置伺服)"
-        )
-
-        # 区分主动关节（右臂 7 DOF: arm 4 + wrist 3）与锁定关节
-        active_joints = self.get_parameter('active_joints').get_parameter_value().string_array_value
-        self.active_joint_names = set(active_joints)
-        # Inspire hand joints (12) — not "locked": 6 active have torque motors,
-        # 6 slaves are equality-driven (no actuator). Excluded from hard-clamp.
-        self.hand_joint_names = set(
-            self.get_parameter('hand_joint_names').get_parameter_value().string_array_value)
-        self.torque_mode = self.get_parameter('torque_mode').get_parameter_value().bool_value
-        self.wrist_joint_names = {  # 手腕关节 — 独立 EMA 平滑抑制 yaw 颤抖
-            'right_wrist_roll_joint',
-            'right_wrist_pitch_joint',
-            'right_wrist_yaw_joint',
-        }
-        self.locked_joint_names = set()
-        for joint_name in self.actuator_map:
-            if (joint_name not in self.active_joint_names
-                    and joint_name not in self.hand_joint_names):
-                self.locked_joint_names.add(joint_name)
-        self.get_logger().info(
-            f"Torque mode: {'ON' if self.torque_mode else 'OFF'} | "
-            f"hand joints: {len(self.hand_joint_names)} | "
-            f"locked: {len(self.locked_joint_names)}")
-
-        if not self.actuator_map:
-            self.get_logger().warn(
-                "未找到任何执行器→关节映射！"
-                "请确保 scene XML 中定义了 <position> 执行器"
-            )
-        else:
-            total_acts = sum(len(v) for v in self.actuator_map.values())
-            self.get_logger().info(
-                f"执行器映射: {len(self.actuator_map)} 个关节, "
-                f"{total_acts} 个执行器 "
-                f"(主动={len(self.active_joint_names)}, "
-                f"锁定={len(self.locked_joint_names)})"
-            )
-
-        # ─────────────────────────────────────────────────────────────
-        # 基座已固定（free joint 移除），无骨盆 free joint —— 不再记录/抬高
-        # 骨盆 qpos。锁定关节靠"位置伺服"保持（scene 中 kp 300~600），
-        # 配合可选硬夹持（hard_clamp_joints，默认关）。
-        #
-        # 为什么锁定关节不依赖硬夹持？
-        #   人形机器人自重 ~35 kg，重力在各关节上产生 10–50 N·m 力矩。
-        #   位置伺服 kp=500 下稳态误差 = 50/500 = 0.1 rad ≈ 5.7°/关节。
-        #   22 个锁定关节各自累积 5° 误差 → 整体姿态完全塌缩。
-        #   要达到 < 0.5° 误差需 kp > 5000，这种刚度在 200 Hz 下会
-        #   导致数值振荡。所以用"硬夹持 + 位置伺服备份"的双重锁死策略：
-        #     - 硬夹持：每步覆写 qpos，消除累积误差
-        #     - 位置伺服：步内持续提供力矩，减小夹持的物理突变
-        #   右臂的振荡并非由夹持引起（夹持只影响锁定关节），而是由
-        #   kp=1000 + 20Hz 阶跃指令 + 积分突变三者的互动造成。
-        # ─────────────────────────────────────────────────────────────
-
-        # ─────────────────────────────────────────────────────────────
-        # 左臂归零：MJCF 默认 qpos0 可能非零，在锁死前强制归零
-        # 确保左右臂对称自然下垂
-        # ─────────────────────────────────────────────────────────────
-        left_arm_joints = [
-            'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
-            'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
-            'left_wrist_pitch_joint', 'left_wrist_yaw_joint',
-        ]
-        left_arm_zeroed = []
-        for joint_name in left_arm_joints:
-            if joint_name in self.actuator_map_primary:
-                act_id = self.actuator_map_primary[joint_name]
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                old_q = float(self.data.qpos[qpos_addr])
-                self.data.qpos[qpos_addr] = 0.0
-                short = joint_name.replace('left_', '').replace('_joint', '')
-                left_arm_zeroed.append(f"{short}: {old_q:.3f}→0.000")
-        if left_arm_zeroed:
-            self.get_logger().info(
-                f"左臂归零（锁死前）: {', '.join(left_arm_zeroed)}"
-            )
-
-        # 锁定关节双重锁死：硬夹持（qpos 覆写）+ 位置伺服（步内维持）
-        # 使用 list（非 tuple）以便运行时更新手臂关节的目标值
-        self.locked_joint_clamps = []  # [[qpos_addr, target_val, dof_addr], ...]
-        self.locked_joint_info = []    # [(joint_name, qpos_addr, init_q), ...] 诊断用
-        self.arm_clamp_index = {}      # {joint_name: index_in_clamps} 快速查找
-
-        # 只采集非手、非右臂的锁定关节
-        # 手关节（Inspire R_*）由手部力矩/equality 控制，硬夹持会与之一致锁死
-        for joint_name in self.locked_joint_names:
-            if joint_name in self.hand_joint_names:
-                continue  # skip — hand joints driven by controller + equality
-            act_id = self.actuator_map_primary[joint_name]
-            act_joint_id = self.model.actuator_trnid[act_id][0]
-            if act_joint_id >= 0 and act_joint_id < self.model.njnt:
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                dof_addr = self.model.jnt_dofadr[act_joint_id]
-                init_q = float(self.data.qpos[qpos_addr])
-                self.locked_joint_clamps.append([qpos_addr, init_q, dof_addr])
-                self.locked_joint_info.append((joint_name, qpos_addr, init_q))
-
-        # ─────────────────────────────────────────────────────────────
-        # 初始化所有执行器 ctrl = MJCF 默认关节角度（qpos0）
-        # 关键：对每个关节的 ALL 执行器（电机 + 位置伺服）统一设 ctrl，
-        # 使所有执行器朝同一目标施力，而非互相对抗。
-        # ─────────────────────────────────────────────────────────────
-        for joint_name, act_ids in self.actuator_map.items():
-            # 用主执行器获取关节信息
-            act_id_primary = self.actuator_map_primary[joint_name]
-            act_joint_id = self.model.actuator_trnid[act_id_primary][0]
-            if act_joint_id >= 0 and act_joint_id < self.model.njnt:
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                init_q = float(self.data.qpos[qpos_addr])
-                # motor → ctrl=0（零力矩）；position servo → ctrl=init_q（位置目标）
-                for act_id in act_ids:
-                    if act_id in self.actuator_motor_ids:
-                        self.data.ctrl[act_id] = 0.0
-                    else:
-                        self.data.ctrl[act_id] = init_q
-                # 仅归零速度（安全措施）
-                dof_addr = self.model.jnt_dofadr[act_joint_id]
-                if dof_addr >= 0 and dof_addr < self.model.nv:
-                    self.data.qvel[dof_addr] = 0.0
-                self.get_logger().debug(
-                    f"  初始化 '{joint_name}': q={init_q:.3f} rad, "
-                    f"{len(act_ids)} 个执行器 "
-                    f"(motor={sum(1 for a in act_ids if a in self.actuator_motor_ids)}→0, "
-                    f"pos={sum(1 for a in act_ids if a in self.actuator_position_ids)}→{init_q:.3f})"
-                )
-
-        total_motor_ctrl = sum(1 for act_id in self.actuator_motor_ids)
-        total_pos_ctrl = sum(1 for act_id in self.actuator_position_ids)
-        self.get_logger().info(
-            f"执行器 ctrl 初始化完成: {total_motor_ctrl} 个 motor → ctrl=0 (禁用), "
-            f"{total_pos_ctrl} 个 position servo → ctrl=qpos0"
-        )
-
-        # 读取硬夹持参数（必须在 MuJoCo 加载后）
-        self.hard_clamp_joints = self.get_parameter('hard_clamp_joints').get_parameter_value().bool_value
-        self.get_logger().info(
-            f"硬夹持配置: joints={'ON' if self.hard_clamp_joints else 'OFF'}"
-        )
-
-        # ─────────────────────────────────────────────────────────────
-        # 设置右臂 "预备跑" 姿态（微屈肘，手在前方 ≈ 跑步预备姿势）
-        # 在 MJCF 默认站立姿态基础上覆盖右臂 7 关节
-        # ─────────────────────────────────────────────────────────────
-
-        # EMA 平滑滤波器状态（必须在 ready pose 之前初始化）
-        self.ctrl_smoothed = {}  # {actuator_id: smoothed_ctrl_value}
-
-        # 诊断：打印右臂关节在 MJCF 默认姿态下的 qpos（就绪姿态覆盖前）
-        default_arm_q = []
-        for joint_name in ['right_shoulder_pitch_joint', 'right_shoulder_roll_joint',
-                           'right_shoulder_yaw_joint', 'right_elbow_joint',
-                           'right_wrist_roll_joint', 'right_wrist_pitch_joint',
-                           'right_wrist_yaw_joint']:
-            if joint_name in self.actuator_map:
-                act_id = self.actuator_map_primary[joint_name]
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                default_q = float(self.data.qpos[qpos_addr])
-                short = joint_name.replace('right_', '').replace('_joint', '')
-                default_arm_q.append(f"{short}={default_q:.3f}")
-        self.get_logger().info(f"右臂 MJCF 默认 qpos: {', '.join(default_arm_q)}")
-
-        # 就绪姿态 = 全零（与左臂镜像）：上臂自然下垂、前臂水平向前。
-        # 实测（MuJoCo）：全零时 upper-arm vec=[0.016,-0.047,-0.187]（向下），
-        # fore-arm vec=[0.184,-0.002,-0.010]（水平向前），与左臂全零完全一致。
-        arm_ready_pose = {
-            'right_shoulder_pitch_joint':  0.0,   # 上臂自然下垂（不再前倾"超前"）
-            'right_shoulder_roll_joint':   0.0,
-            'right_shoulder_yaw_joint':    0.0,
-            'right_elbow_joint':           0.0,   # G1 肘零位 = 前臂水平向前
-            'right_wrist_roll_joint':      0.0,   # neutral — palm quat handles ALL orientation
-            'right_wrist_pitch_joint':     0.0,
-            'right_wrist_yaw_joint':       0.0,
-        }
-        for joint_name, angle in arm_ready_pose.items():
-            if joint_name in self.actuator_map:
-                act_ids = self.actuator_map[joint_name]
-                act_id_primary = self.actuator_map_primary[joint_name]
-                act_joint_id = self.model.actuator_trnid[act_id_primary][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                self.data.qpos[qpos_addr] = angle
-                # motor → ctrl=0（零力矩）；position servo → ctrl=angle（位置目标）
-                for act_id in act_ids:
-                    if act_id in self.actuator_motor_ids:
-                        self.data.ctrl[act_id] = 0.0
-                    else:
-                        self.data.ctrl[act_id] = angle
-                        self.ctrl_smoothed[act_id] = float(angle)  # EMA 滤波器初值（仅位置伺服）
-                n_m = sum(1 for a in act_ids if a in self.actuator_motor_ids)
-                n_p = sum(1 for a in act_ids if a in self.actuator_position_ids)
-                self.get_logger().info(
-                    f"  右臂就绪姿态: {joint_name} = {angle:.3f} rad "
-                    f"(motor×{n_m}→0, pos×{n_p}→{angle:.3f})"
-                )
-            else:
-                self.get_logger().warn(
-                    f"  关节 '{joint_name}' 未在执行器映射中找到，跳过"
-                )
-
-        # ─────────────────────────────────────────────────────────────
-        # Inspire RH56 手初始姿态 = "home" 半握（grasp_library curl(0.8,0.25,0.25)）：
-        #   6 主动关节  thumb_yaw=0.25, thumb_pitch=0.25, 四指 proximal=0.8
-        #   6 从动关节  按 equality 耦合比预置一致值（thumb_int=1.6×tp=0.40,
-        #               thumb_dist=2.4×tp=0.60, 四指 int=1.0×px=0.8），避免初始弹跳。
-        # 拇指 tp=0.35→0.25：抬高 ~6mm，与食指间隙 54→62mm（不碰食指）。
-        # 全在限位内（thumb_yaw[-0.1,1.3], thumb_pitch[-0.1,0.6], 指[0,1.7]）。
-        # 后续 hand_controller 阻抗控制以"当前实际位姿"为保持基准，故半握被保持。
-        # ─────────────────────────────────────────────────────────────
-        hand_ready_pose = {
-            'R_thumb_proximal_yaw_joint':    0.25,
-            'R_thumb_proximal_pitch_joint':  0.25,
-            'R_thumb_intermediate_joint':    0.40,
-            'R_thumb_distal_joint':          0.60,
-            'R_index_proximal_joint':        0.8,
-            'R_index_intermediate_joint':    0.8,
-            'R_middle_proximal_joint':       0.8,
-            'R_middle_intermediate_joint':   0.8,
-            'R_ring_proximal_joint':         0.8,
-            'R_ring_intermediate_joint':     0.8,
-            'R_pinky_proximal_joint':        0.8,
-            'R_pinky_intermediate_joint':    0.8,
-        }
-        if self.hand_joint_names:
-            for joint_name, angle in hand_ready_pose.items():
-                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-                if jid >= 0:
-                    self.data.qpos[self.model.jnt_qposadr[jid]] = angle
-            self.get_logger().info(
-                f"Inspire 手初始姿态: home 半握 "
-                f"(thumb_yaw=0.25, thumb_pitch=0.25, 四指=0.8, "
-                f"从动按耦合比预置 {len(hand_ready_pose)} 关节)"
-            )
-
-        # ─────────────────────────────────────────────────────────────
-        # 启动重力保持：预置所有力矩电机的 ctrl = 当前姿态的重力保持扭矩。
-        #
-        # 问题：右臂/手腕/手指是纯力矩 <motor>，控制器（reach_node /
-        # hand_controller，50Hz）需要先加载 URDF/Pinocchio、完成 ROS 发现、
-        # 收到第一个 /joint_states 才开始发布扭矩。此前 motor ctrl=0 →
-        # 手臂在重力下从就绪姿态自由下垂（"一打开仿真就耷拉下来"），
-        # 而控制器接管后的重力保持只是"停在当前位置"，没有恢复力拉回就绪姿态。
-        #
-        # 解法：在初始姿态（就绪姿态）做零速 mj_forward，取 qfrc_bias
-        # （= 该姿态的保持扭矩，单摆实验已验证符号为 +），直接写进所有
-        # 力矩电机 ctrl。控制器一旦发布真实扭矩会覆盖此值（无副作用）；
-        # 若控制器启动慢/宕机，_physics_step 里仍按最近一次重力保持兜底。
-        # ─────────────────────────────────────────────────────────────
-        self.gravity_hold_ = {}   # {joint_name: gravity_hold_torque}
-        self._refresh_gravity_hold()
-        n_held = 0
-        for joint_name, tau in self.gravity_hold_.items():
-            if joint_name in self.actuator_map:
-                for act_id in self.actuator_map[joint_name]:
-                    if act_id in self.actuator_motor_ids:
-                        self.data.ctrl[act_id] = tau
-                        n_held += 1
-        self.get_logger().info(
-            f"启动重力保持: {len(self.gravity_hold_)} 关节 / {n_held} 力矩电机 "
-            f"ctrl=重力保持扭矩（控制器接管前防下垂）")
-
-        # 手臂关节硬夹持（由参数 clamp_arm_joints 控制）
-        clamp_arm = self.get_parameter('clamp_arm_joints').get_parameter_value().bool_value
-        if clamp_arm:
-            self.get_logger().info(
-                "手臂关节硬夹持已启用 (--ros-args -p clamp_arm_joints:=true)"
-            )
-            for joint_name in self.active_joint_names:
-                if joint_name in self.actuator_map:
-                    act_id = self.actuator_map_primary[joint_name]
-                    act_joint_id = self.model.actuator_trnid[act_id][0]
-                    if act_joint_id >= 0 and act_joint_id < self.model.njnt:
-                        qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                        dof_addr = self.model.jnt_dofadr[act_joint_id]
-                        init_q = float(self.data.qpos[qpos_addr])  # 此时已是就绪姿态
-                        idx = len(self.locked_joint_clamps)
-                        self.locked_joint_clamps.append([qpos_addr, init_q, dof_addr])
-                        self.locked_joint_info.append((joint_name, qpos_addr, init_q))
-                        self.arm_clamp_index[joint_name] = idx  # 快速查找
-        self.get_logger().info(
-            f"硬夹持关节总数: {len(self.locked_joint_clamps)} 个 "
-            f"(其中手臂={len(self.active_joint_names) if clamp_arm else 0})"
-        )
-
-        # -----------------------------------------------------------------
-        # SECTION: 关节传感器映射
-        # -----------------------------------------------------------------
-        # 建立 sensor 名 → 传感器 ID 映射（供快速查询）
-        self.sensor_pos_ids = {}   # {joint_name: sensor_id} for jointpos
-        self.sensor_vel_ids = {}   # {joint_name: sensor_id} for jointvel
-        for sens_id in range(self.model.nsensordata):
-            sens_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_SENSOR, sens_id
-            )
-            if sens_name is None:
-                continue
-            sens_type = self.model.sensor_type[sens_id]
-            # 获取传感器关联的关节
-            obj_id = self.model.sensor_objid[sens_id]
-            if obj_id >= 0:
-                obj_name = mujoco.mj_id2name(
-                    self.model, self.model.sensor_objtype[sens_id], obj_id
-                )
-                if sens_type == mujoco.mjtSensor.mjSENS_JOINTPOS:
-                    self.sensor_pos_ids[obj_name] = sens_id
-                elif sens_type == mujoco.mjtSensor.mjSENS_JOINTVEL:
-                    self.sensor_vel_ids[obj_name] = sens_id
-
-        # -----------------------------------------------------------------
-        # SECTION: 初始化渲染器（离屏）
-        # -----------------------------------------------------------------
-        camera_name = self.get_parameter('camera_name').get_parameter_value().string_value
-        self.camera_id = -1
-        for cam_id in range(self.model.ncam):
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam_id)
-            if name == camera_name:
-                self.camera_id = cam_id
-                break
-
-        if self.camera_id >= 0:
-            cam_res = self.model.cam_resolution[self.camera_id]
-            self.get_logger().info(
-                f"虚拟相机 '{camera_name}' (ID={self.camera_id}): "
-                f"{cam_res[0]}×{cam_res[1]}"
-            )
-            self.renderer = mujoco.Renderer(self.model, cam_res[0], cam_res[1])
-        else:
-            self.get_logger().warn(f"未找到相机 '{camera_name}'，相机发布禁用")
-            self.renderer = None
-
-        # -----------------------------------------------------------------
-        # SECTION: cv_bridge（ROS2 ↔ OpenCV 图像转换）
-        # -----------------------------------------------------------------
-        if HAS_CV2:
-            self.bridge = CvBridge()
-        else:
-            self.bridge = None
-            if self.get_parameter('publish_camera').get_parameter_value().bool_value:
-                self.get_logger().warn(
-                    "cv_bridge 不可用，相机发布将使用 numpy→Image 手动转换"
-                )
-
-        # -----------------------------------------------------------------
-        # SECTION: ROS2 订阅 & 发布
-        # -----------------------------------------------------------------
-        self.joint_cmd = {}        # {joint_name: position_rad} — arm+wrist (7-DOF)
-        self.joint_cmd_effort = {}  # {joint_name: effort_Nm} (torque diagnostics)
-        self.joint_cmd_tau = {}     # {joint_name: torque_Nm} — torque_mode (arm+wrist)
-        self.joint_cmd_tau_stamp = {}  # {joint_name: last update time.monotonic()} — watchdog
-        self.hand_cmd = {}          # {joint_name: position_rad} — hand active joints
-        self.hand_cmd_tau = {}      # {joint_name: torque_Nm} — torque_mode (hand)
-        self.hand_cmd_tau_stamp = {}  # {joint_name: last update time.monotonic()} — watchdog
+        self.gravity_data = mujoco.MjData(self.model)
+        self.arm_names = list(self.get_parameter("arm_joint_names").value)
+        self.hand_names = list(self.get_parameter("hand_joint_names").value)
+        self.arm_timeout = float(self.get_parameter("arm_command_timeout").value)
+        self.diagnostic_period = float(self.get_parameter("diagnostic_period").value)
+        self.instability_velocity = float(
+            self.get_parameter("instability_velocity").value)
         self.lock = threading.Lock()
+        self.arm_torque: dict[str, float] = {}
+        self.hand_position: dict[str, float] = {}
+        self.last_arm_command = -1.0
 
-        self.cmd_sub = self.create_subscription(
-            JointState, '/joint_commands', self._cmd_callback, 10
-        )
+        self.joint_ids: dict[str, int] = {}
+        self.qpos_addresses: dict[str, int] = {}
+        self.dof_addresses: dict[str, int] = {}
+        for joint_id in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if not name or self.model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            self.joint_ids[name] = joint_id
+            self.qpos_addresses[name] = int(self.model.jnt_qposadr[joint_id])
+            self.dof_addresses[name] = int(self.model.jnt_dofadr[joint_id])
 
-        self.hand_cmd_sub = self.create_subscription(
-            JointState, '/hand_commands', self._hand_cmd_callback, 10
-        )
-
-        self.js_pub = self.create_publisher(JointState, '/joint_states', 10)
-
-        # P0-2: watchdog status — per commanded joint, seconds since the last FRESH
-        # torque command (or -1 if none received). Lets operators / tests verify
-        # that the bridge reverts to the gravity-hold fallback within cmd_timeout
-        # when a controller stops publishing (verifiable unload / e-stop path).
-        self.watchdog_pub = self.create_publisher(Float64MultiArray, '/debug/bridge_watchdog', 10)
-
-        publish_camera = self.get_parameter('publish_camera').get_parameter_value().bool_value
-        if publish_camera and self.camera_id >= 0:
-            self.rgb_pub = self.create_publisher(Image, '/camera/rgb', 10)
-            self.depth_pub = self.create_publisher(Image, '/camera/depth', 10)
-        else:
-            self.rgb_pub = None
-            self.depth_pub = None
-
-        publish_ft = self.get_parameter('publish_ft').get_parameter_value().bool_value
-        if publish_ft:
-            self.ft_pub = self.create_publisher(WrenchStamped, '/wrist_ft', 10)
-        else:
-            self.ft_pub = None
-
-        # /locked_joint_hold — 锁定关节的保持位置（实物部署时替代硬夹持）
-        # 仿真中默认关闭（hard_clamp 更可靠），实物部署时启用。
-        # Unitree SDK 桥接节点订阅此 topic 来维持非右臂关节静止。
-        publish_locked_hold = self.get_parameter('publish_locked_joint_hold').get_parameter_value().bool_value
-        if publish_locked_hold:
-            self.locked_hold_pub = self.create_publisher(JointState, '/locked_joint_hold', 10)
-        else:
-            self.locked_hold_pub = None
-
-        # --- MuJoCo 真实末端位置发布（供 PID 使用，消除 URDF/MJCF FK 差异）---
-        # 优先: right_wrist_yaw_link (最后腕关节的 link)
-        # 回退: right_wrist_roll_rubber_hand (腕末端 rubber hand)
-        self.ee_body_id = -1
-        for bid in range(self.model.nbody):
-            bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if bname == 'right_wrist_yaw_link':
-                self.ee_body_id = bid
-                break
-        if self.ee_body_id < 0:
-            for bid in range(self.model.nbody):
-                bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-                if bname == 'right_wrist_roll_rubber_hand':
-                    self.ee_body_id = bid
-                    break
-        if self.ee_body_id >= 0:
-            ee_body_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_BODY, self.ee_body_id)
-            self.ee_pub = self.create_publisher(PointStamped, '/actual_ee_pose', 10)
-            self.get_logger().info(
-                f"真实末端位置发布: body='{ee_body_name}' (ID={self.ee_body_id})"
-            )
-        else:
-            self.ee_pub = None
-            self.get_logger().warn(
-                "未找到 right_wrist_yaw_link 或 right_wrist_roll_rubber_hand body，"
-                "末端位置不发布"
-            )
-
-        # ─────────────────────────────────────────────────────────────
-        # Hand body (palm) for orientation publishing (Plan C: wrist in Hand module)
-        # ─────────────────────────────────────────────────────────────
-        self.hand_body_id = -1
-        for bid in range(self.model.nbody):
-            bname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bid)
-            if bname in ('R_hand_base_link', 'right_palm_link'):  # Inspire hand base
-                self.hand_body_id = bid
-                break
-        if self.hand_body_id < 0:
-            # fallback: use wrist_yaw_link
-            self.hand_body_id = self.ee_body_id
-
-        if self.hand_body_id >= 0:
-            hb_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_BODY, self.hand_body_id)
-            self.hand_ori_pub = self.create_publisher(
-                QuaternionStamped, '/actual_hand_orientation', 10)
-            self.get_logger().info(
-                f"手部朝向发布: body='{hb_name}' (ID={self.hand_body_id})"
-            )
-        else:
-            self.hand_ori_pub = None
-            self.get_logger().warn("未找到手部body，朝向不发布")
-
-        # --- 右臂 7 关节的 dof 地址（仅用于 /mujoco_gravity 的 qfrc_bias 提取）---
-        # 注意：3×7 位置 Jacobian（/mujoco_jacobian）已移除——它没有订阅者
-        # （reach_node/hand_controller 都用 Pinocchio 本地 Jacobian），发布它
-        # 每 10 步白烧 ~15 次 mj_forward。只保留 wrist 3×3（hand_controller 仿真路径用）。
-        arm_joint_order = [
-            'right_shoulder_pitch_joint',
-            'right_shoulder_roll_joint',
-            'right_shoulder_yaw_joint',
-            'right_elbow_joint',
-            'right_wrist_roll_joint',
-            'right_wrist_pitch_joint',
-            'right_wrist_yaw_joint',
-        ]
-        self.arm_joint_dof_addrs = []   # [dof_addr, ...] — 重力补偿提取（qfrc_bias）
-        for joint_name in arm_joint_order:
-            if joint_name in self.actuator_map_primary:
-                act_id = self.actuator_map_primary[joint_name]
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                dof_addr = self.model.jnt_dofadr[act_joint_id]
-                self.arm_joint_dof_addrs.append(dof_addr)
+        self.motor_actuators: dict[str, list[int]] = {}
+        self.position_actuators: dict[str, list[int]] = {}
+        for actuator_id in range(self.model.nu):
+            joint_id = int(self.model.actuator_trnid[actuator_id, 0])
+            if joint_id < 0:
+                continue
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if not name:
+                continue
+            if self.model.actuator_biastype[actuator_id] == mujoco.mjtBias.mjBIAS_NONE:
+                self.motor_actuators.setdefault(name, []).append(actuator_id)
             else:
-                self.get_logger().warn(f"Gravity: 关节 '{joint_name}' 不在 actuator_map 中")
+                self.position_actuators.setdefault(name, []).append(actuator_id)
 
-        # ─────────────────────────────────────────────────────────────
-        # Wrist orientation Jacobian (3×3) for hand_controller (Plan C)
-        # ─────────────────────────────────────────────────────────────
-        wrist_joint_order = [
-            'right_wrist_roll_joint',
-            'right_wrist_pitch_joint',
-            'right_wrist_yaw_joint',
-        ]
-        self.wrist_joint_qpos_addrs = []
-        for joint_name in wrist_joint_order:
-            if joint_name in self.actuator_map_primary:
-                act_id = self.actuator_map_primary[joint_name]
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                self.wrist_joint_qpos_addrs.append(qpos_addr)
-        if self.hand_body_id >= 0 and len(self.wrist_joint_qpos_addrs) == 3:
-            self.wrist_jac_pub = self.create_publisher(
-                Float64MultiArray, '/mujoco_wrist_jacobian', 10)
-            self.get_logger().info(
-                f"Wrist orientation Jacobian (3×3) → /mujoco_wrist_jacobian"
-            )
-        else:
-            self.wrist_jac_pub = None
-            self.get_logger().warn(
-                f"Wrist Jacobian 发布禁用 "
-                f"(hand_body={self.hand_body_id}, wrist_addrs={len(self.wrist_joint_qpos_addrs)})"
-            )
+        self._validate_model()
+        self._set_initial_state()
+        self._initialize_controls()
+        mujoco.mj_forward(self.model, self.data)
+        self.initial_qpos = self.data.qpos.copy()
+        self.gravity_torque = self._compute_gravity()
 
-        # ─────────────────────────────────────────────────────────────
-        # Pure-gravity torque (7 arm+wrist joints) → /mujoco_gravity
-        #
-        # 关键：qfrc_bias = 重力 + 科氏 + 离心（速度相关）。
-        # 控制器做重力补偿时若把科氏/离心也反馈进来会形成正反馈发散，
-        # 所以这里把 qvel 归零后再 mj_forward → qfrc_bias 就只剩纯重力，
-        # 且包含 Inspire 手 + 5010 手腕质量（base URDF 里没有，Pinocchio 补不到）。
-        # 顺序 = arm_joint_order = [shoulder×3, elbow, wrist_roll, wrist_pitch, wrist_yaw]。
-        # ─────────────────────────────────────────────────────────────
-        if len(self.arm_joint_dof_addrs) >= 7:
-            self.grav_pub = self.create_publisher(
-                Float64MultiArray, '/mujoco_gravity', 10)
-            self.get_logger().info(
-                f"Pure-gravity torque (7 arm+wrist joints) → /mujoco_gravity"
-            )
-        else:
-            self.grav_pub = None
-            self.get_logger().warn(
-                f"Gravity publisher 禁用 (arm_joint_dof_addrs={len(self.arm_joint_dof_addrs)})"
-            )
+        site_name = str(self.get_parameter("ee_site").value)
+        self.ee_site_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+        if self.ee_site_id < 0:
+            raise RuntimeError(f"MJCF site not found: {site_name}")
 
-        # -----------------------------------------------------------------
-        # SECTION: 仿真定时器
-        # -----------------------------------------------------------------
-        physics_rate = self.get_parameter('physics_rate').get_parameter_value().double_value
-        self.physics_dt = 1.0 / physics_rate
-        self.model.opt.timestep = self.physics_dt
+        self.joint_state_pub = self.create_publisher(JointState, "/joint_states", 10)
+        self.ee_pose_pub = self.create_publisher(PoseStamped, "/actual_ee_pose", 10)
+        self.gravity_pub = self.create_publisher(Float64MultiArray, "/mujoco_gravity", 10)
+        self.arm_command_sub = self.create_subscription(
+            JointState, "/joint_commands", self._arm_callback, 10)
+        self.hand_command_sub = self.create_subscription(
+            JointState, "/hand_commands", self._hand_callback, 10)
 
-        physics_period_ms = int(1000.0 / physics_rate)
-        self.physics_timer = self.create_timer(
-            physics_period_ms / 1000.0, self._physics_step
-        )
+        physics_rate = float(self.get_parameter("physics_rate").value)
+        publish_rate = float(self.get_parameter("publish_rate").value)
+        self.model.opt.timestep = 1.0 / physics_rate
+        self.publish_interval = max(1, round(physics_rate / publish_rate))
+        self.step_count = 0
+        self.last_diagnostic = time.monotonic()
+        self.timer = self.create_timer(1.0 / physics_rate, self._physics_step)
 
-        # 相机发布计数器（降频渲染）
-        camera_rate = self.get_parameter('camera_rate').get_parameter_value().double_value
-        self.camera_step_interval = max(1, int(physics_rate / camera_rate))
-        self.step_counter = 0
+        self.viewer = None
+        if bool(self.get_parameter("viewer").value):
+            from mujoco import viewer as mujoco_viewer
+            self.viewer = mujoco_viewer.launch_passive(self.model, self.data)
 
-        # -----------------------------------------------------------------
-        # SECTION: 交互式查看器（可选）
-        # -----------------------------------------------------------------
-        self.viewer_enabled = self.get_parameter('viewer').get_parameter_value().bool_value
-        if self.viewer_enabled:
-            try:
-                import glfw  # noqa: F401
-                from mujoco import viewer
-                self.viewer = viewer.launch_passive(self.model, self.data)
-                self.get_logger().info("MuJoCo 交互式查看器已启动")
-            except Exception as e:
-                self.get_logger().warn(f"无法启动查看器: {e}")
-                self.viewer_enabled = False
-                self.viewer = None
-        else:
-            self.viewer = None
-
-        # -----------------------------------------------------------------
-        # SECTION: 就绪
-        # -----------------------------------------------------------------
         self.get_logger().info(
-            f"MuJoCoBridgeNode 就绪 | 物理频率: {physics_rate:.0f} Hz | "
-            f"相机频率: {camera_rate:.0f} Hz | "
-            f"执行器: {len(self.actuator_map)} 个"
-        )
+            f"Loaded {scene_path}: nq={self.model.nq}, nv={self.model.nv}, "
+            f"nu={self.model.nu}; dt={self.model.opt.timestep:.4f}s, "
+            f"integrator={int(self.model.opt.integrator)}, "
+            f"arm=torque(5), hand=position(6)")
 
-    # =========================================================================
-    # MODULE: Subscription Callbacks
-    # =========================================================================
+    def _validate_model(self) -> None:
+        missing_arm = [name for name in self.arm_names if name not in self.motor_actuators]
+        missing_hand = [name for name in self.hand_names if name not in self.position_actuators]
+        if missing_arm or missing_hand:
+            raise RuntimeError(
+                f"model actuator mismatch: missing arm motors={missing_arm}, "
+                f"missing hand position servos={missing_hand}")
+        overlap = set(self.arm_names) & set(self.hand_names)
+        if overlap:
+            raise RuntimeError(f"arm/hand control groups overlap: {sorted(overlap)}")
 
-    def _cmd_callback(self, msg: JointState):
-        """缓存 /joint_commands 中的关节位置和力矩。
+    def _set_initial_state(self) -> None:
+        initial = list(self.get_parameter("initial_arm_positions").value)
+        if len(initial) != len(self.arm_names) or not np.all(np.isfinite(initial)):
+            raise RuntimeError("initial_arm_positions must contain five finite values")
+        for name, value in zip(self.arm_names, initial):
+            joint_id = self.joint_ids[name]
+            if self.model.jnt_limited[joint_id]:
+                lower, upper = self.model.jnt_range[joint_id]
+                value = float(np.clip(value, lower, upper))
+            self.data.qpos[self.qpos_addresses[name]] = value
+        self.data.qvel[:] = 0.0
 
-        torque_mode: effort 字段直接就是力矩指令 τ（reach_node PID 输出），
-        写入 motor ctrl=τ；position 字段仅作诊断（= 当前实际关节角）。
-        同时打时间戳，供看门狗判断指令是否过期。
+    def _initialize_controls(self) -> None:
+        # Do not teleport qpos every step. Non-target G1 joints are held by their
+        # generated position actuators; all direct motors start at zero torque.
+        for actuator_ids in self.motor_actuators.values():
+            for actuator_id in actuator_ids:
+                self.data.ctrl[actuator_id] = 0.0
+        for name, actuator_ids in self.position_actuators.items():
+            target = float(self.data.qpos[self.qpos_addresses[name]])
+            for actuator_id in actuator_ids:
+                lower, upper = self.model.actuator_ctrlrange[actuator_id]
+                self.data.ctrl[actuator_id] = np.clip(target, lower, upper)
 
-        线程安全：使用 lock 保护 joint_cmd 字典的写入。
+    def _arm_callback(self, command: JointState) -> None:
+        updated: dict[str, float] = {}
+        for index, name in enumerate(command.name):
+            if name in self.arm_names and index < len(command.effort):
+                value = float(command.effort[index])
+                if np.isfinite(value):
+                    updated[name] = value
+        if len(updated) == len(self.arm_names):
+            with self.lock:
+                self.arm_torque = updated
+                self.last_arm_command = time.monotonic()
 
-        Args:
-            msg: sensor_msgs/JointState，来自 reach_node 的关节指令。
-        """
+    def _hand_callback(self, command: JointState) -> None:
+        updated: dict[str, float] = {}
+        for index, name in enumerate(command.name):
+            if name in self.hand_names and index < len(command.position):
+                value = float(command.position[index])
+                if np.isfinite(value):
+                    updated[name] = value
+        if updated:
+            with self.lock:
+                self.hand_position.update(updated)
+
+    def _apply_commands(self) -> None:
         with self.lock:
-            for name, pos in zip(msg.name, msg.position):
-                self.joint_cmd[name] = pos
-            # 缓存力矩信息（诊断 + torque_mode 应用）
-            for name, eff in zip(msg.name, msg.effort):
-                self.joint_cmd_effort[name] = eff
-                # TORQUE MODE: effort 字段就是指令，必须无条件信任（包括 0）。
-                # 若用 abs(eff)>1e-12 过滤，关节扭矩算到 0 时旧扭矩不会被覆盖，
-                # 桥会一直施加最后一次非零扭矩 → 手臂持续单方向顶 → 发散。
-                if self.torque_mode:
-                    self.joint_cmd_tau[name] = eff
-                    self.joint_cmd_tau_stamp[name] = time.monotonic()
+            arm_fresh = time.monotonic() - self.last_arm_command <= self.arm_timeout
+            arm_torque = dict(self.arm_torque)
+            hand_position = dict(self.hand_position)
 
-    def _hand_cmd_callback(self, msg: JointState):
-        """缓存 /hand_commands 中的手指关节位置。
+        for name in self.arm_names:
+            dof = self.dof_addresses[name]
+            # Stale command fallback is pure gravity only. Do not use the live
+            # qfrc_bias here: at nonzero velocity it also contains Coriolis and
+            # centrifugal terms from an older state.
+            torque = (arm_torque.get(name, 0.0) if arm_fresh
+                      else float(self.gravity_torque[dof]))
+            for actuator_id in self.motor_actuators[name]:
+                lower, upper = self.model.actuator_ctrlrange[actuator_id]
+                if self.model.actuator_ctrllimited[actuator_id]:
+                    torque = float(np.clip(torque, lower, upper))
+                self.data.ctrl[actuator_id] = torque
 
-        Args:
-            msg: sensor_msgs/JointState，来自 hand_controller 的手指关节指令。
-        """
-        with self.lock:
-            for name, pos in zip(msg.name, msg.position):
-                self.hand_cmd[name] = pos
-            for name, eff in zip(msg.name, msg.effort):
-                # 同上：torque 模式下无条件信任 effort 字段
-                if self.torque_mode:
-                    self.hand_cmd_tau[name] = eff
-                    self.hand_cmd_tau_stamp[name] = time.monotonic()
+        for name, target in hand_position.items():
+            if name not in self.position_actuators:
+                continue
+            for actuator_id in self.position_actuators[name]:
+                lower, upper = self.model.actuator_ctrlrange[actuator_id]
+                self.data.ctrl[actuator_id] = float(np.clip(target, lower, upper))
 
-    # =========================================================================
-    # MODULE: Physics Loop
-    # =========================================================================
-
-    def _physics_step(self):
-        """执行一个 MuJoCo 物理步进。
-
-        流程：
-          1. 将最新的 /joint_commands 写入 MuJoCo ctrl
-          2. 调用 mj_step() 推进物理仿真
-          3. 发布 /joint_states
-          4. 每 N 步渲染并发布相机图像
-          5. 发布腕部力/力矩
-        """
-        # 1. 写入最新关节指令到执行器（带平滑，消除 50Hz→200Hz 阶跃）
-        #    reach_node 每 20ms 更新一次 /joint_commands（50Hz），
-        #    平滑策略：EMA，alpha=0.3 → τ ≈ 3步=15ms，滤除高频噪声。
-        with self.lock:
-            alpha_wrist = self.get_parameter('wrist_ema_alpha').get_parameter_value().double_value
-            for joint_name, act_ids in self.actuator_map.items():
-                # --- Torque mode: apply commanded torque to motor actuators ---
-                # (PID → τ directly; motor ctrl = τ, 1:1 with LowCmd tau_ff on hardware)
-                if self.torque_mode:
-                    # Watchdog: only trust a torque command if it was updated recently.
-                    # If the controller dies, the last torque would otherwise be applied
-                    # forever (a stuck non-zero τ pushes the arm into the joint limits).
-                    # Stale → fall through to gravity-hold / locked-joint hold.
-                    tau = None
-                    now = time.monotonic()
-                    cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
-                    if (joint_name in self.joint_cmd_tau
-                            and now - self.joint_cmd_tau_stamp.get(joint_name, now) <= cmd_timeout):
-                        tau = self.joint_cmd_tau[joint_name]
-                    elif (joint_name in self.hand_cmd_tau
-                            and now - self.hand_cmd_tau_stamp.get(joint_name, now) <= cmd_timeout):
-                        tau = self.hand_cmd_tau[joint_name]
-                    if tau is not None:
-                        for act_id in act_ids:
-                            if act_id in self.actuator_motor_ids:
-                                self.data.ctrl[act_id] = float(tau)
-                        continue
-                    # No torque command this cycle → 用重力保持扭矩兜底。
-                    # 关键：motor ctrl 保持 0 会让手臂/手腕/手指在控制器接管前
-                    # （或控制器宕机时）自由下垂。改为施加当前姿态的重力保持
-                    # 扭矩（__init__ 预置 + 20Hz 刷新），手臂始终被撑住。
-                    if joint_name in self.gravity_hold_:
-                        for act_id in act_ids:
-                            if act_id in self.actuator_motor_ids:
-                                self.data.ctrl[act_id] = self.gravity_hold_[joint_name]
-                        continue
-                    # 锁定关节保持位置伺服初始 ctrl（已在 __init__ 设好）。
-                    if joint_name in self.locked_joint_names:
-                        continue
-                if joint_name in self.joint_cmd:
-                    target = self.joint_cmd[joint_name]
-                    # 使用主执行器做 EMA 平滑
-                    act_primary = self.actuator_map_primary[joint_name]
-                    prev = self.ctrl_smoothed.get(act_primary, target)
-                    # 手腕关节用独立更低的 alpha（抑制 yaw 颤抖）
-                    if joint_name in self.wrist_joint_names:
-                        alpha = alpha_wrist
-                    else:
-                        alpha = 1.0  # 肩/肘关节 EMA: 1.0=无平滑，直通
-                    smoothed = prev + alpha * (target - prev)
-                    # motor → ctrl=0（零力矩）；position servo → ctrl=smoothed（位置目标）
-                    for act_id in act_ids:
-                        if act_id in self.actuator_motor_ids:
-                            self.data.ctrl[act_id] = 0.0
-                        else:
-                            self.ctrl_smoothed[act_id] = smoothed
-                            self.data.ctrl[act_id] = float(smoothed)
-                    # 如果手臂关节被硬夹持，同步更新夹持目标（EMA 平滑）
-                    if joint_name in self.arm_clamp_index:
-                        idx = self.arm_clamp_index[joint_name]
-                        self.locked_joint_clamps[idx][1] = float(smoothed)
-                elif joint_name in self.hand_cmd:
-                    # 手指/手腕关节：来自 /hand_commands，独立 EMA 平滑
-                    target = self.hand_cmd[joint_name]
-                    act_primary = self.actuator_map_primary[joint_name]
-                    prev = self.ctrl_smoothed.get(act_primary, target)
-                    # 手腕关节用独立更低 alpha（抑制 yaw 颤抖）
-                    if joint_name in self.wrist_joint_names:
-                        alpha_hand = self.get_parameter('wrist_ema_alpha').get_parameter_value().double_value
-                    else:
-                        alpha_hand = self.get_parameter('finger_ema_alpha').get_parameter_value().double_value
-                    smoothed = prev + alpha_hand * (target - prev)
-                    for act_id in act_ids:
-                        if act_id in self.actuator_motor_ids:
-                            self.data.ctrl[act_id] = 0.0
-                        else:
-                            self.ctrl_smoothed[act_id] = smoothed
-                            self.data.ctrl[act_id] = float(smoothed)
-                elif joint_name in self.locked_joint_names:
-                    # 锁定关节：motor ctrl 保持 0，position servo ctrl 保持初始值
-                    # （已在 __init__ 中设好），不需要平滑（目标值不变）
-                    pass
-
-        # 1.5 根据参数决定是否硬夹持锁定关节（默认关闭，完全依赖位置伺服 + 足地接触）
-        # 注意：基座已固定（free joint 移除），不存在骨盆 free joint，故无 pelvis 夹持。
-        if self.hard_clamp_joints:
-            for clamp_entry in self.locked_joint_clamps:
-                qpos_addr = clamp_entry[0]
-                target_val = clamp_entry[1]
-                dof_addr = clamp_entry[2]
-                self.data.qpos[qpos_addr] = target_val
-                if dof_addr >= 0:
-                    self.data.qvel[dof_addr] = 0.0
-
-        # 2. 步进物理
+    def _physics_step(self) -> None:
+        self._apply_commands()
         mujoco.mj_step(self.model, self.data)
-
-        # 每 10 秒检查锁定关节漂移（仅在硬夹持时检查，无硬夹持时漂移是正常现象）
-        if self.step_counter % 2000 == 0:
-            if self.hard_clamp_joints:
-                max_lock_drift = 0.0
-                max_lock_name = ""
-                for joint_name, qpos_addr, init_q in self.locked_joint_info:
-                    if joint_name in self.active_joint_names:
-                        continue
-                    d = abs(float(self.data.qpos[qpos_addr]) - init_q)
-                    if d > max_lock_drift:
-                        max_lock_drift = d
-                        max_lock_name = joint_name
-                if max_lock_drift > 0.05:
-                    self.get_logger().warn(
-                        f"锁定关节最大漂移: {max_lock_name} = {max_lock_drift:.4f} rad "
-                        f"({max_lock_drift*57.3:.1f}°) — 检查执行器 kp/kv 是否足够"
-                    )
-
-        # 3. 发布关节状态
-        self._publish_joint_states()
-
-        # 3.6 P0-2: 发布看门狗状态（每关节指令年龄，20 Hz）
-        if self.step_counter % 10 == 0:
-            self._publish_watchdog_status()
-
-        # 3.25 发布锁定关节保持位置（实物部署用，20 秒一次即可）
-        if self.locked_hold_pub is not None and self.step_counter % 4000 == 0:
-            self._publish_locked_joint_hold()
-
-        # 3.5 发布 MuJoCo 真实末端位置 + 手部朝向 + wrist Jacobian + 纯重力 (20Hz，与 PID 同频)
-        # 3×7 位置 Jacobian 已移除（无订阅者；controllers 用 Pinocchio 本地计算）。
-        if self.ee_pub is not None and self.step_counter % 10 == 0:
+        finite = (
+            np.all(np.isfinite(self.data.qpos))
+            and np.all(np.isfinite(self.data.qvel))
+            and np.all(np.isfinite(self.data.qacc))
+        )
+        if not finite:
+            self.get_logger().error(
+                "NON-FINITE MuJoCo state detected; restoring initial simulation state")
+            self._restore_initial_state()
+            return
+        max_velocity = float(np.max(np.abs(self.data.qvel)))
+        if max_velocity > self.instability_velocity:
+            self.get_logger().warning(
+                f"SIMULATION UNSTABLE: max|qvel|={max_velocity:.2f} rad/s, "
+                f"ncon={self.data.ncon}")
+        if self.step_count % self.publish_interval == 0:
+            self._publish_state()
             self._publish_ee_pose()
-            self._publish_hand_orientation()
-            if self.wrist_jac_pub is not None:
-                self._publish_wrist_jacobian()
-            if self.grav_pub is not None:
-                self._publish_gravity()
-
-        # 4. 按降频渲染相机
-        self.step_counter += 1
-        if (self.renderer is not None
-                and self.rgb_pub is not None
-                and self.step_counter % self.camera_step_interval == 0):
-            self._publish_camera()
-
-        # 5. 发布腕部力/力矩
-        if self.ft_pub is not None:
-            self._publish_wrist_ft()
-
-        # 6. 更新交互式查看器
-        if self.viewer_enabled and self.viewer is not None:
+            self._publish_gravity()
+        if time.monotonic() - self.last_diagnostic >= self.diagnostic_period:
+            self._log_diagnostics()
+            self.last_diagnostic = time.monotonic()
+        self.step_count += 1
+        if self.viewer is not None and self.viewer.is_running():
             self.viewer.sync()
 
-    # =========================================================================
-    # MODULE: Publishers
-    # =========================================================================
-
-    def _publish_ee_pose(self):
-        """发布 /actual_ee_pose — MuJoCo 中右手心的真实世界坐标。"""
-        pos = self.data.xpos[self.ee_body_id]  # (3,) array: x, y, z
-        msg = PointStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world'
-        msg.point.x = float(pos[0])
-        msg.point.y = float(pos[1])
-        msg.point.z = float(pos[2])
-        self.ee_pub.publish(msg)
-
-    def _publish_hand_orientation(self):
-        """发布 /actual_hand_orientation — MuJoCo 中手掌的真实世界朝向 (quaternion)。"""
-        if self.hand_ori_pub is None or self.hand_body_id < 0:
-            return
-        xmat = self.data.xmat[self.hand_body_id]  # 9-element rotation matrix (row-major)
-        # Convert 3×3 rotation matrix to quaternion
-        R = xmat.reshape(3, 3)
-        # Use standard rotation-matrix-to-quaternion conversion
-        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
-        if tr > 0:
-            s = np.sqrt(tr + 1.0) * 2.0
-            qw = 0.25 * s
-            qx = float(R[2, 1] - R[1, 2]) / s
-            qy = float(R[0, 2] - R[2, 0]) / s
-            qz = float(R[1, 0] - R[0, 1]) / s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-            qw = float(R[2, 1] - R[1, 2]) / s
-            qx = 0.25 * s
-            qy = float(R[0, 1] + R[1, 0]) / s
-            qz = float(R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-            qw = float(R[0, 2] - R[2, 0]) / s
-            qx = float(R[0, 1] + R[1, 0]) / s
-            qy = 0.25 * s
-            qz = float(R[1, 2] + R[2, 1]) / s
-        else:
-            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-            qw = float(R[1, 0] - R[0, 1]) / s
-            qx = float(R[0, 2] + R[2, 0]) / s
-            qy = float(R[1, 2] + R[2, 1]) / s
-            qz = 0.25 * s
-        msg = QuaternionStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world'
-        msg.quaternion.x = float(qx)
-        msg.quaternion.y = float(qy)
-        msg.quaternion.z = float(qz)
-        msg.quaternion.w = float(qw)
-        self.hand_ori_pub.publish(msg)
-
-    def _publish_wrist_jacobian(self):
-        """发布 /mujoco_wrist_jacobian — 3×3 手腕朝向 Jacobian (orientation, not position).
-
-        对 3 个腕关节分别 ±ε 扰动，观测 hand body 的朝向变化，
-        使用中心差分计算 ∂ω/∂q_wrist (3×3 矩阵)。
-        """
-        if self.wrist_jac_pub is None or self.hand_body_id < 0:
-            return
-        eps = 0.001
-        J = np.zeros((3, 3), dtype=np.float64)
-
-        for i, qpos_addr in enumerate(self.wrist_joint_qpos_addrs):
-            orig = float(self.data.qpos[qpos_addr])
-
-            # +ε
-            self.data.qpos[qpos_addr] = orig + eps
-            mujoco.mj_forward(self.model, self.data)
-            R_plus = self.data.xmat[self.hand_body_id].reshape(3, 3).copy()
-
-            # −ε
-            self.data.qpos[qpos_addr] = orig - eps
-            mujoco.mj_forward(self.model, self.data)
-            R_minus = self.data.xmat[self.hand_body_id].reshape(3, 3).copy()
-
-            # Orientation difference: R_diff = R_plus * R_minus^T
-            # For small rotations: R_diff ≈ I + [ω]×
-            R_diff = R_plus @ R_minus.T
-            omega = 0.5 * np.array([
-                R_diff[2, 1] - R_diff[1, 2],
-                R_diff[0, 2] - R_diff[2, 0],
-                R_diff[1, 0] - R_diff[0, 1],
-            ], dtype=np.float64)
-
-            J[:, i] = omega / (2.0 * eps)
-
-            # Restore
-            self.data.qpos[qpos_addr] = orig
-
-        # Restore full kinematic state
-        mujoco.mj_forward(self.model, self.data)
-
-        msg = Float64MultiArray()
-        msg.data = J.flatten().tolist()  # row-major: [J00, J01, J02, J10, J11, J12, J20, J21, J22]
-        self.wrist_jac_pub.publish(msg)
-
-    def _refresh_gravity_hold(self):
-        """计算当前姿态下所有力矩电机关节的重力保持扭矩（零速 qfrc_bias）。
-
-        存储到 self.gravity_hold_ = {joint_name: torque}，供 __init__ 预置 ctrl
-        和 _physics_step 无指令兜底使用。零速 mj_forward 后 qfrc_bias = 纯重力
-        （科氏/离心与速度成正比，零速即零），正号即保持扭矩（单摆实验验证）。
-        """
-        qvel_save = self.data.qvel.copy()
+    def _restore_initial_state(self) -> None:
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[:] = self.initial_qpos
         self.data.qvel[:] = 0.0
+        self._initialize_controls()
         mujoco.mj_forward(self.model, self.data)
-        for joint_name, act_ids in self.actuator_map.items():
-            has_motor = any(a in self.actuator_motor_ids for a in act_ids)
-            if not has_motor:
-                continue
-            act_primary = self.actuator_map_primary[joint_name]
-            act_joint_id = self.model.actuator_trnid[act_primary][0]
-            if act_joint_id < 0 or act_joint_id >= self.model.njnt:
-                continue
-            dof_addr = self.model.jnt_dofadr[act_joint_id]
-            if 0 <= dof_addr < self.model.nv:
-                self.gravity_hold_[joint_name] = float(self.data.qfrc_bias[dof_addr])
-        self.data.qvel[:] = qvel_save
+        self.gravity_torque = self._compute_gravity()
+        with self.lock:
+            self.arm_torque.clear()
+            self.hand_position.clear()
+            self.last_arm_command = -1.0
 
-    def _publish_gravity(self):
-        """发布 /mujoco_gravity — 7 关节纯重力扭矩（含手+腕质量）。
+    def _log_diagnostics(self) -> None:
+        arm_q = [self.data.qpos[self.qpos_addresses[name]] for name in self.arm_names]
+        arm_dq = [self.data.qvel[self.dof_addresses[name]] for name in self.arm_names]
+        arm_ctrl = [
+            self.data.ctrl[self.motor_actuators[name][0]] for name in self.arm_names
+        ]
+        hand_q = [self.data.qpos[self.qpos_addresses[name]] for name in self.hand_names]
+        hand_ctrl = [
+            self.data.ctrl[self.position_actuators[name][0]] for name in self.hand_names
+        ]
+        maximum_acceleration = float(np.max(np.abs(self.data.qacc)))
+        maximum_constraint = float(np.max(np.abs(self.data.qfrc_constraint)))
+        fmt = lambda values: "[" + ", ".join(f"{value:.3f}" for value in values) + "]"
+        self.get_logger().info(
+            "SIM_DIAG "
+            f"q_arm={fmt(arm_q)} dq_arm={fmt(arm_dq)} tau={fmt(arm_ctrl)} "
+            f"q_hand={fmt(hand_q)} hand_ref={fmt(hand_ctrl)} "
+            f"max|qacc|={maximum_acceleration:.2f} "
+            f"max|constraint|={maximum_constraint:.2f} ncon={self.data.ncon}")
 
-        零速度 mj_forward → qfrc_bias = 纯重力（科氏/离心与速度成正比，零速即零）。
-        控制器用它做重力前馈，替代不含手质量的 Pinocchio computeGeneralizedGravity。
-        """
-        if self.grav_pub is None:
-            return
+    def _publish_state(self) -> None:
+        message = JointState()
+        message.header.stamp = self.get_clock().now().to_msg()
+        for name, joint_id in self.joint_ids.items():
+            qpos = self.qpos_addresses[name]
+            dof = self.dof_addresses[name]
+            message.name.append(name)
+            message.position.append(float(self.data.qpos[qpos]))
+            message.velocity.append(float(self.data.qvel[dof]))
+            message.effort.append(float(self.data.qfrc_actuator[dof]))
+        self.joint_state_pub.publish(message)
 
-        # 保存并归零速度 → mj_forward → qfrc_bias = 纯重力
-        qvel_save = self.data.qvel.copy()
-        self.data.qvel[:] = 0.0
-        mujoco.mj_forward(self.model, self.data)
-        qfrc = self.data.qfrc_bias.copy()
-        self.data.qvel[:] = qvel_save
+    def _publish_ee_pose(self) -> None:
+        message = PoseStamped()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = "world"
+        position = self.data.site_xpos[self.ee_site_id]
+        rotation = self.data.site_xmat[self.ee_site_id]
+        quaternion = np.empty(4, dtype=np.float64)  # MuJoCo order: w,x,y,z
+        mujoco.mju_mat2Quat(quaternion, rotation)
+        message.pose.position.x = float(position[0])
+        message.pose.position.y = float(position[1])
+        message.pose.position.z = float(position[2])
+        message.pose.orientation.w = float(quaternion[0])
+        message.pose.orientation.x = float(quaternion[1])
+        message.pose.orientation.y = float(quaternion[2])
+        message.pose.orientation.z = float(quaternion[3])
+        self.ee_pose_pub.publish(message)
 
-        # 符号（单摆实验铁证）：qfrc_bias 在零速时 = 该姿态的"保持扭矩"。
-        # 摆锤 q=0.3 时 qfrc_bias=+0.725 = m·g·l·sin(0.3)，施加 +0.725 保持静止。
-        # 所以保持扭矩 = +qfrc_bias，控制器按 τ = ... + g 使用，这里直接发 +qfrc_bias。
-        g = np.zeros(len(self.arm_joint_dof_addrs), dtype=np.float64)
-        for i, dof_addr in enumerate(self.arm_joint_dof_addrs):
-            if 0 <= dof_addr < self.model.nv:
-                g[i] = qfrc[dof_addr]
+    def _publish_gravity(self) -> None:
+        self.gravity_torque = self._compute_gravity()
+        message = Float64MultiArray()
+        message.data = [
+            float(self.gravity_torque[self.dof_addresses[name]])
+            for name in self.arm_names
+        ]
+        self.gravity_pub.publish(message)
 
-        msg = Float64MultiArray()
-        msg.data = g.tolist()
-        self.grav_pub.publish(msg)
+    def _compute_gravity(self) -> np.ndarray:
+        """Compute gravity at q with qvel=0, excluding velocity bias forces."""
+        self.gravity_data.qpos[:] = self.data.qpos
+        self.gravity_data.qvel[:] = 0.0
+        self.gravity_data.qacc[:] = 0.0
+        mujoco.mj_forward(self.model, self.gravity_data)
+        return self.gravity_data.qfrc_bias.copy()
 
-        # 20Hz 刷新重力保持兜底（覆盖全部力矩电机，含手指），
-        # 使无指令回退跟踪当前姿态而非停留在启动姿态。
-        self._refresh_gravity_hold()
-
-    def _publish_joint_states(self):
-        """发布 /joint_states（所有主动关节的位置 + 速度）。"""
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.get_parameter('base_frame').get_parameter_value().string_value
-
-        # 从 MuJoCo 传感器读取（如果有的话），否则用 qpos/qvel 直接查
-        for joint_name in self.actuator_map:
-            msg.name.append(joint_name)
-            act_id = self.actuator_map_primary[joint_name]
-
-            # 优先从传感器读取
-            if joint_name in self.sensor_pos_ids:
-                sens_id = self.sensor_pos_ids[joint_name]
-                msg.position.append(float(self.data.sensordata[sens_id]))
-            else:
-                # 从 qpos 获取（需要知道 joint 在 qpos 中的地址）
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                qpos_addr = self.model.jnt_qposadr[act_joint_id]
-                msg.position.append(float(self.data.qpos[qpos_addr]))
-
-            if joint_name in self.sensor_vel_ids:
-                sens_id = self.sensor_vel_ids[joint_name]
-                msg.velocity.append(float(self.data.sensordata[sens_id]))
-            else:
-                act_joint_id = self.model.actuator_trnid[act_id][0]
-                dof_addr = self.model.jnt_dofadr[act_joint_id]
-                msg.velocity.append(float(self.data.qvel[dof_addr]))
-
-            msg.effort.append(float(self.data.actuator_force[act_id]))
-
-        # --- Inspire hand slave joints (equality-driven, NO actuator) ---
-        # They are not in actuator_map; read qpos/qvel directly so the controller
-        # can see the coupled slave positions (verifies underactuation coupling).
-        for joint_name in self.hand_joint_names:
-            if joint_name in self.actuator_map:
-                continue  # already published above
-            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-            if jid < 0:
-                continue
-            qpos_addr = self.model.jnt_qposadr[jid]
-            dof_addr = self.model.jnt_dofadr[jid]
-            msg.name.append(joint_name)
-            msg.position.append(float(self.data.qpos[qpos_addr]))
-            msg.velocity.append(float(self.data.qvel[dof_addr]) if dof_addr >= 0 else 0.0)
-            msg.effort.append(0.0)
-
-        self.js_pub.publish(msg)
-
-    def _publish_watchdog_status(self):
-        """发布 /debug/bridge_watchdog — 每关节距上次"新鲜"扭矩指令的秒数。
-
-        与 actuator_map 顺序一致；-1 表示从未收到扭矩指令。控制器（reach_node /
-        hand_controller）停止发布后，数值在 cmd_timeout 内增长到超过阈值，即证明
-        桥已退回重力保持兜底（可验证的卸力路径）。
-        """
-        if self.watchdog_pub is None:
-            return
-        now = time.monotonic()
-        ages = []
-        for joint_name in self.actuator_map:
-            last = self.joint_cmd_tau_stamp.get(joint_name) \
-                or self.hand_cmd_tau_stamp.get(joint_name)
-            ages.append(-1.0 if last is None else now - last)
-        msg = Float64MultiArray()
-        msg.data = ages
-        self.watchdog_pub.publish(msg)
-
-    def _publish_camera(self):
-        """渲染虚拟相机并发布 RGB + Depth 图像。
-
-        使用 MuJoCo 的离屏渲染器。Depth 图像需要 MuJoCo >= 3.1。
-        """
-        if self.renderer is None or self.camera_id < 0:
-            return
-
-        try:
-            self.renderer.update_scene(self.data, camera=self.camera_id)
-
-            # --- RGB 图像 ---
-            rgb_pixels = self.renderer.render()
-            # 发布 RGB
-            if self.bridge is not None:
-                rgb_msg = self.bridge.cv2_to_imgmsg(
-                    cv.cvtColor(rgb_pixels, cv.COLOR_RGB2BGR), encoding='bgr8'
-                )
-            else:
-                # 手动构建 Image 消息（无 cv_bridge 回退方案）
-                rgb_msg = Image()
-                rgb_msg.height = rgb_pixels.shape[0]
-                rgb_msg.width = rgb_pixels.shape[1]
-                rgb_msg.encoding = 'rgb8'
-                rgb_msg.step = rgb_pixels.shape[1] * 3
-                rgb_msg.data = rgb_pixels.tobytes()
-
-            rgb_msg.header.stamp = self.get_clock().now().to_msg()
-            rgb_msg.header.frame_id = self.get_parameter('camera_name').get_parameter_value().string_value
-            self.rgb_pub.publish(rgb_msg)
-
-            # --- Depth 图像（16-bit 单通道，单位 mm）---
-            try:
-                self.renderer.enable_depth_rendering()
-                depth_pixels = self.renderer.render()
-                self.renderer.disable_depth_rendering()
-                # depth rendering returns shape (H, W)
-                if len(depth_pixels.shape) == 2:
-                    depth_mm = (depth_pixels * 1000).astype(np.uint16)
-                    if self.bridge is not None:
-                        depth_msg = self.bridge.cv2_to_imgmsg(
-                            depth_mm, encoding='mono16'
-                        )
-                    else:
-                        depth_msg = Image()
-                        depth_msg.height = depth_mm.shape[0]
-                        depth_msg.width = depth_mm.shape[1]
-                        depth_msg.encoding = 'mono16'
-                        depth_msg.step = depth_mm.shape[1] * 2
-                        depth_msg.data = depth_mm.tobytes()
-                    depth_msg.header = rgb_msg.header
-                    self.depth_pub.publish(depth_msg)
-                else:
-                    self.get_logger().debug(
-                        "render() 返回非 depth 格式，"
-                        "请升级到 MuJoCo >= 3.1 以获取真实深度图",
-                        throttle_duration_sec=30
-                    )
-            except Exception:
-                self.get_logger().debug(
-                    "深度渲染失败（可能需要 MuJoCo >= 3.1）",
-                    throttle_duration_sec=30
-                )
-
-        except Exception as e:
-            self.get_logger().warn(
-                f"相机渲染失败: {e}", throttle_duration_sec=5
-            )
-
-    def _publish_wrist_ft(self):
-        """发布腕部力/力矩传感器数据。
-
-        使用 WrenchStamped（ROS2 中 Wrench 不含 header）。
-        通过名称搜索传感器：首先查找 'wrist_force' 和 'wrist_torque'。
-        如果找不到，发布零值。
-        """
-        msg = WrenchStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'right_wrist'
-
-        # 在 sensordata 中搜索力/力矩传感器
-        for sens_id in range(self.model.nsensordata):
-            sens_name = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_SENSOR, sens_id
-            )
-            if sens_name is None:
-                continue
-            sens_addr = self.model.sensor_adr[sens_id]
-            sens_dim = self.model.sensor_dim[sens_id]
-
-            if sens_name == 'wrist_force' and sens_dim >= 3:
-                msg.wrench.force.x = float(self.data.sensordata[sens_addr])
-                msg.wrench.force.y = float(self.data.sensordata[sens_addr + 1])
-                msg.wrench.force.z = float(self.data.sensordata[sens_addr + 2])
-            elif sens_name == 'wrist_torque' and sens_dim >= 3:
-                msg.wrench.torque.x = float(self.data.sensordata[sens_addr])
-                msg.wrench.torque.y = float(self.data.sensordata[sens_addr + 1])
-                msg.wrench.torque.z = float(self.data.sensordata[sens_addr + 2])
-
-        self.ft_pub.publish(msg)
-
-    def _publish_locked_joint_hold(self):
-        """发布 /locked_joint_hold — 锁定关节的保持位置命令。
-
-        实物部署时，Unitree SDK 桥接节点订阅此 topic，将保持指令转发至
-        G1 真实机器人的关节控制器，替代仿真中的硬夹持（qpos 覆写）。
-
-        与 hard_clamp 的区别：
-          - hard_clamp: 每步覆写 qpos → 完美冻结，仅仿真可行
-          - locked_joint_hold: ROS2 topic → SDK → 真实关节位置伺服
-            （kp 需足够大，否则重力矩导致姿态漂移）
-        """
-        if not self.locked_joint_info:
-            return
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world'
-        for joint_name, qpos_addr, init_q in self.locked_joint_info:
-            if joint_name in self.active_joint_names:
-                continue  # 右臂关节由 hand_controller 管理，不在此列
-            if 'finger' in joint_name:
-                continue  # 手指由 hand_controller 管理
-            msg.name.append(joint_name)
-            # 发送初始锁定位置（而非当前 qpos，避免漂移累积）
-            msg.position.append(init_q)
-            msg.velocity.append(0.0)
-            msg.effort.append(0.0)
-        if msg.name:
-            self.locked_hold_pub.publish(msg)
-
-    # =========================================================================
-    # MODULE: Cleanup
-    # =========================================================================
-
-    def destroy_node(self):
-        """关闭查看器并清理资源。"""
-        if self.viewer_enabled and self.viewer is not None:
+    def destroy_node(self) -> bool:
+        if self.viewer is not None:
             self.viewer.close()
-        super().destroy_node()
+        return super().destroy_node()
 
 
-# ===========================================================================
-# MODULE: Main — ROS2 entry point
-# ===========================================================================
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
+    node = MuJoCoBridgeNode()
     try:
-        node = MuJoCoBridgeNode()
         rclpy.spin(node)
-    except (ImportError, FileNotFoundError) as e:
-        print(f"[FATAL] 初始化失败: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        pass
     finally:
-        if rclpy.ok():
-            rclpy.shutdown()
-    return 0
+        node.destroy_node()
+        rclpy.shutdown()
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    main()

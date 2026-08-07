@@ -1,17 +1,7 @@
-# HandCommand.msg — Unified hand command (wrist orientation + finger grasp).
-# Published to /hand_command. Consumed by hand_controller_node (Plan C).
-
-# ── Wrist orientation target (quaternion) ──
-# Identity (0,0,0,1) = no orientation change (hold current).
-# Non-identity = rotation RELATIVE to current palm orientation.
-# [0.5,0.5,0.5,0.5] = reset to default injection quat (absolute world-frame target).
-float64  ori_x  0.0
-float64  ori_y  0.0
-float64  ori_z  0.0
-float64  ori_w  1.0
-
-# ── Grasp parameters ──
-string   grasp_type          # Pattern name from GraspLibrary
-float64  grasp_duration 0.5  # Finger interpolation ramp time (s). The hand
-                             # rate-limits the finger target over this duration
-                             # (P1-7); <= 0 snaps immediately (legacy behavior).
+# Revo2 finger-only command; wrist roll belongs to EndEffectorCommand.
+string grasp_type
+float64 grasp_duration
+bool use_joint_positions
+# Official ROS2 order: thumb flexion, thumb opposition, index, middle, ring, pinky.
+float64[6] joint_positions
+int32 command_id

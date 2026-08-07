@@ -1,227 +1,130 @@
-# =============================================================================
-# G1 Right Arm + Dexterous Hand — Plan C (Arm-Hand Fully Decoupled)
-# =============================================================================
-# Arm (reach_node):   4-DOF IK (damped pseudoinverse) → wrist position
-# Hand (hand_controller): 9-DOF (wrist×3 + fingers×6) → orientation + grasp
-#
-# Arm:  Δq = α·J⁺·e_pos + (I−J⁺J)·k_posture·(q_pref−q)
-# Hand: τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act) → q_cmd = q_des + τ/Kp_inner
-# =============================================================================
-
 reach_node:
   ros__parameters:
-
-    # -------------------------------------------------------------------------
-    # Robot Model — joint grouping (Plan C: wrist → Hand module)
-    # -------------------------------------------------------------------------
     robot_model:
-      urdf_path: ""  # Set via launch argument
-
-      active_joints:                        # All right arm joints (for bridge Jacobian)
-        - "right_shoulder_pitch_joint"
-        - "right_shoulder_roll_joint"
-        - "right_shoulder_yaw_joint"
-        - "right_elbow_joint"
-        - "right_wrist_roll_joint"
-        - "right_wrist_pitch_joint"
-        - "right_wrist_yaw_joint"
-
-      arm_joints:                           # Arm IK subset — 4-DOF position control
-        - "right_shoulder_pitch_joint"
-        - "right_shoulder_roll_joint"
-        - "right_shoulder_yaw_joint"
-        - "right_elbow_joint"
-
-      wrist_joints:                         # Wrist joints (Plan C: control in hand_controller, listed for bridge Jacobian)
-        - "right_wrist_roll_joint"
-        - "right_wrist_pitch_joint"
-        - "right_wrist_yaw_joint"
-
-    # -------------------------------------------------------------------------
-    # Arm IK — 4-DOF → 3-DOF position (damped pseudoinverse + null-space)
-    # -------------------------------------------------------------------------
-    pid:
-      kp: 200.0                  # Task stiffness (N/m). kp=8/40 were far too weak: 40 N/m
-                                 # gives only 0.8 N at 2 cm on a ~1.5 kg arm → ~30 s creep.
-                                 # 200 N/m → 4 N at 2 cm; with kv=5 joint damping the arm is
-                                 # overdamped (ζ≈1.3), so no oscillation. Integral fix
-                                 # (2026-08-02) removed the saturated-integral drift driver.
-      ki: 1.0                    # Integral trim only (max force ki·√3·0.15 ≈ 0.26 N, well
-                                 # below P at kp=200) — cancels steady-state gravity residual
-                                 # without ever dominating the P term.
-      kd: 0.3                    # Task-space derivative (was 0.05) — damps the faster
-                                 # approach so the arm settles instead of overshooting.
-      damping: 2.0e-4            # Damped pseudoinverse λ (adaptive)
-      tolerance: 0.005           # Position tolerance (5 mm)
-      posture_gain: 0.2          # Null-space attraction toward posture_target
-      # 全零 = 上臂自然下垂 + 前臂水平向前（与桥接 ready pose 及左臂镜像一致）。
-      # 旧值 [-0.3,0,0,0.3] 会让重力保持/零空间把手臂拉回前倾姿态（"超前"）。
-      posture_target: [0.0, 0.0, 0.0, 0.0]  # arm(4): natural hang + forearm forward
-
-      # -----------------------------------------------------------------------
-      # Torque mode — PID output τ = JᵀF + g − Kd·dq (MIT mode on real hardware)
-      # -----------------------------------------------------------------------
-      torque_mode: true
+      urdf_path: ""
+      ee_frame: "right_revo2_tcp"
+      # Revo2 palm/finger longitudinal axis in the official hand model.
+      tool_axis_local: [0.0, 0.0, 1.0]
+      active_joints:
+        - right_shoulder_pitch_joint
+        - right_shoulder_roll_joint
+        - right_shoulder_yaw_joint
+        - right_elbow_joint
+        - right_wrist_roll_joint
+    # High-level task controller. The hardware transport may run faster and
+    # repeat the most recent bounded torque command.
+    control_rate: 50.0
+    task_pid:
+      # Fast bounded baseline. The 15 N task-wrench clamp remains authoritative.
+      kp_position: 220.0
+      ki_position: 0.5
+      kd_position: 22.0
+      kp_roll: 10.0
+      ki_roll: 0.0
+      kd_roll: 1.2
+      damping: 0.001
+      position_tolerance: 0.005
+      roll_tolerance: 0.035
+      posture_gain: 2.0
+      joint_damping: 2.0
       gravity_compensation: true
-      inner_servo_kp: 5.0
-      inner_servo_kv: 5.0
+      # Keep false for hardware; the MuJoCo launch overrides this to true.
+      use_external_gravity: false
+      posture_target: [0.0, 0.0, 0.0, 0.0, 0.0]
+    safety:
+      # Launch files may override this. It remains false for direct ros2 run.
+      enable_torque_output: false
+      deadman_required: false
+      deadman_timeout: 0.10
+      joint_state_timeout: 0.10
+      effort_derate: 0.50
+      max_joint_torque: 20.0
+      max_torque_slew_rate: 80.0
+      max_task_force: 15.0
+      max_roll_moment: 1.5
+    trajectory:
+      # Acceleration-limited reference. These bounds define commanded motion;
+      # torque limits still have final authority on physical hardware.
+      max_linear_velocity: 0.15
+      max_linear_acceleration: 0.60
+      max_roll_velocity: 0.50
+      max_roll_acceleration: 2.00
+    diagnostics:
+      log_period: 1.0
+    topics:
+      command: /end_effector_command
+      legacy_target_point: /target_point
+      joint_states: /joint_states
+      joint_commands: /joint_commands
+      deadman: /arm_deadman
+      sim_gravity: /mujoco_gravity
 
-    # -------------------------------------------------------------------------
-    # Node configuration
-    # -------------------------------------------------------------------------
-    manager:
-      control_rate: 50.0         # Control loop frequency (Hz)
-
-    reach_node:
-      origin_frame: "right_shoulder"
-      # URDF pelvis → MuJoCo world Z alignment. The base is now FIXED in the MJCF
-      # (free joint removed), so the pelvis sits at its body_pos z = 0.793, NOT the
-      # old free-base hard-clamp height 0.823. A 0.03 m error here misplaces the
-      # reach target and the arm converges to the wrong point.
-      pelvis_offset: [0.0, 0.0, 0.793]
-      target_point_topic: "/target_point"   # Point, 3-DOF (shoulder-relative XYZ)
-      joint_state_topic: "/joint_states"
-      default_target: [0.18, -0.05, -0.10]  # Shoulder-relative, ~21 cm reachable
-
-# =============================================================================
-# Dexterous Hand — Inspire RH56 (Plan C: wrist×3 + fingers×6 active = 9-DOF)
-#   6 slaves equality-coupled (thumb_int=1.6×tp, thumb_dist=2.4×tp, fingers 1:1)
-# =============================================================================
 hand_controller:
   ros__parameters:
+    joint_names:
+      - right_thumb_proximal_joint
+      - right_thumb_metacarpal_joint
+      - right_index_proximal_joint
+      - right_middle_proximal_joint
+      - right_ring_proximal_joint
+      - right_pinky_proximal_joint
+    lower_limits: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    upper_limits: [1.0297443, 1.5707963, 1.4137167, 1.4137167, 1.4137167, 1.4137167]
+    control_rate: 50.0
+    # 0 keeps a commanded grasp active; tactile freshness has its own watchdog.
+    command_timeout: 0.0
+    safety:
+      enable_output: false
+      # Hardware launch overrides this to true. The hand has a separate
+      # deadman because it is intentionally decoupled from the arm controller.
+      deadman_required: false
+      deadman_timeout: 0.10
+    tactile:
+      # Enable only after a BrainCo SDK adapter publishes normalized fingertip
+      # normal-force summaries on /revo2/tactile_force_summary.
+      enable: false
+      timeout: 0.20
+      target_force: 0.35
+      max_force: 0.75
+      position_gain: 0.20
+    topics:
+      command: /hand_command
+      joint_states: /joint_states
+      sim_command: /hand_commands
+      trajectory_command: /right_revo2_hand_controller/joint_trajectory
+      tactile_summary: /revo2/tactile_force_summary
+      deadman: /hand_deadman
 
-    # -------------------------------------------------------------------------
-    # Robot model (hardware path) — Pinocchio wrist feedback
-    # -------------------------------------------------------------------------
-    # Wrist orientation / Jacobian / gravity are computed locally from this URDF
-    # when the MuJoCo-only topics (/actual_hand_orientation, /mujoco_wrist_jacobian,
-    # /mujoco_gravity) are absent — i.e. on real hardware. In sim the MuJoCo topics
-    # take priority (exact-sim override). urdf_path set via launch argument.
-    robot_model:
-      urdf_path: ""            # Set via launch argument
-      arm_joints:              # Right-arm joints (for /joint_states sync + gravity)
-        - "right_shoulder_pitch_joint"
-        - "right_shoulder_roll_joint"
-        - "right_shoulder_yaw_joint"
-        - "right_elbow_joint"
-
-    # -------------------------------------------------------------------------
-    # Joint names — wrist (3) + Inspire active fingers (6) = 9 DOF
-    # -------------------------------------------------------------------------
-    wrist_joint_names:
-      - "right_wrist_roll_joint"
-      - "right_wrist_pitch_joint"
-      - "right_wrist_yaw_joint"
-
-    finger_joint_names:
-      - "R_thumb_proximal_yaw_joint"      # Thumb: abduction/opposition
-      - "R_thumb_proximal_pitch_joint"    # Thumb: flexion
-      - "R_index_proximal_joint"          # Index: flexion
-      - "R_middle_proximal_joint"         # Middle: flexion
-      - "R_ring_proximal_joint"           # Ring: flexion
-      - "R_pinky_proximal_joint"          # Pinky: flexion
-
-    # -------------------------------------------------------------------------
-    # Wrist orientation PID
-    # -------------------------------------------------------------------------
-    # Jacobian provided by /mujoco_wrist_jacobian (MuJoCo numerical, avoids FK mismatch).
-    # Gravity FF from /mujoco_gravity (MuJoCo pure gravity incl. hand mass) — without it
-    # the wrist droops ~1.4 rad under the hand and oscillates ~1 Hz (kd too low, ζ≈0.19).
-    kp_wrist: 3.5                # Orientation P gain (raised: must also hold hand vs gravity)
-    ki_wrist: 0.05               # Orientation I gain (minimal — deadband handles static error)
-    kd_wrist: 0.8                # Orientation D gain (raised from 0.12 → overdamped, kills 1 Hz)
-    wrist_joint_damping: 0.6     # Joint-space velocity damping τ += −kd·dq (N·m·s/rad)
-    wrist_offset_limit: 2.0      # ±max wrist offset from ready pose (rad)
-
-    # -------------------------------------------------------------------------
-    # Finger impedance control (TORQUE OUTPUT)
-    # -------------------------------------------------------------------------
-    # τ = Kp_finger·(q_des−q_act) + Kd_finger·(0−dq_act), published as effort=τ.
-    kp_finger: 5.0                # Finger stiffness (N·m/rad)
-    kd_finger: 0.3               # Finger damping (N·m·s/rad)
-    tau_max_finger: 1.5           # Max finger torque (N·m) — matches scene motor forcerange
-
-    # P0-3: per-joint wrist effort limits (roll, pitch, yaw) N·m — OPTIONAL.
-    # Omit entirely → auto from URDF model <limit effort=> × wrist_effort_derate
-    #   (stock URDF roll=25, pitch/yaw=5), then tau_max_wrist as fallback.
-    # Set explicitly to override, e.g. to the real 5010 rating:
-    #   wrist_effort_limits: [25.0, 13.4, 13.4]
-    # NOTE: do NOT write `wrist_effort_limits: []` — ROS2 YAML parses an empty
-    # array as "unset" (PARAMETER_NOT_SET); the node treats that as auto anyway,
-    # but as_double_array() on an unset param throws (crashed the node before).
-    wrist_effort_derate: 0.9
-    tau_max_wrist: 13.4           # legacy uniform fallback (5010 pitch/yaw)
-
-    # P0-2: command stream watchdog — if /hand_command stops arriving (sequencer
-    # died), unload after this many seconds (wrist gravity-hold, fingers relax).
-    # The sequencer heartbeats every 20 ms, so 0.5 s only fires on real loss.
-    command_timeout: 0.5
-
-    # -------------------------------------------------------------------------
-    # Topics
-    # -------------------------------------------------------------------------
-    hand_command_topic: "/hand_command"
-    joint_state_topic: "/joint_states"
-    hand_orientation_topic: "/actual_hand_orientation"   # sim-only; Pinocchio fallback on hardware
-    wrist_jacobian_topic: "/mujoco_wrist_jacobian"       # sim-only; Pinocchio fallback on hardware
-    gravity_topic: "/mujoco_gravity"                     # sim-only; Pinocchio fallback on hardware
-    ee_pose_topic: "/actual_ee_pose"                     # sim-only; diagnostic EE position
-
-# =============================================================================
-# MuJoCo bridge — physics simulation (200 Hz)
-# =============================================================================
 mujoco_bridge:
   ros__parameters:
     scene_path: ""
-    physics_rate: 200.0
-    camera_rate: 15.0
-    publish_camera: false
-    publish_ft: true
+    physics_rate: 500.0
+    publish_rate: 200.0
     viewer: false
-    base_frame: "pelvis"
-
-    # Active joints: arm 4 + wrist 3 (Jacobian extraction only).
-    # Arm 4 commanded from reach_node, wrist 3 + fingers 6 from hand_controller.
-    active_joints:
-      - "right_shoulder_pitch_joint"
-      - "right_shoulder_roll_joint"
-      - "right_shoulder_yaw_joint"
-      - "right_elbow_joint"
-      - "right_wrist_roll_joint"
-      - "right_wrist_pitch_joint"
-      - "right_wrist_yaw_joint"
-
-    # Torque mode: controllers publish effort=τ, bridge writes motor ctrl=τ.
-    torque_mode: true
-
-    # Inspire hand joints (12) — excluded from hard-clamp; published in /joint_states.
+    arm_command_timeout: 0.10
+    diagnostic_period: 1.0
+    instability_velocity: 30.0
+    # Elbow zero keeps the forearm/tool axis horizontal and forward. Opposite
+    # wrist roll cancels shoulder roll so the palm faces the robot's left side.
+    initial_arm_positions: [0.0, -0.35, 0.0, 0.0, 0.35]
+    ee_site: right_revo2_tcp
+    arm_joint_names:
+      - right_shoulder_pitch_joint
+      - right_shoulder_roll_joint
+      - right_shoulder_yaw_joint
+      - right_elbow_joint
+      - right_wrist_roll_joint
     hand_joint_names:
-      - "R_thumb_proximal_yaw_joint"
-      - "R_thumb_proximal_pitch_joint"
-      - "R_thumb_intermediate_joint"
-      - "R_thumb_distal_joint"
-      - "R_index_proximal_joint"
-      - "R_index_intermediate_joint"
-      - "R_middle_proximal_joint"
-      - "R_middle_intermediate_joint"
-      - "R_ring_proximal_joint"
-      - "R_ring_intermediate_joint"
-      - "R_pinky_proximal_joint"
-      - "R_pinky_intermediate_joint"
+      - right_thumb_proximal_joint
+      - right_thumb_metacarpal_joint
+      - right_index_proximal_joint
+      - right_middle_proximal_joint
+      - right_ring_proximal_joint
+      - right_pinky_proximal_joint
 
-    finger_ema_alpha: 1.0      # EMA smoothing (1.0 = no smoothing)
-    wrist_ema_alpha: 1.0       # Wrist EMA (1.0 = no smoothing)
-
-    # Hard clamping
-    # Base is now FIXED in the MJCF (free joint → fixed, inject_inspire_hand.py).
-    # There is NO pelvis free joint, so hard_clamp_pelvis was removed entirely.
-    # hard_clamp_joints MUST be OFF: every-step qpos+qvel teleport of the legs/waist/
-    # left-arm injects impulses through the torso into the right arm. The gravity hold
-    # is pure feedforward (no restoring force), so the arm accumulates steady backward
-    # drift (~0.05 rad/s). Legs/waist are already held by strong position servos.
-    hard_clamp_joints: false
-    clamp_arm_joints: false
-
-    # Watchdog: torque commands older than this (s) are treated as stale (controller
-    # died / stopped publishing) and reverted to the gravity-hold fallback.
-    cmd_timeout: 0.3
+action_sequencer:
+  ros__parameters:
+    control_rate: 50.0
+    position_tolerance: 0.015
+    roll_tolerance: 0.06
+    feedback_timeout: 0.5

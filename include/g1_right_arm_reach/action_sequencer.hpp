@@ -1,127 +1,56 @@
-/** @file action_sequencer.hpp
- *  @brief Coordinated action sequencer — arm movement + hand grasp (Plan C).
- *
- *  Plan C Architecture:
- *    Position (XYZ) → /target_point → reach_node (4-DOF arm IK)
- *    Orientation + grasp → /hand_command → hand_controller (9-DOF)
- *
- *  State machine:
- *    IDLE → REACHING → SETTLING → GRASPING → IDLE
- *
- *  Subscribes to /action_command (ActionCommand) for high-level commands.
- *  Monitors /debug/position_error for convergence decisions.
- */
-
 #ifndef G1_RIGHT_ARM_REACH__ACTION_SEQUENCER_HPP_
 #define G1_RIGHT_ARM_REACH__ACTION_SEQUENCER_HPP_
 
-#include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/point.hpp>
-#include <std_msgs/msg/float64.hpp>
-
 #include "g1_right_arm_reach/msg/action_command.hpp"
 #include "g1_right_arm_reach/msg/action_result.hpp"
+#include "g1_right_arm_reach/msg/end_effector_command.hpp"
 #include "g1_right_arm_reach/msg/hand_command.hpp"
 
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float64.hpp>
+
+#include <chrono>
 #include <string>
 
 namespace g1_right_arm_reach {
 
-// ============================================================================
-// ActionSequencerNode — high-level action coordinator (Plan C)
-// ============================================================================
-
-class ActionSequencerNode : public rclcpp::Node {
+class ActionSequencerNode final : public rclcpp::Node {
 public:
     ActionSequencerNode();
 
 private:
-    // --- State machine ---
     enum class State { IDLE, REACHING, SETTLING, GRASPING };
-
-    void actionCallback(const msg::ActionCommand::SharedPtr msg);
-    void errorCallback(const std_msgs::msg::Float64::SharedPtr msg);
-    void oriErrorCallback(const std_msgs::msg::Float64::SharedPtr msg);
+    void actionCallback(const msg::ActionCommand::SharedPtr command);
+    void positionErrorCallback(const std_msgs::msg::Float64::SharedPtr value);
+    void rollErrorCallback(const std_msgs::msg::Float64::SharedPtr value);
     void controlLoop();
+    void publishReach();
+    void publishGrasp();
+    void finish(bool success, const std::string& reason);
+    bool feedbackFresh() const;
 
-    void startReaching();
-    void startGrasping();
-    void finishAction(bool success, const std::string& reason = "OK");
-    void publishResult(bool success, const std::string& reason);
-
-    /// Feedback watchdog (P0-2): true only if /debug/*_error arrived recently
-    /// (<= feedback_timeout_). Stale feedback from a dead controller/bridge is
-    /// NOT evidence of convergence — without this gate the sequencer could
-    /// "arrive" using an old error and jump to grasp.
-    bool posErrorFresh() const;
-    bool oriErrorFresh() const;
-
-    /// Liveness heartbeat: publish an identity-orientation, empty-grasp
-    /// HandCommand. Kept streaming every control cycle (IDLE/SETTLING/GRASPING)
-    /// so hand_controller's command watchdog can distinguish "action finished,
-    /// hold grasp" (stream alive) from "sequencer died" (stream stops → unload).
-    void publishHoldCommand();
-
-    // --- ROS2 communication ---
-    rclcpp::Subscription<msg::ActionCommand>::SharedPtr action_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr error_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr ori_error_sub_;
-
-    // Plan C: position → /target_point, orientation + grasp → /hand_command
-    rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr point_pub_;
-    rclcpp::Publisher<msg::HandCommand>::SharedPtr hand_cmd_pub_;
-    rclcpp::Publisher<msg::ActionResult>::SharedPtr result_pub_;  // P0-2: one-shot outcome
-
-    rclcpp::TimerBase::SharedPtr control_timer_;
-
-    // --- Current action state ---
     State state_{State::IDLE};
+    msg::ActionCommand action_;
+    int32_t last_action_id_{0};
+    double position_error_{999.0}, roll_error_{999.0};
+    double elapsed_{0.0}, total_elapsed_{0.0}, dt_{0.02};
+    // Steady-clock anchors for real-time timeouts (not accumulated dt ticks).
+    std::chrono::steady_clock::time_point action_start_{};
+    std::chrono::steady_clock::time_point state_start_{};
+    bool have_position_error_{false}, have_roll_error_{false};
+    rclcpp::Time last_position_error_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time last_roll_error_{0, 0, RCL_ROS_TIME};
+    double feedback_timeout_{0.5};
 
-    // Arm target (3-DOF position only)
-    double target_x_{0.18}, target_y_{-0.05}, target_z_{-0.10};
-
-    // Hand target (orientation + grasp)
-    double ori_x_{0.0}, ori_y_{0.0}, ori_z_{0.0}, ori_w_{1.0};
-    std::string grasp_type_;
-    double grasp_duration_{0.5};
-
-    // Timing
-    double convergence_timeout_{5.0};
-    double settle_time_{0.15};
-    double state_elapsed_{0.0};
-    double position_error_{999.0};
-
-    /// Hard per-action budget (s) across REACHING + SETTLING. Set at action start
-    /// (startReaching); does NOT reset on REACHING↔SETTLING bounces, so an
-    /// oscillating arm is eventually aborted instead of looping forever.
-    double total_elapsed_{0.0};
-    double total_timeout_{10.0};
-
-    /// P0-2: caller-supplied id echoed in /action_result (from ActionCommand).
-    int32_t current_action_id_{-1};
-
-    // Control
-    double dt_{0.02};
-    bool error_received_{false};
-    bool ori_error_received_{false};
-    bool has_orientation_{false};  ///< True when user specifies non-identity orientation
-    double orientation_error_{999.0};
-    double ori_convergence_tol_{0.08};  ///< ~4.6° for orientation convergence
-
-    // --- Feedback watchdog (P0-2) ---
-    rclcpp::Time last_pos_err_time_;    ///< stamp of last /debug/position_error
-    rclcpp::Time last_ori_err_time_;    ///< stamp of last /debug/orientation_error
-    bool pos_err_time_valid_{false};    ///< false until first error arrives this action
-    bool ori_err_time_valid_{false};
-    double feedback_timeout_{0.5};      ///< s; older feedback = stale, not usable
-
-    /// Saturation detection: when wrist offset hits limit, ori_err stops improving.
-    /// Track best error and time since last improvement → skip wait if stuck.
-    double best_ori_error_{999.0};
-    double ori_stuck_time_{0.0};
-    static constexpr double ori_stuck_threshold_{4.0};  ///< 4s no improvement → skip to grasp
+    rclcpp::Subscription<msg::ActionCommand>::SharedPtr action_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr position_error_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr roll_error_sub_;
+    rclcpp::Publisher<msg::EndEffectorCommand>::SharedPtr reach_pub_;
+    rclcpp::Publisher<msg::HandCommand>::SharedPtr hand_pub_;
+    rclcpp::Publisher<msg::ActionResult>::SharedPtr result_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
 };
 
 }  // namespace g1_right_arm_reach
 
-#endif  // G1_RIGHT_ARM_REACH__ACTION_SEQUENCER_HPP_
+#endif
