@@ -28,6 +28,7 @@ private:
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr state);
     void tactileCallback(const std_msgs::msg::Float64MultiArray::SharedPtr tactile);
     void controlLoop();
+    void invalidateCommand(const char* reason);
     bool setTarget(const Eigen::VectorXd& target, double duration,
                    const std::string& grasp_name);
     void applyTactileStabilization(Eigen::VectorXd& target);
@@ -40,7 +41,9 @@ private:
     Eigen::VectorXd tactile_force_;
     std::string active_grasp_{"open"};
     double dt_{0.02}, interpolation_remaining_{0.0};
-    double command_timeout_{0.0}, tactile_timeout_{0.20}, tactile_target_{0.35};
+    double speed_scale_{2.0};
+    double command_timeout_{0.20}, state_timeout_{0.10};
+    double tactile_timeout_{0.20}, tactile_target_{0.35};
     double tactile_max_{0.75}, tactile_gain_{0.20}, deadman_timeout_{0.10};
     bool have_state_{false}, have_command_{false};
     bool output_enabled_{false}, tactile_enabled_{false}, tactile_valid_{false};
@@ -48,6 +51,7 @@ private:
     bool have_command_id_{false};
     int32_t last_command_id_{0};
     rclcpp::Time last_command_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time last_state_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time last_tactile_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time last_deadman_time_{0, 0, RCL_ROS_TIME};
 

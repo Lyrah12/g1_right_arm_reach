@@ -33,6 +33,13 @@ REVO_ACTIVE_JOINTS = (
     "right_pinky_proximal_joint",
 )
 
+# MuJoCo finger dynamics, independent of the physical SDK speed settings.
+REVO_SERVO_KP = 30.0
+REVO_SERVO_KV = 0.8
+REVO_JOINT_DAMPING = 0.05
+REVO_JOINT_ARMATURE = 0.001
+REVO_JOINT_FRICTION = 0.01
+
 REVO_LIMITS = {
     "right_thumb_metacarpal_joint": (0.0, math.radians(90.0)),
     "right_thumb_proximal_joint": (0.0, math.radians(59.0)),
@@ -296,6 +303,12 @@ def configure_dynamics(root: ET.Element) -> None:
     option.set("timestep", "0.002")
     option.set("integrator", "implicitfast")
 
+    hand_joint = require(root, "./default/default[@class='righthand']/joint",
+                         "Revo2 joint defaults")
+    hand_joint.set("damping", f"{REVO_JOINT_DAMPING:g}")
+    hand_joint.set("armature", f"{REVO_JOINT_ARMATURE:g}")
+    hand_joint.set("frictionloss", f"{REVO_JOINT_FRICTION:g}")
+
     for joint in root.findall(".//joint[@name]"):
         if joint.get("name") in RIGHT_ARM_JOINTS:
             joint.set("damping", "0.5")
@@ -437,6 +450,9 @@ def build_mjcf(
         if name in REVO_LIMITS:
             lo, hi = REVO_LIMITS[name]
             copy_item.set("ctrlrange", f"{lo:.8g} {hi:.8g}")
+        if name in REVO_ACTIVE_JOINTS and copy_item.tag == "position":
+            copy_item.set("kp", f"{REVO_SERVO_KP:g}")
+            copy_item.set("kv", f"{REVO_SERVO_KV:g}")
         g1_actuator.append(copy_item)
 
     equality = g1_root.find("./equality")

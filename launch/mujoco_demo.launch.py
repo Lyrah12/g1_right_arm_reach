@@ -44,6 +44,8 @@ def launch_setup(context):
              name="mujoco_bridge", parameters=[params, {
                  "scene_path": scene,
                  "viewer": ParameterValue(LaunchConfiguration("viewer"), value_type=bool),
+                 "viewer_rate": ParameterValue(
+                     LaunchConfiguration("viewer_rate"), value_type=float),
              }], output="screen"),
         Node(package="g1_right_arm_reach", executable="reach_node",
              parameters=[params, {"robot_model.urdf_path": urdf,
@@ -51,7 +53,11 @@ def launch_setup(context):
                                   "safety.enable_torque_output": True},
                          fast], output="screen"),
         Node(package="g1_right_arm_reach", executable="hand_controller_node",
-             parameters=[params, {"safety.enable_output": True}], output="screen"),
+             parameters=[params, {
+                 "safety.enable_output": True,
+                 "motion.speed_scale": ParameterValue(
+                     LaunchConfiguration("hand_speed_scale"), value_type=float),
+             }], output="screen"),
         Node(package="g1_right_arm_reach", executable="action_sequencer_node",
              parameters=[params], output="screen"),
         Node(package="g1_right_arm_reach", executable="target_publisher_node",
@@ -66,8 +72,10 @@ def generate_launch_description():
         DeclareLaunchArgument("urdf_path", default_value=""),
         DeclareLaunchArgument("scene_path", default_value=""),
         DeclareLaunchArgument("viewer", default_value="false"),
+        DeclareLaunchArgument("viewer_rate", default_value="60.0"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("use_test_target", default_value="false"),
+        DeclareLaunchArgument("hand_speed_scale", default_value="2.0"),
         # Simulation-only fast defaults (validated 2026-08-07: reach 2.4s ->
         # 1.9s end-to-end, zero force/joint saturation, no roll limit cycle).
         # params.yaml + reach_node defaults stay conservative for hardware.

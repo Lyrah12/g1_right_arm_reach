@@ -2,6 +2,7 @@
 """Physical G1/Revo2 controller launch; all hardware outputs default locked."""
 
 import os
+from typing import List
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -56,6 +57,10 @@ def launch_setup(context):
                      LaunchConfiguration("enable_hand_output"), value_type=bool),
                  "safety.deadman_required": True,
                  "safety.deadman_timeout": 0.10,
+                 "safety.joint_state_timeout": 0.10,
+                 "command_timeout": 0.20,
+                 "motion.speed_scale": ParameterValue(
+                     LaunchConfiguration("hand_speed_scale"), value_type=float),
                  "tactile.enable": ParameterValue(
                      LaunchConfiguration("enable_tactile"), value_type=bool),
              }], output="screen"),
@@ -72,7 +77,12 @@ def launch_setup(context):
                  "enable_tactile": ParameterValue(
                      LaunchConfiguration("enable_tactile"), value_type=bool),
                  "io_rate": 50.0,
+                 "finger_speeds": ParameterValue(
+                     LaunchConfiguration("hand_finger_speeds"), value_type=List[int]),
                  "command_timeout": 0.20,
+                 "deadman_required": True,
+                 "deadman_timeout": 0.10,
+                 "deadman_topic": "/hand_deadman",
                  "normal_force_full_scale": ParameterValue(
                      LaunchConfiguration("tactile_full_scale"), value_type=float),
              }], output="screen"),
@@ -89,6 +99,11 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_hand_output", default_value="false"),
         DeclareLaunchArgument("enable_tactile", default_value="false"),
         DeclareLaunchArgument("use_revo2_sdk", default_value="false"),
+        DeclareLaunchArgument("hand_speed_scale", default_value="2.0",
+                             description="Hand interpolation speed multiplier"),
+        DeclareLaunchArgument("hand_finger_speeds",
+                             default_value="[1000, 1000, 1000, 1000, 1000, 1000]",
+                             description="SDK position+speed magnitudes, each 1..1000"),
         # Conservative supported-rig defaults; increase only after staged tests.
         DeclareLaunchArgument("effort_derate", default_value="0.15"),
         DeclareLaunchArgument("max_joint_torque", default_value="3.0"),

@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -33,7 +34,12 @@ public:
         declare_parameter("protocol", "auto");
         declare_parameter("slave_id", 127);
         declare_parameter("io_rate", 50.0);
+        // Position+speed uses positive magnitudes; direction follows position.
+        declare_parameter("finger_speeds", std::vector<int64_t>(6, 1000));
         declare_parameter("command_timeout", 0.20);
+        declare_parameter("deadman_required", true);
+        declare_parameter("deadman_timeout", 0.10);
+        declare_parameter("deadman_topic", "/hand_deadman");
         declare_parameter("enable_position_output", false);
         declare_parameter("enable_tactile", true);
         declare_parameter("normal_force_full_scale", 1000.0);
@@ -47,12 +53,19 @@ public:
 
         slave_id_ = static_cast<uint8_t>(get_parameter("slave_id").as_int());
         command_timeout_ = get_parameter("command_timeout").as_double();
+        deadman_required_ = get_parameter("deadman_required").as_bool();
+        deadman_timeout_ = get_parameter("deadman_timeout").as_double();
         output_enabled_ = get_parameter("enable_position_output").as_bool();
+        if (command_timeout_ < 0.0 || deadman_timeout_ <= 0.0) {
+            throw std::runtime_error("Revo2 safety timeouts are invalid");
+        }
         tactile_enabled_ = get_parameter("enable_tactile").as_bool();
         full_scale_ = get_parameter("normal_force_full_scale").as_double();
         joint_names_ = get_parameter("joint_names").as_string_array();
         const auto limits = get_parameter("upper_limits").as_double_array();
-        if (full_scale_ <= 0.0 || joint_names_.size() != 6 || limits.size() != 6) {
+        const auto speeds = get_parameter("finger_speeds").as_integer_array();
+        if (!std::isfinite(full_scale_) || full_scale_ <= 0.0
+            || joint_names_.size() != 6 || limits.size() != 6 || speeds.size() != 6) {
             throw std::runtime_error("invalid Revo2 SDK adapter parameters");
         }
         for (size_t i = 0; i < 6; ++i) {
@@ -60,6 +73,10 @@ public:
                 throw std::runtime_error("Revo2 upper limits must be finite and positive");
             }
             upper_limits_[i] = limits[i];
+            if (speeds[i] < 1 || speeds[i] > 1000) {
+                throw std::runtime_error("Revo2 finger_speeds must be in [1, 1000]");
+            }
+            finger_speeds_[i] = static_cast<uint16_t>(speeds[i]);
         }
 
         StarkProtocolType protocol = STARK_PROTOCOL_TYPE_AUTO;
@@ -90,6 +107,11 @@ public:
         }
         protocol_ = static_cast<uint8_t>(selected->protocol);
         hardware_type_ = selected->hardware_type;
+        if (static_cast<uint8_t>(hardware_type_) < 10
+            || static_cast<uint8_t>(hardware_type_) >= 20) {
+            free_detected_device_list(devices);
+            throw std::runtime_error("position+speed backend requires a Revo2 device");
+        }
         if (tactile_enabled_
             && !stark_is_touch_device(static_cast<uint8_t>(hardware_type_))) {
             free_detected_device_list(devices);
@@ -109,8 +131,14 @@ public:
         if (tactile_enabled_) stark_enable_touch_sensor(handle_, slave_id_, 0x1f);
 
         command_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-            "/hand_commands", 10,
+            "/hand_commands", rclcpp::QoS(1),
             std::bind(&Revo2SdkAdapter::commandCallback, this, std::placeholders::_1));
+        deadman_sub_ = create_subscription<std_msgs::msg::Bool>(
+            get_parameter("deadman_topic").as_string(), 10,
+            [this](const std_msgs::msg::Bool::SharedPtr value) {
+                deadman_ = value->data;
+                last_deadman_time_ = now();
+            });
         state_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
         tactile_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
             "/revo2/tactile_force_summary", 10);
@@ -178,6 +206,7 @@ private:
         }
         pending_positions_ = positions;
         have_pending_command_ = true;
+        have_command_ = true;
         last_command_time_ = now();
     }
 
@@ -226,15 +255,35 @@ private:
 
     void ioLoop()
     {
+        const rclcpp::Time current_time = now();
+        const bool command_fresh = have_command_
+            && (current_time - last_command_time_).seconds() <= command_timeout_;
+        const bool deadman_fresh = !deadman_required_
+            || (deadman_ && last_deadman_time_.nanoseconds() > 0
+                && (current_time - last_deadman_time_).seconds() <= deadman_timeout_);
+        const bool output_allowed = output_enabled_ && command_fresh && deadman_fresh;
+
         if (have_pending_command_) {
-            const bool fresh =
-                (now() - last_command_time_).seconds() <= command_timeout_;
-            if (output_enabled_ && fresh) {
-                stark_set_finger_positions(
+            if (output_allowed) {
+                stark_set_finger_positions_and_speeds(
                     handle_, slave_id_, pending_positions_.data(),
+                    finger_speeds_.data(),
                     pending_positions_.size());
             }
             have_pending_command_ = false;
+        }
+        if (output_enabled_ && !output_allowed) {
+            // BrainCo exposes an explicit zero-speed command. Send it while
+            // locked so an in-flight position target is actively stopped, and
+            // require a fresh command after deadman or command timeout.
+            const std::array<int16_t, 6> stop_speeds{};
+            stark_set_finger_speeds(
+                handle_, slave_id_, stop_speeds.data(), stop_speeds.size());
+            have_command_ = false;
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Revo2 output stopped: command_fresh=%d deadman_fresh=%d",
+                command_fresh, deadman_fresh);
         }
         publishMotorState();
         publishTactile();
@@ -246,11 +295,16 @@ private:
     std::vector<std::string> joint_names_;
     std::array<double, 6> upper_limits_{};
     std::array<uint16_t, 6> pending_positions_{};
+    std::array<uint16_t, 6> finger_speeds_{};
     double full_scale_{1000.0}, command_timeout_{0.20};
+    double deadman_timeout_{0.10};
     bool output_enabled_{false}, tactile_enabled_{true};
-    bool have_pending_command_{false};
+    bool deadman_required_{true}, deadman_{false};
+    bool have_pending_command_{false}, have_command_{false};
     rclcpp::Time last_command_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time last_deadman_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr command_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr deadman_sub_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr tactile_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr calibrate_service_, reset_service_;

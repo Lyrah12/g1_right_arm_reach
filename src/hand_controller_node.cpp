@@ -22,10 +22,12 @@ HandController::HandController() : Node("hand_controller")
     declare_parameter("upper_limits", std::vector<double>{
         1.0297443, 1.5707963, 1.4137167, 1.4137167, 1.4137167, 1.4137167});
     declare_parameter("control_rate", 50.0);
-    declare_parameter("command_timeout", 0.0);
+    declare_parameter("motion.speed_scale", 2.0);
+    declare_parameter("command_timeout", 0.20);
     declare_parameter("safety.enable_output", false);
     declare_parameter("safety.deadman_required", false);
     declare_parameter("safety.deadman_timeout", 0.10);
+    declare_parameter("safety.joint_state_timeout", 0.10);
     declare_parameter("tactile.enable", false);
     declare_parameter("tactile.timeout", 0.20);
     declare_parameter("tactile.target_force", 0.35);
@@ -52,12 +54,22 @@ HandController::HandController() : Node("hand_controller")
     tactile_force_ = Eigen::VectorXd::Zero(5);  // thumb, index, middle, ring, pinky
 
     const double rate = get_parameter("control_rate").as_double();
-    if (rate <= 0.0) throw std::runtime_error("control_rate must be positive");
+    if (!std::isfinite(rate) || rate <= 0.0) {
+        throw std::runtime_error("control_rate must be finite and positive");
+    }
     dt_ = 1.0 / rate;
+    speed_scale_ = get_parameter("motion.speed_scale").as_double();
+    if (!std::isfinite(speed_scale_) || speed_scale_ <= 0.0) {
+        throw std::runtime_error("motion.speed_scale must be finite and positive");
+    }
     command_timeout_ = get_parameter("command_timeout").as_double();
     output_enabled_ = get_parameter("safety.enable_output").as_bool();
     deadman_required_ = get_parameter("safety.deadman_required").as_bool();
     deadman_timeout_ = get_parameter("safety.deadman_timeout").as_double();
+    state_timeout_ = get_parameter("safety.joint_state_timeout").as_double();
+    if (command_timeout_ < 0.0 || state_timeout_ <= 0.0 || deadman_timeout_ <= 0.0) {
+        throw std::runtime_error("hand safety timeouts are invalid");
+    }
     tactile_enabled_ = get_parameter("tactile.enable").as_bool();
     tactile_timeout_ = get_parameter("tactile.timeout").as_double();
     tactile_target_ = get_parameter("tactile.target_force").as_double();
@@ -100,7 +112,13 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr comma
     // The action sequencer repeats messages to survive DDS discovery. Accept
     // the first copy only, otherwise every copy restarts grasp interpolation.
     if (command->command_id != 0 && have_command_id_
-        && command->command_id == last_command_id_) return;
+        && command->command_id == last_command_id_) {
+        // The action sequencer repeats the same ID as a keepalive. Refresh the
+        // timeout while the target is still valid, but never revive a target
+        // after deadman, feedback, or command-timeout invalidation.
+        if (have_command_) last_command_time_ = now();
+        return;
+    }
 
     Eigen::VectorXd target(6);
     if (command->use_joint_positions) {
@@ -123,16 +141,28 @@ void HandController::handCommandCallback(const msg::HandCommand::SharedPtr comma
         }
         last_command_time_ = now();
         RCLCPP_INFO(get_logger(),
-                    "Accepted Revo2 command id=%d grasp=%s duration=%.2fs",
+                    "Accepted Revo2 command id=%d grasp=%s duration=%.2fs interpolation=%.2fs",
                     command->command_id, command->grasp_type.c_str(),
-                    command->grasp_duration);
+                    command->grasp_duration, command->grasp_duration / speed_scale_);
     }
+}
+
+void HandController::invalidateCommand(const char* reason)
+{
+    if (have_command_) {
+        RCLCPP_WARN(get_logger(), "Revo2 command invalidated: %s", reason);
+    }
+    have_command_ = false;
+    interpolation_remaining_ = 0.0;
+    tactile_valid_ = false;
+    active_grasp_.clear();
 }
 
 bool HandController::setTarget(const Eigen::VectorXd& target, double duration,
                                const std::string& grasp_name)
 {
-    if (target.size() != 6 || !target.allFinite()) return false;
+    if (target.size() != 6 || !target.allFinite()
+        || !std::isfinite(duration) || duration < 0.0) return false;
     for (int i = 0; i < target.size(); ++i) {
         if (target(i) < lower_limits_(i) || target(i) > upper_limits_(i)) {
             RCLCPP_ERROR(get_logger(), "Rejected Revo2 target: joint %s out of range",
@@ -141,14 +171,14 @@ bool HandController::setTarget(const Eigen::VectorXd& target, double duration,
         }
     }
     if (!have_command_ && have_state_) desired_position_ = actual_position_;
-    final_position_ = target;
     // De-duplicate identical retries (the sequencer repeats the grasp while it
     // is active so a single DDS race cannot drop it): restarting the
     // interpolation on every duplicate would keep resetting it and the fingers
     // would never finish closing.
     if (!have_command_ || grasp_name != active_grasp_
         || !target.isApprox(active_target_, 1.0e-6)) {
-        interpolation_remaining_ = std::max(0.0, duration);
+        final_position_ = target;
+        interpolation_remaining_ = duration / speed_scale_;
     }
     active_target_ = target;
     active_grasp_ = grasp_name;
@@ -177,6 +207,7 @@ void HandController::jointStateCallback(const sensor_msgs::msg::JointState::Shar
             final_position_ = actual_position_;
         }
         have_state_ = true;
+        last_state_time_ = now();
     }
 }
 
@@ -202,17 +233,20 @@ void HandController::applyTactileStabilization(Eigen::VectorXd& target)
     // the hardware adapter. Simulators may omit it. Thumb controls indices 0/1;
     // index and optional middle control indices 2/3. Thumb opposition is not
     // adjusted after contact; only thumb flexion is.
-    const auto correction = [this](double measured) {
-        if (measured > tactile_max_) return -tactile_gain_ * (measured - tactile_max_) * dt_;
-        return tactile_gain_ * (tactile_target_ - measured) * dt_;
+    const auto adjust = [this, &target](int joint, double measured) {
+        // Finish the approach before seeking contact. Excess force can stop
+        // and release the affected finger even while the others are closing.
+        if (interpolation_remaining_ > 0.0 && measured <= tactile_max_) return;
+        const double delta = measured > tactile_max_
+            ? -tactile_gain_ * (measured - tactile_max_) * dt_
+            : tactile_gain_ * (tactile_target_ - measured) * dt_;
+        target(joint) = std::clamp(target(joint) + delta,
+                                   lower_limits_(joint), upper_limits_(joint));
+        final_position_(joint) = target(joint);
     };
-    const double thumb_delta = correction(tactile_force_(0));
-    target(0) += thumb_delta;
-    target(2) += correction(tactile_force_(1));
-    if (active_grasp_ != "pinch") target(3) += correction(tactile_force_(2));
-    for (int i = 0; i < target.size(); ++i) {
-        target(i) = std::clamp(target(i), lower_limits_(i), upper_limits_(i));
-    }
+    adjust(0, tactile_force_(0));
+    adjust(2, tactile_force_(1));
+    if (active_grasp_ != "pinch") adjust(3, tactile_force_(2));
 }
 
 void HandController::publish(const Eigen::VectorXd& target)
@@ -242,12 +276,22 @@ void HandController::controlLoop()
     if (!have_state_ || !have_command_) return;
 
     const rclcpp::Time current_time = now();
+    const bool state_fresh =
+        (current_time - last_state_time_).seconds() <= state_timeout_;
+    if (output_enabled_ && !state_fresh) {
+        invalidateCommand("joint state is stale");
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Revo2 output inhibited: joint state is stale");
+        return;
+    }
     const bool deadman_fresh = !deadman_required_
         || (deadman_ && last_deadman_time_.nanoseconds() > 0
             && (current_time - last_deadman_time_).seconds() <= deadman_timeout_);
     if (output_enabled_ && !deadman_fresh) {
+        invalidateCommand("hand deadman is false or stale");
         // Do not advance interpolation while inhibited: re-enabling the hand
-        // must not expose a target that moved silently during the lockout.
+        // must receive a new command instead of exposing a stale target.
         RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
             "Revo2 output inhibited: /hand_deadman is false or stale");
@@ -255,9 +299,11 @@ void HandController::controlLoop()
     }
     if (command_timeout_ > 0.0
         && (current_time - last_command_time_).seconds() > command_timeout_) {
-        // Hold the last safe position. Do not continue tactile tightening after
-        // upstream command loss.
-        tactile_valid_ = false;
+        invalidateCommand("hand command is stale");
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Revo2 output inhibited: hand command is stale");
+        return;
     }
     if (last_tactile_time_.nanoseconds() == 0
         || (current_time - last_tactile_time_).seconds() > tactile_timeout_) {
@@ -274,7 +320,6 @@ void HandController::controlLoop()
     Eigen::VectorXd output = desired_position_;
     applyTactileStabilization(output);
     desired_position_ = output;
-    if (tactile_enabled_ && tactile_valid_) final_position_ = output;
     if (output_enabled_) publish(output);
 }
 

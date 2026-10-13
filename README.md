@@ -5,7 +5,7 @@
 ## 功能
 
 - TCP 三维位置 + 工具轴 roll 的任务空间力矩控制；
-- Revo2 六轴位置控制及 `reach_and_grasp` 动作编排；
+- Revo2 六轴位置＋速度控制及 `reach_and_grasp` 动作编排；
 - 速度、加速度、任务力、关节力矩和变化率多层限幅；
 - MuJoCo/实机共用 C++ 控制律，臂与手拥有互斥的关节集合；
 - 独立 deadman、状态超时保护及可选触觉抓稳闭环。
@@ -20,7 +20,7 @@ roll 定义为“TCP 绕局部工具轴、相对标定零姿态的空间旋转�
 | `hand_controller_node` | 50 Hz | Revo2 六轴位置目标 |
 | `action_sequencer_node` | 50 Hz | 臂/手动作编排 |
 | `g1_arm_sdk_adapter` | 200 Hz | Unitree `rt/arm_sdk` |
-| `revo2_sdk_adapter` | 50 Hz | BrainCo SDK 状态、位置与触觉 I/O |
+| `revo2_sdk_adapter` | 50 Hz | BrainCo SDK 状态、位置＋速度与触觉 I/O |
 | MuJoCo bridge | 500 Hz 物理 / 200 Hz 状态 | 仿真状态与执行器 |
 
 臂控制器只拥有 `right_shoulder_pitch/roll/yaw`、`right_elbow` 和 `right_wrist_roll`；手控制器只拥有 Revo2 六个手指关节。BrainCo SDK 与 BrainCo `ros2_control` 后端互斥，同一时刻只能启用一个。
@@ -102,6 +102,31 @@ python3 src/g1_right_arm_reach/scripts/validate_reach.py
 
 不要将仿真快速参数直接复制到实机。调参时应同时检查 `CTRL_DIAG` 中的 `fsat`、`rsa`、`jlim`、`slew` 和 `alloc_sing`。
 
+### 灵巧手响应速度
+
+手指插值倍率 `hand_controller.motion.speed_scale` 默认为 `2.0`，目标插值时间为 `grasp_duration / speed_scale`；例如 `0.8 s` 的动作在 `0.4 s` 内发送完整目标。动作编排仍保持原始 `grasp_duration` 的命令刷新窗口，给设备跟随目标留出时间。这个窗口结束仅表示编排完成，实际到位时间还受设备速度、负载和接触影响。`speed_scale` 必须为有限正数，`1.0` 恢复原插值速度。
+
+SDK 后端使用 `stark_set_finger_positions_and_speeds` 同时发送六轴位置与速度。`revo2_sdk_adapter.finger_speeds` 是六个整数，范围为 `1..1000`，默认全为 `1000`。位置按关节范围换算为 `0..1000`；速度采用 SDK 归一化单位，`1000` 为最大速度指令，开合方向由目标位置决定。这里的速度值不是 `rad/s`，也不是持续运动的独立速度模式。`/hand_commands.velocity` 不作为该归一化速度参数。
+
+启动时可分别调节插值倍率和 SDK 速度（以下硬件命令保留输出锁定）：
+
+```bash
+ros2 launch g1_right_arm_reach mujoco_demo.launch.py hand_speed_scale:=2.0
+
+ros2 launch g1_right_arm_reach hardware_controllers.launch.py \
+  network_interface:=eth0 use_revo2_sdk:=true \
+  hand_speed_scale:=2.0 \
+  hand_finger_speeds:='[1000, 1000, 1000, 1000, 1000, 1000]'
+```
+
+六轴顺序为拇指屈伸、拇指内收外展、食指、中指、无名指、小拇指。`hand_finger_speeds` 只作用于 SDK 后端；外部 `ros2_control` 后端仍接收位置轨迹。速度参数在节点启动时读取，修改后需重启。触觉闭环在接近过程中保留最终抓取目标，过力时只停止收紧并回退对应手指；完成插值后才根据触觉继续微调抓稳。
+
+可视化仿真由 MuJoCo 位置伺服驱动，SDK 的 `hand_finger_speeds` 不控制仿真手指。仿真六轴使用 `kp=30`、`kv=0.8`，手指关节默认 `damping=0.05`、`armature=0.001`、`frictionloss=0.01`；这些值也写入模型生成脚本，重新生成模型后仍然生效。
+
+窗口默认按 `viewer_rate:=60.0` 同步，物理仍按 500 Hz 推进；新版 MuJoCo 使用 [仅同步状态的接口](https://mujoco.readthedocs.io/en/stable/python.html#passive-viewer)，旧版自动使用完整同步。`SIM_DIAG` 新增 `rtf`（仿真时间/墙钟时间）、`physics_hz` 和平均 `viewer_sync_ms`。正常 `rtf` 应接近 `1.0`；如果明显偏低，实际看到的臂和手都会变慢，可以降低 `viewer_rate` 并检查运行负载。
+
+本机诊断中，旧版每个物理步完整同步窗口时 `rtf=0.188`，修改后约 `1.000`。以 0.4 秒线性插值驱动无接触单指到 0.7 rad，并要求误差小于 0.02 rad、速度小于 0.05 rad/s，旧参数稳定到位约需 1.6 秒仿真时间，新参数约需 0.5 秒。这些数值用于对比本机仿真性能，接触抓取仍可能因碰撞无法到达空载目标位置。
+
 ## 主要接口
 
 | 接口 | 类型 | 用途 |
@@ -118,3 +143,4 @@ python3 src/g1_right_arm_reach/scripts/validate_reach.py
 
 - [宇树 G1 开发文档](https://support.unitree.com/home/zh/G1_developer/about_G1)
 - [BrainCo Revo2 参数](https://www.brainco-hz.com/docs/revolimb-hand/revo2/parameters.html)
+- [BrainCo Revo2 C/C++ SDK 位置＋速度接口](https://www.brainco-hz.com/docs/revolimb-hand/revo2/c_sdk.html)

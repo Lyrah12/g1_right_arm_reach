@@ -4,7 +4,7 @@
   <option timestep="0.002" integrator="implicitfast" />
   <default>
     <default class="righthand">
-      <joint damping="0.5" armature="0.01" frictionloss="0.1" />
+      <joint damping="0.05" armature="0.001" frictionloss="0.01" />
       <default class="visual_hand">
         <geom group="1" type="mesh" contype="0" conaffinity="0" density="0" />
       </default>
@@ -376,12 +376,12 @@
     <motor name="right_shoulder_yaw_joint" joint="right_shoulder_yaw_joint" />
     <motor name="right_elbow_joint" joint="right_elbow_joint" />
     <motor name="right_wrist_roll_joint" joint="right_wrist_roll_joint" />
-    <position name="right_thumb_metacarpal_joint" joint="right_thumb_metacarpal_joint" kp="30" kv="10" ctrlrange="0 1.5707963" />
-    <position name="right_thumb_proximal_joint" joint="right_thumb_proximal_joint" kp="30" kv="10" ctrlrange="0 1.0297443" />
-    <position name="right_index_proximal_joint" joint="right_index_proximal_joint" kp="30" kv="10" ctrlrange="0 1.4137167" />
-    <position name="right_middle_proximal_joint" joint="right_middle_proximal_joint" kp="30" kv="10" ctrlrange="0 1.4137167" />
-    <position name="right_ring_proximal_joint" joint="right_ring_proximal_joint" kp="30" kv="10" ctrlrange="0 1.4137167" />
-    <position name="right_pinky_proximal_joint" joint="right_pinky_proximal_joint" kp="30" kv="10" ctrlrange="0 1.4137167" />
+    <position name="right_thumb_metacarpal_joint" joint="right_thumb_metacarpal_joint" kp="30" kv="0.8" ctrlrange="0 1.5707963" />
+    <position name="right_thumb_proximal_joint" joint="right_thumb_proximal_joint" kp="30" kv="0.8" ctrlrange="0 1.0297443" />
+    <position name="right_index_proximal_joint" joint="right_index_proximal_joint" kp="30" kv="0.8" ctrlrange="0 1.4137167" />
+    <position name="right_middle_proximal_joint" joint="right_middle_proximal_joint" kp="30" kv="0.8" ctrlrange="0 1.4137167" />
+    <position name="right_ring_proximal_joint" joint="right_ring_proximal_joint" kp="30" kv="0.8" ctrlrange="0 1.4137167" />
+    <position name="right_pinky_proximal_joint" joint="right_pinky_proximal_joint" kp="30" kv="0.8" ctrlrange="0 1.4137167" />
     <position name="hold_left_hip_pitch_joint" joint="left_hip_pitch_joint" kp="200" kv="20" ctrlrange="-2.5307 2.8798" />
     <position name="hold_left_hip_roll_joint" joint="left_hip_roll_joint" kp="200" kv="20" ctrlrange="-0.5236 2.9671" />
     <position name="hold_left_hip_yaw_joint" joint="left_hip_yaw_joint" kp="200" kv="20" ctrlrange="-2.7576 2.7576" />

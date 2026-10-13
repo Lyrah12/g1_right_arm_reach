@@ -11,6 +11,7 @@ This Python file is simulation-only. Production controllers remain C++.
 
 from __future__ import annotations
 
+import inspect
 import os
 import threading
 import time
@@ -50,6 +51,7 @@ class MuJoCoBridgeNode(Node):
         self.declare_parameter("physics_rate", 500.0)
         self.declare_parameter("publish_rate", 100.0)
         self.declare_parameter("viewer", False)
+        self.declare_parameter("viewer_rate", 60.0)
         self.declare_parameter("arm_command_timeout", 0.10)
         self.declare_parameter("diagnostic_period", 1.0)
         self.declare_parameter("instability_velocity", 30.0)
@@ -129,22 +131,36 @@ class MuJoCoBridgeNode(Node):
 
         physics_rate = float(self.get_parameter("physics_rate").value)
         publish_rate = float(self.get_parameter("publish_rate").value)
+        viewer_rate = float(self.get_parameter("viewer_rate").value)
+        if not all(np.isfinite(rate) and rate > 0.0
+                   for rate in (physics_rate, publish_rate, viewer_rate)):
+            raise RuntimeError("physics_rate, publish_rate and viewer_rate must be finite and positive")
         self.model.opt.timestep = 1.0 / physics_rate
         self.publish_interval = max(1, round(physics_rate / publish_rate))
         self.step_count = 0
-        self.last_diagnostic = time.monotonic()
         self.timer = self.create_timer(1.0 / physics_rate, self._physics_step)
 
         self.viewer = None
+        self.viewer_timer = None
+        self.viewer_sync_seconds = 0.0
+        self.viewer_sync_count = 0
+        self.viewer_state_only = False
         if bool(self.get_parameter("viewer").value):
             from mujoco import viewer as mujoco_viewer
             self.viewer = mujoco_viewer.launch_passive(self.model, self.data)
+            self.viewer_state_only = "state_only" in inspect.signature(self.viewer.sync).parameters
+            self.viewer_timer = self.create_timer(1.0 / viewer_rate, self._sync_viewer)
+
+        self.last_diagnostic = time.monotonic()
+        self.last_diagnostic_sim_time = float(self.data.time)
+        self.last_diagnostic_step = self.step_count
 
         self.get_logger().info(
             f"Loaded {scene_path}: nq={self.model.nq}, nv={self.model.nv}, "
             f"nu={self.model.nu}; dt={self.model.opt.timestep:.4f}s, "
             f"integrator={int(self.model.opt.integrator)}, "
-            f"arm=torque(5), hand=position(6)")
+            f"arm=torque(5), hand=position(6), "
+            f"viewer_rate={viewer_rate:.1f}Hz state_only={self.viewer_state_only}")
 
     def _validate_model(self) -> None:
         missing_arm = [name for name in self.arm_names if name not in self.motor_actuators]
@@ -256,8 +272,18 @@ class MuJoCoBridgeNode(Node):
             self._log_diagnostics()
             self.last_diagnostic = time.monotonic()
         self.step_count += 1
+
+    def _sync_viewer(self) -> None:
+        # Rendering runs at display rate, independently of the 500 Hz physics
+        # timer. Full model synchronization on every step can stall physics.
         if self.viewer is not None and self.viewer.is_running():
-            self.viewer.sync()
+            start = time.monotonic()
+            if self.viewer_state_only:
+                self.viewer.sync(state_only=True)
+            else:
+                self.viewer.sync()
+            self.viewer_sync_seconds += time.monotonic() - start
+            self.viewer_sync_count += 1
 
     def _restore_initial_state(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
@@ -266,12 +292,25 @@ class MuJoCoBridgeNode(Node):
         self._initialize_controls()
         mujoco.mj_forward(self.model, self.data)
         self.gravity_torque = self._compute_gravity()
+        self.last_diagnostic_sim_time = float(self.data.time)
+        self.last_diagnostic = time.monotonic()
+        self.last_diagnostic_step = self.step_count
         with self.lock:
             self.arm_torque.clear()
             self.hand_position.clear()
             self.last_arm_command = -1.0
 
     def _log_diagnostics(self) -> None:
+        wall_time = time.monotonic()
+        elapsed = max(wall_time - self.last_diagnostic, 1.0e-9)
+        real_time_factor = (self.data.time - self.last_diagnostic_sim_time) / elapsed
+        physics_hz = (self.step_count - self.last_diagnostic_step) / elapsed
+        viewer_sync_ms = (1000.0 * self.viewer_sync_seconds / self.viewer_sync_count
+                          if self.viewer_sync_count else 0.0)
+        self.last_diagnostic_sim_time = float(self.data.time)
+        self.last_diagnostic_step = self.step_count
+        self.viewer_sync_seconds = 0.0
+        self.viewer_sync_count = 0
         arm_q = [self.data.qpos[self.qpos_addresses[name]] for name in self.arm_names]
         arm_dq = [self.data.qvel[self.dof_addresses[name]] for name in self.arm_names]
         arm_ctrl = [
@@ -286,6 +325,8 @@ class MuJoCoBridgeNode(Node):
         fmt = lambda values: "[" + ", ".join(f"{value:.3f}" for value in values) + "]"
         self.get_logger().info(
             "SIM_DIAG "
+            f"rtf={real_time_factor:.3f} physics_hz={physics_hz:.1f} "
+            f"viewer_sync_ms={viewer_sync_ms:.2f} "
             f"q_arm={fmt(arm_q)} dq_arm={fmt(arm_dq)} tau={fmt(arm_ctrl)} "
             f"q_hand={fmt(hand_q)} hand_ref={fmt(hand_ctrl)} "
             f"max|qacc|={maximum_acceleration:.2f} "
@@ -348,9 +389,12 @@ def main(args=None) -> None:
     node = MuJoCoBridgeNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
