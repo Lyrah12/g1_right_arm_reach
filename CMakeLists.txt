@@ -31,6 +31,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ActionCommand.msg"
   "msg/HandCommand.msg"
   "msg/ActionResult.msg"
+  "msg/Contact.msg"
+  "msg/ContactArray.msg"
   DEPENDENCIES std_msgs geometry_msgs
   ADD_LINTER_TESTS
 )
@@ -119,6 +121,7 @@ install(TARGETS
 install(DIRECTORY include/ DESTINATION include)
 install(PROGRAMS
   scripts/mujoco_bridge_node.py
+  scripts/verify_mujoco_interfaces.py
   scripts/compose_g1_23dof_revo2.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -129,10 +132,15 @@ install(FILES config/params.yaml config/rviz_config.rviz
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_kinematics test/test_kinematics.cpp)
   target_link_libraries(test_kinematics g1_right_arm_core)
   ament_add_gtest(test_controllers test/test_controllers.cpp)
   target_link_libraries(test_controllers g1_controllers g1_right_arm_core)
+  ament_add_pytest_test(test_mujoco_interfaces test/test_mujoco_interfaces.py
+    TIMEOUT 60
+    APPEND_ENV
+      "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/scripts:${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_py")
 endif()
 
 ament_export_include_directories(include)

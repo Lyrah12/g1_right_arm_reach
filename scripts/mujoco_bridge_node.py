@@ -2,7 +2,7 @@
 """MuJoCo bridge for the decoupled G1-23DOF + Revo2 controller.
 
 Runtime control is deliberately mixed by joint group:
-  * five G1 right-arm joints: direct motor torque from /joint_commands.effort;
+  * five G1 right-arm joints: torque or joint-position control (startup mode);
   * six Revo2 active joints: position targets from /hand_commands.position;
   * all other G1 joints: fixed-target position servos generated in the MJCF.
 
@@ -24,6 +24,7 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
+from g1_right_arm_reach.msg import Contact, ContactArray
 
 
 DEFAULT_ARM_JOINTS = [
@@ -45,14 +46,19 @@ DEFAULT_HAND_JOINTS = [
 
 
 class MuJoCoBridgeNode(Node):
-    def __init__(self) -> None:
-        super().__init__("mujoco_bridge_node")
+    def __init__(self, parameter_overrides=None) -> None:
+        super().__init__("mujoco_bridge_node", parameter_overrides=parameter_overrides)
         self.declare_parameter("scene_path", "")
         self.declare_parameter("physics_rate", 500.0)
         self.declare_parameter("publish_rate", 100.0)
         self.declare_parameter("viewer", False)
         self.declare_parameter("viewer_rate", 60.0)
         self.declare_parameter("arm_command_timeout", 0.10)
+        self.declare_parameter("arm_control_mode", "torque")
+        self.declare_parameter("arm_position_kp", [80.0, 80.0, 60.0, 60.0, 12.0])
+        self.declare_parameter("arm_position_kd", [8.0, 8.0, 5.0, 5.0, 1.5])
+        self.declare_parameter("arm_position_max_torque", [20.0, 20.0, 15.0, 15.0, 3.0])
+        self.declare_parameter("arm_position_max_velocity", [1.0, 1.0, 1.0, 1.0, 1.5])
         self.declare_parameter("diagnostic_period", 1.0)
         self.declare_parameter("instability_velocity", 30.0)
         self.declare_parameter(
@@ -74,6 +80,13 @@ class MuJoCoBridgeNode(Node):
         self.gravity_data = mujoco.MjData(self.model)
         self.arm_names = list(self.get_parameter("arm_joint_names").value)
         self.hand_names = list(self.get_parameter("hand_joint_names").value)
+        self.arm_mode = str(self.get_parameter("arm_control_mode").value)
+        if self.arm_mode not in ("torque", "position"):
+            raise RuntimeError("arm_control_mode must be torque or position")
+        self.position_kp = self._arm_parameter("arm_position_kp")
+        self.position_kd = self._arm_parameter("arm_position_kd", allow_zero=True)
+        self.position_max_torque = self._arm_parameter("arm_position_max_torque")
+        self.position_max_velocity = self._arm_parameter("arm_position_max_velocity")
         self.arm_timeout = float(self.get_parameter("arm_command_timeout").value)
         self.diagnostic_period = float(self.get_parameter("diagnostic_period").value)
         self.instability_velocity = float(
@@ -114,6 +127,9 @@ class MuJoCoBridgeNode(Node):
         mujoco.mj_forward(self.model, self.data)
         self.initial_qpos = self.data.qpos.copy()
         self.gravity_torque = self._compute_gravity()
+        self.arm_position_target = np.array([
+            self.data.qpos[self.qpos_addresses[name]] for name in self.arm_names])
+        self.arm_position_reference = self.arm_position_target.copy()
 
         site_name = str(self.get_parameter("ee_site").value)
         self.ee_site_id = mujoco.mj_name2id(
@@ -124,8 +140,13 @@ class MuJoCoBridgeNode(Node):
         self.joint_state_pub = self.create_publisher(JointState, "/joint_states", 10)
         self.ee_pose_pub = self.create_publisher(PoseStamped, "/actual_ee_pose", 10)
         self.gravity_pub = self.create_publisher(Float64MultiArray, "/mujoco_gravity", 10)
-        self.arm_command_sub = self.create_subscription(
-            JointState, "/joint_commands", self._arm_callback, 10)
+        self.contacts_pub = self.create_publisher(ContactArray, "/mujoco/contacts", 10)
+        if self.arm_mode == "position":
+            self.arm_command_sub = self.create_subscription(
+                JointState, "/arm_position_commands", self._arm_position_callback, 10)
+        else:
+            self.arm_command_sub = self.create_subscription(
+                JointState, "/joint_commands", self._arm_callback, 10)
         self.hand_command_sub = self.create_subscription(
             JointState, "/hand_commands", self._hand_callback, 10)
 
@@ -135,8 +156,11 @@ class MuJoCoBridgeNode(Node):
         if not all(np.isfinite(rate) and rate > 0.0
                    for rate in (physics_rate, publish_rate, viewer_rate)):
             raise RuntimeError("physics_rate, publish_rate and viewer_rate must be finite and positive")
+        if publish_rate > physics_rate:
+            raise RuntimeError("publish_rate must not exceed physics_rate")
         self.model.opt.timestep = 1.0 / physics_rate
-        self.publish_interval = max(1, round(physics_rate / publish_rate))
+        self.publish_period = 1.0 / publish_rate
+        self.publish_elapsed = 0.0
         self.step_count = 0
         self.timer = self.create_timer(1.0 / physics_rate, self._physics_step)
 
@@ -159,10 +183,22 @@ class MuJoCoBridgeNode(Node):
             f"Loaded {scene_path}: nq={self.model.nq}, nv={self.model.nv}, "
             f"nu={self.model.nu}; dt={self.model.opt.timestep:.4f}s, "
             f"integrator={int(self.model.opt.integrator)}, "
-            f"arm=torque(5), hand=position(6), "
+            f"arm={self.arm_mode}(5), hand=position(6), "
             f"viewer_rate={viewer_rate:.1f}Hz state_only={self.viewer_state_only}")
 
+    def _arm_parameter(self, name: str, allow_zero: bool = False) -> np.ndarray:
+        values = np.asarray(self.get_parameter(name).value, dtype=np.float64)
+        valid_sign = values >= 0.0 if allow_zero else values > 0.0
+        if (values.shape != (len(self.arm_names),)
+                or not np.all(np.isfinite(values)) or not np.all(valid_sign)):
+            raise RuntimeError(f"{name} requires one finite positive value per arm joint"
+                               + (" (zero allowed)" if allow_zero else ""))
+        return values
+
     def _validate_model(self) -> None:
+        if (len(self.arm_names) != 5 or len(set(self.arm_names)) != 5
+                or len(self.hand_names) != 6 or len(set(self.hand_names)) != 6):
+            raise RuntimeError("expected five unique arm joints and six unique hand joints")
         missing_arm = [name for name in self.arm_names if name not in self.motor_actuators]
         missing_hand = [name for name in self.hand_names if name not in self.position_actuators]
         if missing_arm or missing_hand:
@@ -198,6 +234,8 @@ class MuJoCoBridgeNode(Node):
                 self.data.ctrl[actuator_id] = np.clip(target, lower, upper)
 
     def _arm_callback(self, command: JointState) -> None:
+        if self.arm_mode != "torque":
+            return
         updated: dict[str, float] = {}
         for index, name in enumerate(command.name):
             if name in self.arm_names and index < len(command.effort):
@@ -208,6 +246,31 @@ class MuJoCoBridgeNode(Node):
             with self.lock:
                 self.arm_torque = updated
                 self.last_arm_command = time.monotonic()
+
+    def _arm_position_callback(self, command: JointState) -> None:
+        if self.arm_mode != "position":
+            return
+        # Accept complete, named commands atomically; never retain a half update.
+        if (len(command.name) != len(self.arm_names)
+                or len(command.position) != len(self.arm_names)
+                or len(set(command.name)) != len(self.arm_names)
+                or set(command.name) != set(self.arm_names)):
+            self.get_logger().warning("Rejected arm position command: require all five unique joint names and positions")
+            return
+        values = dict(zip(command.name, command.position))
+        target = np.array([values[name] for name in self.arm_names], dtype=np.float64)
+        if not np.all(np.isfinite(target)):
+            self.get_logger().warning("Rejected non-finite arm position command")
+            return
+        for name, value in zip(self.arm_names, target):
+            joint_id = self.joint_ids[name]
+            if self.model.jnt_limited[joint_id]:
+                lower, upper = self.model.jnt_range[joint_id]
+                if not lower <= value <= upper:
+                    self.get_logger().warning(f"Rejected arm position command: {name} outside [{lower}, {upper}] rad")
+                    return
+        with self.lock:
+            self.arm_position_target = target
 
     def _hand_callback(self, command: JointState) -> None:
         updated: dict[str, float] = {}
@@ -225,14 +288,26 @@ class MuJoCoBridgeNode(Node):
             arm_fresh = time.monotonic() - self.last_arm_command <= self.arm_timeout
             arm_torque = dict(self.arm_torque)
             hand_position = dict(self.hand_position)
+            position_target = self.arm_position_target.copy()
 
-        for name in self.arm_names:
+        if self.arm_mode == "position":
+            step = self.position_max_velocity * self.model.opt.timestep
+            self.arm_position_reference += np.clip(
+                position_target - self.arm_position_reference, -step, step)
+
+        for index, name in enumerate(self.arm_names):
             dof = self.dof_addresses[name]
             # Stale command fallback is pure gravity only. Do not use the live
             # qfrc_bias here: at nonzero velocity it also contains Coriolis and
             # centrifugal terms from an older state.
             torque = (arm_torque.get(name, 0.0) if arm_fresh
                       else float(self.gravity_torque[dof]))
+            if self.arm_mode == "position":
+                error = self.arm_position_reference[index] - self.data.qpos[self.qpos_addresses[name]]
+                torque = (self.gravity_torque[dof] + self.position_kp[index] * error
+                          - self.position_kd[index] * self.data.qvel[dof])
+                torque = float(np.clip(torque, -self.position_max_torque[index],
+                                       self.position_max_torque[index]))
             for actuator_id in self.motor_actuators[name]:
                 lower, upper = self.model.actuator_ctrlrange[actuator_id]
                 if self.model.actuator_ctrllimited[actuator_id]:
@@ -264,9 +339,16 @@ class MuJoCoBridgeNode(Node):
             self.get_logger().warning(
                 f"SIMULATION UNSTABLE: max|qvel|={max_velocity:.2f} rad/s, "
                 f"ncon={self.data.ncon}")
-        if self.step_count % self.publish_interval == 0:
-            self._publish_state()
-            self._publish_ee_pose()
+        self.publish_elapsed += self.model.opt.timestep
+        if self.publish_elapsed + 1.0e-12 >= self.publish_period:
+            self.publish_elapsed -= self.publish_period
+            # mj_step integrates qpos after evaluating contacts/sites. Refresh
+            # derived fields so all observations describe the current qpos.
+            mujoco.mj_forward(self.model, self.data)
+            stamp = self.get_clock().now().to_msg()
+            self._publish_state(stamp)
+            self._publish_ee_pose(stamp)
+            self.contacts_pub.publish(self._contact_state(stamp))
             self._publish_gravity()
         if time.monotonic() - self.last_diagnostic >= self.diagnostic_period:
             self._log_diagnostics()
@@ -299,6 +381,10 @@ class MuJoCoBridgeNode(Node):
             self.arm_torque.clear()
             self.hand_position.clear()
             self.last_arm_command = -1.0
+            self.arm_position_target = np.array([
+                self.data.qpos[self.qpos_addresses[name]] for name in self.arm_names])
+            self.arm_position_reference = self.arm_position_target.copy()
+        self.publish_elapsed = 0.0
 
     def _log_diagnostics(self) -> None:
         wall_time = time.monotonic()
@@ -332,9 +418,9 @@ class MuJoCoBridgeNode(Node):
             f"max|qacc|={maximum_acceleration:.2f} "
             f"max|constraint|={maximum_constraint:.2f} ncon={self.data.ncon}")
 
-    def _publish_state(self) -> None:
+    def _publish_state(self, stamp=None) -> None:
         message = JointState()
-        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
         for name, joint_id in self.joint_ids.items():
             qpos = self.qpos_addresses[name]
             dof = self.dof_addresses[name]
@@ -344,9 +430,9 @@ class MuJoCoBridgeNode(Node):
             message.effort.append(float(self.data.qfrc_actuator[dof]))
         self.joint_state_pub.publish(message)
 
-    def _publish_ee_pose(self) -> None:
+    def _publish_ee_pose(self, stamp=None) -> None:
         message = PoseStamped()
-        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
         message.header.frame_id = "world"
         position = self.data.site_xpos[self.ee_site_id]
         rotation = self.data.site_xmat[self.ee_site_id]
@@ -360,6 +446,35 @@ class MuJoCoBridgeNode(Node):
         message.pose.orientation.y = float(quaternion[2])
         message.pose.orientation.z = float(quaternion[3])
         self.ee_pose_pub.publish(message)
+
+    def _contact_state(self, stamp) -> ContactArray:
+        message = ContactArray()
+        message.header.stamp = stamp
+        message.header.frame_id = "world"
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            value = Contact()
+            value.geom1_id, value.geom2_id = (int(i) for i in contact.geom)
+            for number, geom_id in enumerate((value.geom1_id, value.geom2_id), start=1):
+                geom_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+                body_id = int(self.model.geom_bodyid[geom_id])
+                body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                setattr(value, f"geom{number}_name", geom_name or f"geom_{geom_id}")
+                setattr(value, f"body{number}_name", body_name or f"body_{body_id}")
+            value.position.x, value.position.y, value.position.z = map(float, contact.pos)
+            frame = contact.frame.reshape(3, 3)
+            value.normal.x, value.normal.y, value.normal.z = map(float, frame[0])
+            value.distance = float(contact.dist)
+            value.active = bool(contact.efc_address >= 0)
+            local_wrench = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(self.model, self.data, index, local_wrench)
+            value.normal_force = float(local_wrench[0])
+            world_force = frame.T @ local_wrench[:3]
+            world_torque = frame.T @ local_wrench[3:]
+            value.wrench.force.x, value.wrench.force.y, value.wrench.force.z = map(float, world_force)
+            value.wrench.torque.x, value.wrench.torque.y, value.wrench.torque.z = map(float, world_torque)
+            message.contacts.append(value)
+        return message
 
     def _publish_gravity(self) -> None:
         self.gravity_torque = self._compute_gravity()
